@@ -1,5 +1,5 @@
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 
 actor NotificationManager {
     static let shared = NotificationManager()
@@ -7,10 +7,10 @@ actor NotificationManager {
     private let center = UNUserNotificationCenter.current()
 
     func requestAuthorization() async -> Bool {
-        do {
-            return try await center.requestAuthorization(options: [.alert, .sound])
-        } catch {
-            return false
+        await withCheckedContinuation { continuation in
+            center.requestAuthorization(options: [.alert, .sound]) { allowed, _ in
+                continuation.resume(returning: allowed)
+            }
         }
     }
 
@@ -25,6 +25,10 @@ actor NotificationManager {
             content: content,
             trigger: nil
         )
-        try? await center.add(request)
+        await withCheckedContinuation { continuation in
+            center.add(request) { _ in
+                continuation.resume()
+            }
+        }
     }
 }

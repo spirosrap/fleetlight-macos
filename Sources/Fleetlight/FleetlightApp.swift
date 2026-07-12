@@ -12,14 +12,10 @@ struct FleetlightApp: App {
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: model.menuSymbol)
-                if model.unreachableCount > 0 {
-                    Text("\(model.unreachableCount) off")
-                }
-                if model.slowConnectionCount > 0 {
-                    Text("\(model.slowConnectionCount) slow")
-                }
-                if model.serviceOrResourceAlertCount > 0 {
-                    Text("\(model.serviceOrResourceAlertCount) alert\(model.serviceOrResourceAlertCount == 1 ? "" : "s")")
+                if let status = model.menuStatusText {
+                    Text(status)
+                        .monospacedDigit()
+                        .fixedSize()
                 }
             }
             .accessibilityLabel("Fleetlight, \(model.attentionDescription)")

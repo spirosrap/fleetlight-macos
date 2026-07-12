@@ -68,6 +68,10 @@ final class FleetModel: ObservableObject {
         attentionSummary.uniqueAttentionCount
     }
 
+    var menuStatusText: String? {
+        attentionSummary.compactDescription
+    }
+
     var onlineCount: Int {
         attentionSummary.onlineCount
     }

@@ -414,6 +414,16 @@ public struct FleetAttentionSummary: Equatable, Sendable {
         self.serviceOrResourceAlertCount = serviceOrResourceAlertCount
         self.uniqueAttentionCount = uniqueAttentionCount
     }
+
+    public var compactDescription: String? {
+        var parts: [String] = []
+        if unreachableCount > 0 { parts.append("\(unreachableCount) offline") }
+        if performanceWarningCount > 0 { parts.append("\(performanceWarningCount) slow") }
+        if serviceOrResourceAlertCount > 0 {
+            parts.append("\(serviceOrResourceAlertCount) alert\(serviceOrResourceAlertCount == 1 ? "" : "s")")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 public enum FleetStatusFilter: String, CaseIterable, Codable, Identifiable, Sendable {

@@ -70,6 +70,7 @@ Supported machine fields:
 
 - Concurrent local and SSH health checks with verification markers and hard timeouts
 - Online, Offline, Slow, Alerts, and All Issues drill-down filters
+- One combined menu-bar label that preserves simultaneous states, such as `1 offline · 2 slow · 1 alert`
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Configurable performance-warning thresholds

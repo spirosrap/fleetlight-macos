@@ -412,6 +412,8 @@ test.require(attentionSummary.unreachableCount == 1, "attention summary should c
 test.require(attentionSummary.performanceWarningCount == 2, "attention summary should count slow connected machines")
 test.require(attentionSummary.serviceOrResourceAlertCount == 2, "attention summary should separate service and resource alerts")
 test.require(attentionSummary.uniqueAttentionCount == 4, "overlapping warning categories should not double-count machines")
+test.require(attentionSummary.compactDescription == "1 offline · 2 slow · 2 alerts", "menu status should retain every simultaneous attention category")
+test.require(FleetAttentionSummary(onlineCount: 1, unreachableCount: 0, performanceWarningCount: 0, serviceOrResourceAlertCount: 0, uniqueAttentionCount: 0).compactDescription == nil, "healthy fleets should not add menu status text")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionOffline.id]!, thresholds: .default, filter: .offline), "offline filter should include unreachable machines")
 test.require(!FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionOffline.id]!, thresholds: .default, filter: .online), "online filter should exclude unreachable machines")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionSlow.id]!, thresholds: .default, filter: .slow), "slow filter should include connected performance warnings")

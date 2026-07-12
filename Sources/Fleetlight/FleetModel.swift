@@ -18,6 +18,8 @@ final class FleetModel: ObservableObject {
     @Published private(set) var hosts: [FleetHost]
     @Published var refreshInterval: TimeInterval
     @Published var fleetStatusFilter: FleetStatusFilter
+    @Published private(set) var pinnedHostIDs: Set<String>
+    @Published private(set) var fleetSortMode: FleetSortMode
     @Published var launchAtLogin = false
     @Published var notificationsEnabled: Bool
     @Published private(set) var performanceThresholds: PerformanceThresholds
@@ -39,6 +41,10 @@ final class FleetModel: ObservableObject {
         fleetStatusFilter = UserDefaults.standard.string(forKey: "fleetStatusFilter")
             .flatMap(FleetStatusFilter.init(rawValue:))
             ?? (UserDefaults.standard.bool(forKey: "attentionOnly") ? .attention : .all)
+        pinnedHostIDs = Set(UserDefaults.standard.stringArray(forKey: "pinnedHostIDs") ?? [])
+        fleetSortMode = UserDefaults.standard.string(forKey: "fleetSortMode")
+            .flatMap(FleetSortMode.init(rawValue:))
+            ?? .priority
         notificationsEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
         performanceThresholds = UserDefaults.standard.data(forKey: "performanceThresholds")
             .flatMap { try? JSONDecoder().decode(PerformanceThresholds.self, from: $0) }
@@ -97,13 +103,20 @@ final class FleetModel: ObservableObject {
     }
 
     var displayedHosts: [FleetHost] {
-        visibleHosts.filter { host in
+        let filteredHosts = visibleHosts.filter { host in
             FleetAttentionAnalyzer.matches(
                 snapshot: snapshots[host.id] ?? HostSnapshot(),
                 thresholds: performanceThresholds,
                 filter: fleetStatusFilter
             )
         }
+        return FleetHostSorter.sort(
+            hosts: filteredHosts,
+            snapshots: snapshots,
+            thresholds: performanceThresholds,
+            pinnedHostIDs: pinnedHostIDs,
+            mode: fleetSortMode
+        )
     }
 
     var refreshIntervalLabel: String {
@@ -242,6 +255,23 @@ final class FleetModel: ObservableObject {
         fleetStatusFilter = fleetStatusFilter == filter ? .all : filter
         UserDefaults.standard.set(fleetStatusFilter.rawValue, forKey: "fleetStatusFilter")
         UserDefaults.standard.set(fleetStatusFilter == .attention, forKey: "attentionOnly")
+    }
+
+    func setFleetSortMode(_ mode: FleetSortMode) {
+        fleetSortMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "fleetSortMode")
+        notice = "Sorted by \(mode.displayName.lowercased())"
+    }
+
+    func togglePinned(_ host: FleetHost) {
+        if pinnedHostIDs.contains(host.id) {
+            pinnedHostIDs.remove(host.id)
+            notice = "\(host.displayName) unpinned"
+        } else {
+            pinnedHostIDs.insert(host.id)
+            notice = "\(host.displayName) pinned to the top"
+        }
+        UserDefaults.standard.set(Array(pinnedHostIDs).sorted(), forKey: "pinnedHostIDs")
     }
 
     func samples(for hostID: String, hours: Double = 24, now: Date = Date()) -> [MetricSample] {
@@ -398,7 +428,9 @@ final class FleetModel: ObservableObject {
                 ($0.id, previousSnapshots[$0.id] ?? HostSnapshot())
             })
             hiddenHostIDs.formIntersection(Set(hosts.map(\.id)))
+            pinnedHostIDs.formIntersection(Set(hosts.map(\.id)))
             UserDefaults.standard.set(Array(hiddenHostIDs).sorted(), forKey: "hiddenHostIDs")
+            UserDefaults.standard.set(Array(pinnedHostIDs).sorted(), forKey: "pinnedHostIDs")
             notice = "Loaded \(hosts.count) machine\(hosts.count == 1 ? "" : "s") from fleet.json"
             if started { Task { await refreshAll() } }
         } catch {

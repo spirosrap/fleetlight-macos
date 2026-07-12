@@ -178,6 +178,8 @@ private struct FleetMenuView: View {
                                 performanceWarnings: model.performanceWarnings(for: host.id),
                                 routeTests: model.routeTests[host.id] ?? [],
                                 isRefreshing: model.refreshingHostIDs.contains(host.id),
+                                isPinned: model.pinnedHostIDs.contains(host.id),
+                                onTogglePin: { model.togglePinned(host) },
                                 onWake: { Task { await model.wake(host) } },
                                 onSSH: { model.openSSH(host) },
                                 onCopy: { model.copyDiagnostics(for: host) },
@@ -289,6 +291,7 @@ private struct FleetSummaryBar: View {
                 color: model.serviceOrResourceAlertCount > 0 ? .orange : .secondary
             )
             Spacer()
+            sortMenu
             Button {
                 model.setFleetStatusFilter(.attention)
             } label: {
@@ -306,6 +309,27 @@ private struct FleetSummaryBar: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            ForEach(FleetSortMode.allCases) { mode in
+                Button {
+                    model.setFleetSortMode(mode)
+                } label: {
+                    Label(
+                        mode.displayName,
+                        systemImage: model.fleetSortMode == mode ? "checkmark" : mode.systemImage
+                    )
+                }
+            }
+        } label: {
+            Label("Sort: \(model.fleetSortMode.displayName)", systemImage: "arrow.up.arrow.down.circle")
+                .labelStyle(.iconOnly)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Sort machines: \(model.fleetSortMode.displayName)")
     }
 
     private func statusButton(_ filter: FleetStatusFilter, value: Int, color: Color) -> some View {
@@ -1407,6 +1431,8 @@ private struct HostRow: View {
     let performanceWarnings: [PerformanceWarning]
     let routeTests: [RouteProbeResult]
     let isRefreshing: Bool
+    let isPinned: Bool
+    let onTogglePin: () -> Void
     let onWake: () -> Void
     let onSSH: () -> Void
     let onCopy: () -> Void
@@ -1427,6 +1453,13 @@ private struct HostRow: View {
                         Text(host.id)
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.tertiary)
+                        Button(action: onTogglePin) {
+                            Image(systemName: isPinned ? "star.fill" : "star")
+                                .font(.system(size: 10))
+                                .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(isPinned ? "Unpin \(host.displayName)" : "Pin \(host.displayName) to the top")
                     }
                     Text(primaryDetail)
                         .font(.caption)

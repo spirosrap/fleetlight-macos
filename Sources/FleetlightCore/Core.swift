@@ -505,6 +505,95 @@ public enum FleetAttentionAnalyzer {
     }
 }
 
+public enum FleetSortMode: String, CaseIterable, Codable, Identifiable, Sendable {
+    case priority
+    case health
+    case ping
+    case name
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .priority: "Issues first"
+        case .health: "Lowest health"
+        case .ping: "Ping"
+        case .name: "Name"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .priority: "exclamationmark.triangle"
+        case .health: "heart.text.square"
+        case .ping: "arrow.left.and.right"
+        case .name: "textformat.abc"
+        }
+    }
+}
+
+public enum FleetHostSorter {
+    public static func sort(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        thresholds: PerformanceThresholds,
+        pinnedHostIDs: Set<String>,
+        mode: FleetSortMode
+    ) -> [FleetHost] {
+        hosts.sorted { left, right in
+            let leftPinned = pinnedHostIDs.contains(left.id)
+            let rightPinned = pinnedHostIDs.contains(right.id)
+            if leftPinned != rightPinned { return leftPinned }
+
+            let leftSnapshot = snapshots[left.id] ?? HostSnapshot()
+            let rightSnapshot = snapshots[right.id] ?? HostSnapshot()
+
+            switch mode {
+            case .priority:
+                let leftSeverity = severity(of: leftSnapshot, thresholds: thresholds)
+                let rightSeverity = severity(of: rightSnapshot, thresholds: thresholds)
+                if leftSeverity != rightSeverity { return leftSeverity < rightSeverity }
+            case .health:
+                let leftHealth = HealthScorer.score(snapshot: leftSnapshot, availability: nil, thresholds: thresholds)
+                let rightHealth = HealthScorer.score(snapshot: rightSnapshot, availability: nil, thresholds: thresholds)
+                if leftHealth != rightHealth { return leftHealth < rightHealth }
+            case .ping:
+                let leftPing = leftSnapshot.state == .online ? leftSnapshot.pingMilliseconds : nil
+                let rightPing = rightSnapshot.state == .online ? rightSnapshot.pingMilliseconds : nil
+                switch (leftPing, rightPing) {
+                case let (leftValue?, rightValue?) where leftValue != rightValue:
+                    return leftValue < rightValue
+                case (_?, nil): return true
+                case (nil, _?): return false
+                default: break
+                }
+            case .name:
+                break
+            }
+
+            return left.displayName.localizedCaseInsensitiveCompare(right.displayName) == .orderedAscending
+        }
+    }
+
+    private static func severity(
+        of snapshot: HostSnapshot,
+        thresholds: PerformanceThresholds
+    ) -> Int {
+        if snapshot.state == .unreachable { return 0 }
+        if snapshot.state == .online,
+           (snapshot.diskPercent ?? 0) >= 90
+            || snapshot.services.contains(where: { $0.state.needsAttention }) {
+            return 1
+        }
+        if snapshot.state == .online,
+           !PerformanceEvaluator.warnings(snapshot: snapshot, thresholds: thresholds).isEmpty {
+            return 2
+        }
+        if snapshot.state == .checking || snapshot.state == .waking { return 3 }
+        return 4
+    }
+}
+
 public struct MetricSample: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public let timestamp: Date

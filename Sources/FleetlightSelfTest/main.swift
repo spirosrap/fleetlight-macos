@@ -191,6 +191,43 @@ test.require(comparisonReport.contains("Fleetlight comparison — Ping"), "compa
 test.require(comparisonReport.contains("Fast: 20 ms · fastest"), "comparison report should mark the fastest machine")
 test.require(comparisonReport.contains("Slow: 80 ms · +60 ms"), "comparison report should show the gap from fastest")
 
+let sortingSnapshots = [
+    "fast": HostSnapshot(state: .online, pingMilliseconds: 20),
+    "slow": HostSnapshot(state: .online, pingMilliseconds: 250),
+    "offline": HostSnapshot(state: .unreachable),
+]
+let issueSortedHosts = FleetHostSorter.sort(
+    hosts: [slowHost, fastHost, offlineHost],
+    snapshots: sortingSnapshots,
+    thresholds: .default,
+    pinnedHostIDs: [],
+    mode: .priority
+)
+test.require(issueSortedHosts.map(\.id) == ["offline", "slow", "fast"], "issues-first sorting should rank unreachable then warning then healthy machines")
+let pinnedSortedHosts = FleetHostSorter.sort(
+    hosts: [slowHost, fastHost, offlineHost],
+    snapshots: sortingSnapshots,
+    thresholds: .default,
+    pinnedHostIDs: ["fast"],
+    mode: .priority
+)
+test.require(pinnedSortedHosts.map(\.id) == ["fast", "offline", "slow"], "pinned machines should remain above the selected sort order")
+test.require(
+    FleetHostSorter.sort(hosts: [slowHost, offlineHost, fastHost], snapshots: sortingSnapshots, thresholds: .default, pinnedHostIDs: [], mode: .ping).map(\.id)
+        == ["fast", "slow", "offline"],
+    "ping sorting should place measured online machines first from fastest to slowest"
+)
+test.require(
+    FleetHostSorter.sort(hosts: [slowHost, offlineHost, fastHost], snapshots: sortingSnapshots, thresholds: .default, pinnedHostIDs: [], mode: .name).map(\.id)
+        == ["fast", "offline", "slow"],
+    "name sorting should be alphabetical"
+)
+test.require(
+    FleetHostSorter.sort(hosts: [fastHost, slowHost, offlineHost], snapshots: sortingSnapshots, thresholds: .default, pinnedHostIDs: [], mode: .health).map(\.id)
+        == ["offline", "slow", "fast"],
+    "health sorting should surface the lowest live health first"
+)
+
 let encoder = JSONEncoder()
 encoder.dateEncodingStrategy = .iso8601
 let decoder = JSONDecoder()

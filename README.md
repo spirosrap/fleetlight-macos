@@ -76,7 +76,8 @@ Supported machine fields:
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
 - Optional Codex desktop app version and build reporting for configured macOS hosts
-- Always-visible Codex desktop app version summary plus independently identified per-Mac rows
+- Separate Mac App and CLI views in the Codex dashboard, opening on the Mac App view so signed app versions and builds are immediately visible
+- Mac App summaries for installed, verified, offline, and missing states, with explicit per-machine last-check times and a copyable version report
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

@@ -81,6 +81,13 @@ private enum CodexFleetUpdateScope {
     }
 }
 
+private enum CodexSubview: String, CaseIterable, Identifiable {
+    case desktopApp = "Mac App"
+    case cli = "CLI"
+
+    var id: String { rawValue }
+}
+
 private struct FleetMenuView: View {
     @ObservedObject var model: FleetModel
     @State private var selectedSection: PanelSection = .fleet
@@ -538,9 +545,24 @@ private struct CodexView: View {
     let onUpdateAvailable: () -> Void
     @State private var pendingDesktopAppHost: FleetHost?
     @State private var isConfirmingAllDesktopApps = false
+    @State private var selectedSubview: CodexSubview = .desktopApp
 
     var body: some View {
         VStack(spacing: 0) {
+            Picker("Codex view", selection: $selectedSubview) {
+                Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
+                Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            if selectedSubview == .desktopApp {
+                desktopAppContent
+            } else {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex CLI")
@@ -619,51 +641,9 @@ private struct CodexView: View {
                         )
                     }
 
-                    if !model.codexDesktopAppHosts.isEmpty {
-                        Divider()
-                            .padding(.vertical, 4)
-
-                        HStack(spacing: 8) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Codex desktop app")
-                                    .font(.headline)
-                                Text(desktopAppVersionDetail)
-                                    .font(.caption)
-                                    .foregroundStyle(Color.primary.opacity(0.78))
-                                Text("OpenAI’s updater restarts Codex only when it installs a newer version")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button {
-                                isConfirmingAllDesktopApps = true
-                            } label: {
-                                Label(
-                                    model.isUpdatingCodexDesktopApps ? "Updating…" : "Check & Update All",
-                                    systemImage: "arrow.down.app"
-                                )
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
-                        }
-                        .padding(.top, 2)
-
-                        VStack(spacing: 8) {
-                            ForEach(model.codexDesktopAppHosts) { host in
-                                CodexDesktopAppMachineRow(
-                                    host: host,
-                                    snapshot: model.snapshots[host.id] ?? HostSnapshot(),
-                                    updateProgress: model.codexDesktopAppUpdates[host.id],
-                                    isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
-                                    onUpdate: { pendingDesktopAppHost = host }
-                                )
-                            }
-                        }
-                        .id("codex-desktop-app-machines")
-                    }
                 }
                 .padding(12)
+            }
             }
         }
         .confirmationDialog(
@@ -695,6 +675,93 @@ private struct CodexView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Each Mac is checked sequentially. Codex restarts only where OpenAI’s updater installs a newer version.")
+        }
+    }
+
+    private var desktopAppContent: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Codex Mac app")
+                        .font(.headline)
+                    Text(desktopAppVersionDetail)
+                        .font(.caption)
+                        .foregroundStyle(Color.primary.opacity(0.78))
+                    Text("OpenAI’s updater restarts Codex only when it installs a newer version")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    model.copyCodexDesktopAppReport()
+                } label: {
+                    Label("Copy Report", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    isConfirmingAllDesktopApps = true
+                } label: {
+                    Label(
+                        model.isUpdatingCodexDesktopApps ? "Updating…" : "Check & Update All",
+                        systemImage: "arrow.down.app"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+            }
+            .padding(12)
+
+            HStack(spacing: 6) {
+                SummaryPill(
+                    label: "Installed",
+                    value: "\(model.codexDesktopAppSummary.installedCount)",
+                    color: .green,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Verified",
+                    value: "\(model.codexDesktopAppVerifiedCount)",
+                    color: model.codexDesktopAppVerifiedCount > 0 ? .blue : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Offline",
+                    value: "\(model.codexDesktopAppSummary.offlineCount)",
+                    color: model.codexDesktopAppSummary.offlineCount > 0 ? .red : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Missing",
+                    value: "\(model.codexDesktopAppSummary.missingCount)",
+                    color: model.codexDesktopAppSummary.missingCount > 0 ? .orange : .secondary,
+                    isSelected: false
+                )
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(model.codexDesktopAppHosts) { host in
+                        CodexDesktopAppMachineRow(
+                            host: host,
+                            snapshot: model.snapshots[host.id] ?? HostSnapshot(),
+                            updateProgress: model.codexDesktopAppUpdates[host.id],
+                            isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
+                            onUpdate: { pendingDesktopAppHost = host }
+                        )
+                    }
+                }
+                .padding(12)
+            }
         }
     }
 
@@ -758,6 +825,11 @@ private struct CodexDesktopAppMachineRow: View {
                 Text(versionDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let checkedDetail {
+                    Label(checkedDetail, systemImage: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
                 if let updateProgress {
                     Label(updateProgress.detail, systemImage: progressImage)
                         .font(.caption2)
@@ -793,6 +865,11 @@ private struct CodexDesktopAppMachineRow: View {
 
     private var canUpdate: Bool {
         snapshot.state == .online && snapshot.codexDesktopAppVersion != nil
+    }
+
+    private var checkedDetail: String? {
+        guard let checkedAt = snapshot.checkedAt else { return nil }
+        return "Checked \(checkedAt.formatted(date: .abbreviated, time: .shortened))"
     }
 
     private var versionDetail: String {

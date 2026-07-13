@@ -118,6 +118,10 @@ final class FleetModel: ObservableObject {
         hosts.filter(\.supportsCodexDesktopApp)
     }
 
+    var codexDesktopAppSummary: CodexDesktopAppSummary {
+        CodexDesktopAppReportBuilder.summarize(hosts: codexDesktopAppHosts, snapshots: snapshots)
+    }
+
     var codexDesktopAppVerifiedCount: Int {
         codexDesktopAppUpdates.values.filter { $0.phase == .succeeded }.count
     }
@@ -1080,6 +1084,16 @@ final class FleetModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(report, forType: .string)
         notice = "Full diagnosis copied"
+    }
+
+    func copyCodexDesktopAppReport() {
+        let report = CodexDesktopAppReportBuilder.build(
+            hosts: codexDesktopAppHosts,
+            snapshots: snapshots
+        )
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+        notice = "Codex Mac app report copied"
     }
 
     func copyComparison(metric: FleetTimingMetric) {

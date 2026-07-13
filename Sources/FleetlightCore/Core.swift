@@ -815,6 +815,97 @@ public enum FleetComparisonReportBuilder {
     }
 }
 
+public struct CodexDesktopAppSummary: Sendable, Equatable {
+    public let installedCount: Int
+    public let offlineCount: Int
+    public let missingCount: Int
+    public let checkingCount: Int
+
+    public init(installedCount: Int, offlineCount: Int, missingCount: Int, checkingCount: Int) {
+        self.installedCount = installedCount
+        self.offlineCount = offlineCount
+        self.missingCount = missingCount
+        self.checkingCount = checkingCount
+    }
+}
+
+public enum CodexDesktopAppReportBuilder {
+    public static func summarize(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot]
+    ) -> CodexDesktopAppSummary {
+        var installed = 0
+        var offline = 0
+        var missing = 0
+        var checking = 0
+
+        for host in hosts where host.supportsCodexDesktopApp {
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            switch snapshot.state {
+            case .online:
+                if snapshot.codexDesktopAppVersion == nil {
+                    missing += 1
+                } else {
+                    installed += 1
+                }
+            case .unreachable:
+                offline += 1
+            case .checking, .waking:
+                checking += 1
+            }
+        }
+
+        return CodexDesktopAppSummary(
+            installedCount: installed,
+            offlineCount: offline,
+            missingCount: missing,
+            checkingCount: checking
+        )
+    }
+
+    public static func build(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        generatedAt: Date = Date()
+    ) -> String {
+        let appHosts = hosts.filter(\.supportsCodexDesktopApp)
+        let summary = summarize(hosts: appHosts, snapshots: snapshots)
+        var lines = [
+            "Fleetlight Codex Mac app report — \(generatedAt.formatted(date: .abbreviated, time: .standard))",
+            "Configured \(appHosts.count) · Installed \(summary.installedCount) · Offline \(summary.offlineCount) · Missing \(summary.missingCount) · Checking \(summary.checkingCount)"
+        ]
+
+        for host in appHosts {
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            var facts: [String]
+            switch snapshot.state {
+            case .checking:
+                facts = ["Checking"]
+            case .waking:
+                facts = ["Waking"]
+            case .unreachable:
+                facts = ["Offline"]
+            case .online:
+                if let version = snapshot.codexDesktopAppVersion {
+                    let build = snapshot.codexDesktopAppBuild.map { " (build \($0))" } ?? ""
+                    facts = ["Installed \(version)\(build)"]
+                } else {
+                    facts = ["Not installed"]
+                }
+            }
+            if let checkedAt = snapshot.checkedAt {
+                facts.append("checked \(checkedAt.formatted(date: .abbreviated, time: .standard))")
+            }
+            if let route = snapshot.routeName {
+                facts.append("route \(route)")
+            }
+            lines.append("• \(host.displayName): \(facts.joined(separator: " · "))")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+}
+
 public enum HistoryAnalyzer {
     public static func recentSamples(
         _ samples: [MetricSample],

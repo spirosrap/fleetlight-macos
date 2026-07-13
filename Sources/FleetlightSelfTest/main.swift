@@ -109,6 +109,53 @@ test.require(report.contains("Network diagnosis:"), "report should include a pla
 test.require(report.contains("route Via Relay"), "report should include the working route")
 test.require(report.contains("Plex: stopped"), "report should include service health")
 
+let appHost = FleetHost(
+    id: "example-mac",
+    displayName: "Example Mac",
+    systemImage: "desktopcomputer",
+    supportsCodexDesktopApp: true
+)
+let offlineAppHost = FleetHost(
+    id: "offline-mac",
+    displayName: "Offline Mac",
+    systemImage: "desktopcomputer",
+    supportsCodexDesktopApp: true
+)
+let missingAppHost = FleetHost(
+    id: "missing-mac",
+    displayName: "Missing Mac",
+    systemImage: "desktopcomputer",
+    supportsCodexDesktopApp: true
+)
+let appCheckedAt = Date(timeIntervalSince1970: 1_782_900_000)
+let appSnapshot = HostSnapshot(
+    state: .online,
+    checkedAt: appCheckedAt,
+    codexDesktopAppVersion: "26.707.62119",
+    codexDesktopAppBuild: "5211"
+)
+let appSnapshots = [
+    appHost.id: appSnapshot,
+    offlineAppHost.id: HostSnapshot(state: .unreachable),
+    missingAppHost.id: HostSnapshot(state: .online)
+]
+let appSummary = CodexDesktopAppReportBuilder.summarize(
+    hosts: [appHost, offlineAppHost, missingAppHost, host],
+    snapshots: appSnapshots
+)
+test.require(appSummary.installedCount == 1, "Mac app summary should count installed versions")
+test.require(appSummary.offlineCount == 1, "Mac app summary should count offline hosts")
+test.require(appSummary.missingCount == 1, "Mac app summary should count missing installs")
+test.require(appSummary.checkingCount == 0, "Mac app summary should ignore unsupported hosts")
+let appReport = CodexDesktopAppReportBuilder.build(
+    hosts: [appHost, offlineAppHost, missingAppHost, host],
+    snapshots: appSnapshots,
+    generatedAt: appCheckedAt
+)
+test.require(appReport.contains("Configured 3 · Installed 1 · Offline 1 · Missing 1"), "Mac app report should summarize fleet state")
+test.require(appReport.contains("Example Mac: Installed 26.707.62119 (build 5211)"), "Mac app report should include the signed version and build")
+test.require(appReport.contains("checked"), "Mac app report should include the last check time")
+
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")

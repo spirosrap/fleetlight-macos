@@ -599,6 +599,7 @@ final class FleetModel: ObservableObject {
         let logDetail = [
             snapshot.state.rawValue,
             snapshot.routeName.map { "route=\($0)" },
+            snapshot.codexVersion.map { "codex=\($0)" },
             snapshot.pingMilliseconds.map { "ping=\($0)ms" },
             snapshot.pingJitterMilliseconds.map { "jitter=\($0)ms" },
             snapshot.packetLossPercent.map { String(format: "loss=%.1f%%", $0) },

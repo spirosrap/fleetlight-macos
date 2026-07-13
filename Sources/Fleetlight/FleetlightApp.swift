@@ -1669,19 +1669,22 @@ private struct HostRow: View {
             return snapshot.detail
         case .online:
             let os = snapshot.operatingSystem ?? "Online"
+            let codex = "Codex \(snapshot.codexVersion ?? "Unknown")"
             let ping = snapshot.pingMilliseconds.map { "Ping \(durationLabel($0))" }
             let ready = snapshot.latencyMilliseconds.map {
                 host.isLocal ? "Process \(durationLabel($0))" : "SSH \(durationLabel($0))"
             }
-            let timing = [ping, ready].compactMap { $0 }.joined(separator: " · ")
+            var facts = [os, codex]
             let serviceAlerts = snapshot.services.filter { $0.state.needsAttention }.count
             if serviceAlerts > 0 {
-                return "\(os) · \(serviceAlerts) service alert\(serviceAlerts == 1 ? "" : "s") · \(timing)"
+                facts.append("\(serviceAlerts) service alert\(serviceAlerts == 1 ? "" : "s")")
+            } else if let warning = performanceWarnings.first {
+                facts.append(warning.kind.displayName)
+            } else {
+                facts.append(snapshot.detail)
             }
-            if let warning = performanceWarnings.first {
-                return "\(os) · \(warning.kind.displayName) · \(timing)"
-            }
-            return "\(os) · \(snapshot.detail) · \(timing)"
+            facts.append(contentsOf: [ping, ready].compactMap { $0 })
+            return facts.joined(separator: " · ")
         }
     }
 

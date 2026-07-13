@@ -187,6 +187,7 @@ public struct HostSnapshot: Sendable, Equatable {
     public var probeDurationMilliseconds: Int?
     public var operatingSystem: String?
     public var bootDescription: String?
+    public var codexVersion: String?
     public var diskPercent: Int?
     public var memoryPercent: Int?
     public var loadAverage: Double?
@@ -207,6 +208,7 @@ public struct HostSnapshot: Sendable, Equatable {
         probeDurationMilliseconds: Int? = nil,
         operatingSystem: String? = nil,
         bootDescription: String? = nil,
+        codexVersion: String? = nil,
         diskPercent: Int? = nil,
         memoryPercent: Int? = nil,
         loadAverage: Double? = nil,
@@ -226,6 +228,7 @@ public struct HostSnapshot: Sendable, Equatable {
         self.probeDurationMilliseconds = probeDurationMilliseconds
         self.operatingSystem = operatingSystem
         self.bootDescription = bootDescription
+        self.codexVersion = codexVersion
         self.diskPercent = diskPercent
         self.memoryPercent = memoryPercent
         self.loadAverage = loadAverage
@@ -1355,6 +1358,7 @@ public enum ProbeParser {
 
         let os = value(after: "OS=", in: lines)
         let boot = value(after: "BOOT=", in: lines)
+        let codexVersion = normalizeCodexVersion(value(after: "CODEX=", in: lines))
         let diskText = value(after: "DISK=", in: lines)?.replacingOccurrences(of: "%", with: "")
         let disk = diskText.flatMap(Int.init)
         let memory = value(after: "MEM=", in: lines).flatMap(Int.init)
@@ -1369,6 +1373,7 @@ public enum ProbeParser {
             probeDurationMilliseconds: result.elapsedMilliseconds,
             operatingSystem: os,
             bootDescription: normalizeBoot(boot),
+            codexVersion: codexVersion,
             diskPercent: disk,
             memoryPercent: memory,
             loadAverage: load,
@@ -1408,6 +1413,19 @@ public enum ProbeParser {
         return String(meaningful.prefix(120))
     }
 
+    private static func normalizeCodexVersion(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        switch raw.lowercased() {
+        case "not-installed": return "Not installed"
+        case "unavailable": return "Unavailable"
+        default:
+            for prefix in ["codex-cli ", "codex "] where raw.lowercased().hasPrefix(prefix) {
+                return String(raw.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return raw
+        }
+    }
+
     private static func normalizeBoot(_ raw: String?) -> String? {
         guard let raw else { return nil }
 
@@ -1438,7 +1456,24 @@ public enum RemoteCommandBuilder {
           mem=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2} END{if(t>0)printf "%.0f",(t-a)*100/t}' /proc/meminfo 2>/dev/null)
         fi
         disk=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $5}')
-        printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
+        codex_bin=$(command -v codex 2>/dev/null || true)
+        if [ -z "$codex_bin" ]; then
+          for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+            if [ -x "$candidate" ]; then codex_bin=$candidate; break; fi
+          done
+        fi
+        if [ -z "$codex_bin" ] && [ -s "$HOME/.nvm/nvm.sh" ]; then
+          . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+          nvm use --silent default >/dev/null 2>&1 || nvm use --silent node >/dev/null 2>&1 || true
+          codex_bin=$(command -v codex 2>/dev/null || true)
+        fi
+        if [ -n "$codex_bin" ]; then
+          codex_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | tr -d '\r')
+          if [ -z "$codex_version" ]; then codex_version=unavailable; fi
+        else
+          codex_version=not-installed
+        fi
+        printf 'OS=%s\nBOOT=%s\nCODEX=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$codex_version" "$disk" "$load" "$mem"
         """
 
         return ([base] + services.map(serviceCommand)).joined(separator: "\n")
@@ -1487,6 +1522,7 @@ public enum FleetReportBuilder {
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             var facts = [snapshot.state.rawValue.capitalized]
             if let os = snapshot.operatingSystem { facts.append(os) }
+            if let codexVersion = snapshot.codexVersion { facts.append("Codex \(codexVersion)") }
             if let disk = snapshot.diskPercent { facts.append("disk \(disk)%") }
             if let memory = snapshot.memoryPercent { facts.append("memory \(memory)%") }
             if let load = snapshot.loadAverage { facts.append(String(format: "load %.2f", load)) }

@@ -69,6 +69,7 @@ private enum TrendRange: Double, CaseIterable, Identifiable {
 private struct FleetMenuView: View {
     @ObservedObject var model: FleetModel
     @State private var selectedSection: PanelSection = .fleet
+    @State private var confirmingCodexFleetUpdate = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -175,11 +176,14 @@ private struct FleetMenuView: View {
                                 routeTests: model.routeTests[host.id] ?? [],
                                 isRefreshing: model.refreshingHostIDs.contains(host.id),
                                 isPinned: model.pinnedHostIDs.contains(host.id),
+                                codexUpdate: model.codexUpdates[host.id],
+                                isCodexUpdateBusy: model.isUpdatingCodex,
                                 onTogglePin: { model.togglePinned(host) },
                                 onWake: { Task { await model.wake(host) } },
                                 onSSH: { model.openSSH(host) },
                                 onCopy: { model.copyDiagnostics(for: host) },
                                 onRefresh: { Task { await model.refresh(host) } },
+                                onUpdateCodex: { Task { await model.updateCodex(on: host) } },
                                 onTestRoutes: { Task { await model.testRoutes(for: host) } }
                             )
                         }
@@ -229,7 +233,40 @@ private struct FleetMenuView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if confirmingCodexFleetUpdate {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.up.circle")
+                        .foregroundStyle(.blue)
+                    Text(model.hosts.count == 1
+                        ? "Update Codex on this machine?"
+                        : "Update Codex on all \(model.hosts.count) machines?")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    Button("Cancel") { confirmingCodexFleetUpdate = false }
+                    Button("Update All") {
+                        confirmingCodexFleetUpdate = false
+                        Task { await model.updateCodexOnAllHosts() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+
             HStack {
+                Button {
+                    confirmingCodexFleetUpdate = true
+                } label: {
+                    if model.isUpdatingCodex {
+                        Label(
+                            "Updating \(model.codexUpdateCompletedCount)/\(model.codexUpdateTotalCount)",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                    } else {
+                        Label("Update Codex", systemImage: "arrow.up.circle")
+                    }
+                }
+                .disabled(model.isUpdatingCodex || model.isRefreshing)
+                .help("Update and verify Codex on every configured machine")
                 Button("Copy Full Diagnosis") { model.copyReport() }
                 Menu("Data") {
                     Button("Export History as CSV…") { model.exportHistoryCSV() }
@@ -1428,11 +1465,14 @@ private struct HostRow: View {
     let routeTests: [RouteProbeResult]
     let isRefreshing: Bool
     let isPinned: Bool
+    let codexUpdate: HostCodexUpdateProgress?
+    let isCodexUpdateBusy: Bool
     let onTogglePin: () -> Void
     let onWake: () -> Void
     let onSSH: () -> Void
     let onCopy: () -> Void
     let onRefresh: () -> Void
+    let onUpdateCodex: () -> Void
     let onTestRoutes: () -> Void
 
     @State private var isExpanded = false
@@ -1461,6 +1501,12 @@ private struct HostRow: View {
                         .font(.caption)
                         .foregroundStyle(snapshot.state == .unreachable ? .red : .secondary)
                         .lineLimit(2)
+                    if let codexUpdate {
+                        Label(codexUpdate.detail, systemImage: codexUpdateSystemImage)
+                            .font(.caption2)
+                            .foregroundStyle(codexUpdateColor)
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 4)
@@ -1491,6 +1537,8 @@ private struct HostRow: View {
                 Menu {
                     Button("Refresh This Machine", action: onRefresh)
                         .disabled(isRefreshing)
+                    Button("Update Codex", action: onUpdateCodex)
+                        .disabled(isCodexUpdateBusy || isRefreshing || snapshot.state != .online)
                     if !host.isLocal {
                         Button("Open SSH", action: onSSH)
                             .disabled(snapshot.state != .online)
@@ -1653,6 +1701,26 @@ private struct HostRow: View {
             return .orange
         case .unreachable:
             return .red
+        }
+    }
+
+    private var codexUpdateSystemImage: String {
+        switch codexUpdate?.phase {
+        case .queued: "clock"
+        case .updating: "arrow.triangle.2.circlepath"
+        case .succeeded: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        case nil: "arrow.up.circle"
+        }
+    }
+
+    private var codexUpdateColor: Color {
+        switch codexUpdate?.phase {
+        case .queued: .secondary
+        case .updating: .blue
+        case .succeeded: .green
+        case .failed: .red
+        case nil: .secondary
         }
     }
 

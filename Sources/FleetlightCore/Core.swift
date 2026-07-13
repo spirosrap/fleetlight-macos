@@ -1547,6 +1547,134 @@ public enum RemoteCommandBuilder {
     }
 }
 
+public struct CodexUpdateOutcome: Equatable, Sendable {
+    public let succeeded: Bool
+    public let activeVersion: String?
+    public let detail: String
+
+    public init(succeeded: Bool, activeVersion: String?, detail: String) {
+        self.succeeded = succeeded
+        self.activeVersion = activeVersion
+        self.detail = detail
+    }
+}
+
+public enum CodexUpdateCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_CODEX_UPDATE\n'
+        shell_bin=${SHELL:-/bin/sh}
+        codex_bin=$("$shell_bin" -ic 'command -v codex 2>/dev/null || true' 2>/dev/null | sed -n '1p' | tr -d '\r')
+        if [ -z "$codex_bin" ]; then
+          codex_bin=$(command -v codex 2>/dev/null || true)
+        fi
+        if [ -z "$codex_bin" ]; then
+          for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+            if [ -x "$candidate" ]; then codex_bin=$candidate; break; fi
+          done
+        fi
+        if [ -z "$codex_bin" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+          codex_bin=$(find "$HOME/.nvm/versions/node" -type f -path '*/bin/codex' 2>/dev/null | sed -n '1p')
+        fi
+        if [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; then
+          printf 'UPDATE:missing\nVERIFY:failed\n'
+          exit 2
+        fi
+
+        PATH=$(dirname "$codex_bin"):$PATH
+        export PATH
+        before_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | sed 's/^codex-cli //' | tr -d '\r')
+        printf 'BEFORE_VERSION:%s\n' "$before_version"
+        update_log=$(mktemp "${TMPDIR:-/tmp}/fleetlight-codex-update.XXXXXX")
+        "$codex_bin" update >"$update_log" 2>&1
+        update_status=$?
+        tail -n 12 "$update_log" 2>/dev/null || true
+        rm -f "$update_log"
+
+        active_version=$("$shell_bin" -ic 'codex -V 2>/dev/null || true' 2>/dev/null | sed -n '$p' | sed 's/^codex-cli //' | tr -d '\r')
+        if [ -z "$active_version" ]; then
+          active_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | sed 's/^codex-cli //' | tr -d '\r')
+        fi
+        printf 'ACTIVE_VERSION:%s\n' "$active_version"
+        if [ "$update_status" -eq 0 ] && [ -n "$active_version" ]; then
+          printf 'UPDATE:ok\nVERIFY:ok\n'
+          exit 0
+        fi
+        printf 'UPDATE:failed:%s\nVERIFY:failed\n' "$update_status"
+        exit 1
+        """
+    }
+}
+
+public enum CodexUpdateParser {
+    public static func outcome(from result: CommandResult) -> CodexUpdateOutcome {
+        let lines = result.stdout
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let activeVersion = value(after: "ACTIVE_VERSION:", in: lines).flatMap(normalizeVersion)
+
+        if result.timedOut {
+            return CodexUpdateOutcome(
+                succeeded: false,
+                activeVersion: activeVersion,
+                detail: "Update timed out"
+            )
+        }
+
+        if result.exitCode == 0, lines.contains("VERIFY:ok") {
+            let detail = activeVersion.map { "Codex \($0) is current" } ?? "Codex update completed"
+            return CodexUpdateOutcome(succeeded: true, activeVersion: activeVersion, detail: detail)
+        }
+
+        if lines.contains("UPDATE:missing") {
+            return CodexUpdateOutcome(
+                succeeded: false,
+                activeVersion: nil,
+                detail: "Codex is not installed"
+            )
+        }
+
+        if let activeVersion {
+            return CodexUpdateOutcome(
+                succeeded: false,
+                activeVersion: activeVersion,
+                detail: "Update failed; still using Codex \(activeVersion)"
+            )
+        }
+
+        let errorLine = result.stderr
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .last(where: { !$0.isEmpty })
+            ?? lines.last(where: { line in
+                !line.hasPrefix("FLEETLIGHT_")
+                    && !line.hasPrefix("BEFORE_VERSION:")
+                    && !line.hasPrefix("UPDATE:")
+                    && !line.hasPrefix("VERIFY:")
+            })
+        return CodexUpdateOutcome(
+            succeeded: false,
+            activeVersion: nil,
+            detail: errorLine.map { String($0.prefix(140)) } ?? "Codex update failed"
+        )
+    }
+
+    private static func value(after prefix: String, in lines: [String]) -> String? {
+        guard let line = lines.last(where: { $0.hasPrefix(prefix) }) else { return nil }
+        let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func normalizeVersion(_ raw: String) -> String? {
+        let value = raw.lowercased().hasPrefix("codex-cli ")
+            ? String(raw.dropFirst("codex-cli ".count))
+            : raw
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
 public enum FleetReportBuilder {
     public static func build(
         hosts: [FleetHost],

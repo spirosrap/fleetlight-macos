@@ -123,6 +123,40 @@ let noCodexResult = CommandResult(
 )
 test.require(ProbeParser.snapshot(from: noCodexResult).codexVersion == "Not installed", "missing Codex CLI should be explicit instead of unknown")
 
+let codexUpdateCommand = CodexUpdateCommandBuilder.build()
+test.require(codexUpdateCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_UPDATE"), "Codex updater should emit a verification marker before changing anything")
+test.require(codexUpdateCommand.contains("\"$codex_bin\" update"), "Codex updater should use the supported self-update command")
+test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'command -v codex"), "Codex updater should resolve the interactive-shell installation")
+
+let successfulCodexUpdate = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_CODEX_UPDATE\nBEFORE_VERSION:0.137.0\nACTIVE_VERSION:0.144.2\nUPDATE:ok\nVERIFY:ok\n",
+    stderr: "",
+    elapsedMilliseconds: 1_250,
+    timedOut: false
+)
+let successfulCodexOutcome = CodexUpdateParser.outcome(from: successfulCodexUpdate)
+test.require(successfulCodexOutcome.succeeded, "verified Codex updates should succeed")
+test.require(successfulCodexOutcome.activeVersion == "0.144.2", "verified Codex updates should report the active version")
+
+let missingCodexUpdate = CommandResult(
+    exitCode: 2,
+    stdout: "FLEETLIGHT_CODEX_UPDATE\nUPDATE:missing\nVERIFY:failed\n",
+    stderr: "",
+    elapsedMilliseconds: 50,
+    timedOut: false
+)
+test.require(CodexUpdateParser.outcome(from: missingCodexUpdate).detail == "Codex is not installed", "missing Codex should have a clear update failure")
+
+let timedOutCodexUpdate = CommandResult(
+    exitCode: 15,
+    stdout: "FLEETLIGHT_CODEX_UPDATE\n",
+    stderr: "",
+    elapsedMilliseconds: 300_000,
+    timedOut: true
+)
+test.require(CodexUpdateParser.outcome(from: timedOutCodexUpdate).detail == "Update timed out", "Codex update timeouts should be explicit")
+
 let defaultHost = FleetHost.defaults.first!
 test.require(FleetHost.defaults.count == 1, "the public default fleet should contain only this Mac")
 test.require(defaultHost.id == "local" && defaultHost.isLocal, "the public default should not contain a private SSH target")

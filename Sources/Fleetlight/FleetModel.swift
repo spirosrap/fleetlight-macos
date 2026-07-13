@@ -4,6 +4,18 @@ import FleetlightCore
 import ServiceManagement
 import UniformTypeIdentifiers
 
+enum HostCodexUpdatePhase: Equatable {
+    case queued
+    case updating
+    case succeeded
+    case failed
+}
+
+struct HostCodexUpdateProgress: Equatable {
+    let phase: HostCodexUpdatePhase
+    let detail: String
+}
+
 @MainActor
 final class FleetModel: ObservableObject {
     @Published private(set) var snapshots: [String: HostSnapshot]
@@ -13,6 +25,10 @@ final class FleetModel: ObservableObject {
     @Published private(set) var routeTests: [String: [RouteProbeResult]] = [:]
     @Published private(set) var refreshingHostIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var codexUpdates: [String: HostCodexUpdateProgress] = [:]
+    @Published private(set) var isUpdatingCodex = false
+    @Published private(set) var codexUpdateCompletedCount = 0
+    @Published private(set) var codexUpdateTotalCount = 0
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var hiddenHostIDs: Set<String>
     @Published private(set) var hosts: [FleetHost]
@@ -198,6 +214,75 @@ final class FleetModel: ObservableObject {
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
         isRefreshing = false
+    }
+
+    func updateCodexOnAllHosts() async {
+        await performCodexUpdates(on: hosts)
+    }
+
+    func updateCodex(on host: FleetHost) async {
+        await performCodexUpdates(on: [host])
+    }
+
+    private func performCodexUpdates(on targets: [FleetHost]) async {
+        guard !targets.isEmpty, !isUpdatingCodex else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+
+        pollTask?.cancel()
+        isUpdatingCodex = true
+        codexUpdateCompletedCount = 0
+        codexUpdateTotalCount = targets.count
+        codexUpdates = Dictionary(uniqueKeysWithValues: targets.map {
+            ($0.id, HostCodexUpdateProgress(phase: .queued, detail: "Waiting to update…"))
+        })
+        notice = targets.count == 1
+            ? "Preparing Codex update for \(targets[0].displayName)"
+            : "Updating Codex sequentially on \(targets.count) machines"
+        await ActivityLogger.shared.append(
+            event: "codex-update-started",
+            detail: "targets=\(targets.count)"
+        )
+
+        for host in targets {
+            codexUpdates[host.id] = HostCodexUpdateProgress(
+                phase: .updating,
+                detail: "Updating Codex…"
+            )
+            let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+            let result = await Self.runCodexUpdate(host: host, routeAlias: routeAlias)
+            let outcome = CodexUpdateParser.outcome(from: result)
+            codexUpdates[host.id] = HostCodexUpdateProgress(
+                phase: outcome.succeeded ? .succeeded : .failed,
+                detail: outcome.detail
+            )
+            codexUpdateCompletedCount += 1
+            await ActivityLogger.shared.append(
+                event: outcome.succeeded ? "codex-update-succeeded" : "codex-update-failed",
+                host: host.id,
+                detail: outcome.detail
+            )
+        }
+
+        if targets.count == 1, let host = targets.first {
+            await refresh(host)
+        } else {
+            await refreshAll()
+        }
+
+        let succeeded = codexUpdates.values.filter { $0.phase == .succeeded }.count
+        let failed = codexUpdates.values.filter { $0.phase == .failed }.count
+        isUpdatingCodex = false
+        if started { schedulePolling() }
+        notice = failed == 0
+            ? "Codex update verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
+            : "Codex update: \(succeeded) verified · \(failed) failed"
+        await ActivityLogger.shared.append(
+            event: "codex-update-finished",
+            detail: "verified=\(succeeded); failed=\(failed)"
+        )
     }
 
     func setRefreshInterval(_ interval: TimeInterval) {
@@ -796,6 +881,44 @@ final class FleetModel: ObservableObject {
         let identifier = "\(host)-\(event)-\(Int(Date().timeIntervalSince1970))"
         await NotificationManager.shared.send(title: title, body: body, identifier: identifier)
         await ActivityLogger.shared.append(event: "notification-sent", host: host, detail: "\(title): \(body)")
+    }
+
+    nonisolated private static func runCodexUpdate(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        let command = CodexUpdateCommandBuilder.build()
+        return await Task.detached {
+            if host.isLocal {
+                return CommandRunner.run(
+                    executable: "/bin/sh",
+                    arguments: ["-c", command],
+                    timeout: 300
+                )
+            }
+            guard let routeAlias else {
+                return CommandResult(
+                    exitCode: -1,
+                    stdout: "",
+                    stderr: "No SSH route configured",
+                    elapsedMilliseconds: 0,
+                    timedOut: false
+                )
+            }
+            return CommandRunner.run(
+                executable: "/usr/bin/ssh",
+                arguments: [
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=12",
+                    "-o", "ConnectionAttempts=1",
+                    "-o", "ServerAliveInterval=15",
+                    "-o", "ServerAliveCountMax=2",
+                    routeAlias,
+                    command,
+                ],
+                timeout: 300
+            )
+        }.value
     }
 
     nonisolated private static func probe(host: FleetHost) async -> HostSnapshot {

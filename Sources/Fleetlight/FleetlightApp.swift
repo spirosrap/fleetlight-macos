@@ -627,8 +627,11 @@ private struct CodexView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Codex desktop app")
                                     .font(.headline)
-                                Text("Uses OpenAI’s updater and restarts Codex only when an update is installed")
+                                Text(desktopAppVersionDetail)
                                     .font(.caption)
+                                    .foregroundStyle(Color.primary.opacity(0.78))
+                                Text("OpenAI’s updater restarts Codex only when it installs a newer version")
+                                    .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -646,15 +649,18 @@ private struct CodexView: View {
                         }
                         .padding(.top, 2)
 
-                        ForEach(model.codexDesktopAppHosts) { host in
-                            CodexDesktopAppMachineRow(
-                                host: host,
-                                snapshot: model.snapshots[host.id] ?? HostSnapshot(),
-                                updateProgress: model.codexDesktopAppUpdates[host.id],
-                                isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
-                                onUpdate: { pendingDesktopAppHost = host }
-                            )
+                        VStack(spacing: 8) {
+                            ForEach(model.codexDesktopAppHosts) { host in
+                                CodexDesktopAppMachineRow(
+                                    host: host,
+                                    snapshot: model.snapshots[host.id] ?? HostSnapshot(),
+                                    updateProgress: model.codexDesktopAppUpdates[host.id],
+                                    isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
+                                    onUpdate: { pendingDesktopAppHost = host }
+                                )
+                            }
                         }
+                        .id("codex-desktop-app-machines")
                     }
                 }
                 .padding(12)
@@ -704,6 +710,23 @@ private struct CodexView: View {
         return model.codexReleaseCheckFailed
             ? "Latest stable release is temporarily unavailable"
             : "Latest stable release has not been checked yet"
+    }
+
+    private var desktopAppVersionDetail: String {
+        let installed = model.codexDesktopAppHosts.compactMap { host -> (name: String, version: String)? in
+            guard let version = model.snapshots[host.id]?.codexDesktopAppVersion else { return nil }
+            let build = model.snapshots[host.id]?.codexDesktopAppBuild.map { " (build \($0))" } ?? ""
+            return (host.displayName, "\(version)\(build)")
+        }
+        guard !installed.isEmpty else { return "Installed app version unavailable until the next successful refresh" }
+
+        let uniqueVersions = Set(installed.map(\.version))
+        if installed.count == model.codexDesktopAppHosts.count,
+           uniqueVersions.count == 1,
+           let version = installed.first?.version {
+            return "Version \(version) on \(installed.count) Mac\(installed.count == 1 ? "" : "s")"
+        }
+        return installed.map { "\($0.name): \($0.version)" }.joined(separator: " · ")
     }
 }
 

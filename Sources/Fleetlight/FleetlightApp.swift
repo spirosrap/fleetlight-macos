@@ -66,10 +66,22 @@ private enum TrendRange: Double, CaseIterable, Identifiable {
     }
 }
 
+private enum CodexFleetUpdateScope {
+    case available
+    case all
+
+    var confirmationButtonTitle: String {
+        switch self {
+        case .available: "Update Available"
+        case .all: "Update All"
+        }
+    }
+}
+
 private struct FleetMenuView: View {
     @ObservedObject var model: FleetModel
     @State private var selectedSection: PanelSection = .fleet
-    @State private var confirmingCodexFleetUpdate = false
+    @State private var pendingCodexFleetUpdate: CodexFleetUpdateScope?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -234,17 +246,16 @@ private struct FleetMenuView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if confirmingCodexFleetUpdate {
+            if let pendingCodexFleetUpdate {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.up.circle")
                         .foregroundStyle(.blue)
-                    Text(model.codexUpdateConfirmationText)
+                    Text(codexUpdateConfirmationText(for: pendingCodexFleetUpdate))
                         .font(.caption.weight(.semibold))
                     Spacer()
-                    Button("Cancel") { confirmingCodexFleetUpdate = false }
-                    Button("Update All") {
-                        confirmingCodexFleetUpdate = false
-                        Task { await model.updateCodexOnAllHosts() }
+                    Button("Cancel") { self.pendingCodexFleetUpdate = nil }
+                    Button(pendingCodexFleetUpdate.confirmationButtonTitle) {
+                        confirmCodexUpdate(pendingCodexFleetUpdate)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
@@ -275,19 +286,64 @@ private struct FleetMenuView: View {
 
             HStack {
                 Button {
-                    confirmingCodexFleetUpdate = true
+                    if model.codexUpdateAvailableCount > 0 {
+                        pendingCodexFleetUpdate = .available
+                    } else {
+                        Task { await model.checkCodexReleaseNow() }
+                    }
                 } label: {
                     if model.isUpdatingCodex {
                         Label(
                             "Updating \(model.codexUpdateCompletedCount)/\(model.codexUpdateTotalCount)",
                             systemImage: "arrow.triangle.2.circlepath"
                         )
+                    } else if model.codexUpdateAvailableCount > 0 {
+                        Label(
+                            "Update \(model.codexUpdateAvailableCount) Available",
+                            systemImage: "arrow.up.circle.fill"
+                        )
+                    } else if model.isCheckingCodexRelease {
+                        Label("Checking Latest", systemImage: "arrow.triangle.2.circlepath")
+                    } else if model.onlineCodexMachinesAreCurrent {
+                        Label("Online Current", systemImage: "checkmark.circle")
                     } else {
-                        Label("Update Codex", systemImage: "arrow.up.circle")
+                        Label("Check Codex", systemImage: "arrow.clockwise.circle")
                     }
                 }
-                .disabled(model.isUpdatingCodex || model.isRefreshing)
-                .help("Update and verify Codex on every configured machine")
+                .disabled(
+                    model.isUpdatingCodex
+                        || model.isRefreshing
+                        || model.isCheckingCodexRelease
+                        || model.onlineCodexMachinesAreCurrent
+                )
+                .help(
+                    model.codexUpdateAvailableCount > 0
+                        ? "Update and verify only the online machines with an older Codex version"
+                        : "Check npm for the latest stable Codex version"
+                )
+                Menu {
+                    Button("Check Latest Now") {
+                        Task { await model.checkCodexReleaseNow() }
+                    }
+                    .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isUpdatingCodex)
+                    if model.codexUpdateAvailableCount > 0 {
+                        Divider()
+                        Button("Update \(model.codexUpdateAvailableCount) Available") {
+                            pendingCodexFleetUpdate = .available
+                        }
+                        .disabled(model.isRefreshing || model.isUpdatingCodex)
+                    }
+                    Divider()
+                    Button("Update All \(model.hosts.count) Machines") {
+                        pendingCodexFleetUpdate = .all
+                    }
+                    .disabled(model.isRefreshing || model.isUpdatingCodex)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("More Codex update options")
                 Button("Copy Full Diagnosis") { model.copyReport() }
                 Menu("Data") {
                     Button("Export History as CSV…") { model.exportHistoryCSV() }
@@ -320,6 +376,27 @@ private struct FleetMenuView: View {
             .font(.caption)
         }
         .padding(12)
+    }
+
+    private func codexUpdateConfirmationText(for scope: CodexFleetUpdateScope) -> String {
+        switch scope {
+        case .available:
+            return model.codexAvailableUpdateConfirmationText
+        case .all:
+            return model.codexAllUpdateConfirmationText
+        }
+    }
+
+    private func confirmCodexUpdate(_ scope: CodexFleetUpdateScope) {
+        pendingCodexFleetUpdate = nil
+        Task {
+            switch scope {
+            case .available:
+                await model.updateCodexOnAvailableHosts()
+            case .all:
+                await model.updateCodexOnAllHosts()
+            }
+        }
     }
 }
 

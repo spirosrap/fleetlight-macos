@@ -104,15 +104,33 @@ final class FleetModel: ObservableObject {
         attentionSummary.serviceOrResourceAlertCount
     }
 
+    var codexUpdateAvailableHosts: [FleetHost] {
+        CodexUpdatePlanner.availableHosts(
+            hosts: hosts,
+            snapshots: snapshots,
+            latestVersion: latestCodexVersion
+        )
+    }
+
     var codexUpdateAvailableCount: Int {
-        hosts.filter { host in
+        codexUpdateAvailableHosts.count
+    }
+
+    var hasComparableOnlineCodexMachine: Bool {
+        hosts.contains { host in
             let snapshot = snapshots[host.id]
             return snapshot?.state == .online
-                && CodexReleaseChecker.isUpdateAvailable(
-                    installedVersion: snapshot?.codexVersion,
-                    latestVersion: latestCodexVersion
-                )
-        }.count
+                && snapshot?.codexVersion != nil
+                && snapshot?.codexVersion != "Not installed"
+                && snapshot?.codexVersion != "Unavailable"
+        }
+    }
+
+    var onlineCodexMachinesAreCurrent: Bool {
+        latestCodexVersion != nil
+            && !codexReleaseCheckFailed
+            && hasComparableOnlineCodexMachine
+            && codexUpdateAvailableHosts.isEmpty
     }
 
     var codexReleaseSummary: String? {
@@ -121,19 +139,12 @@ final class FleetModel: ObservableObject {
                 let qualifier = codexReleaseCheckFailed ? "last known latest" : "latest"
                 return "\(codexUpdateAvailableCount) update\(codexUpdateAvailableCount == 1 ? "" : "s") available · \(qualifier) \(latestCodexVersion)"
             }
-            let hasComparableMachine = hosts.contains { host in
-                let snapshot = snapshots[host.id]
-                return snapshot?.state == .online
-                    && snapshot?.codexVersion != nil
-                    && snapshot?.codexVersion != "Not installed"
-                    && snapshot?.codexVersion != "Unavailable"
-            }
             if codexReleaseCheckFailed {
-                return hasComparableMachine
+                return hasComparableOnlineCodexMachine
                     ? "No known updates · last known latest \(latestCodexVersion)"
                     : "Last known Codex \(latestCodexVersion)"
             }
-            return hasComparableMachine
+            return hasComparableOnlineCodexMachine
                 ? "Online machines current · latest \(latestCodexVersion)"
                 : "Latest Codex \(latestCodexVersion)"
         }
@@ -142,12 +153,18 @@ final class FleetModel: ObservableObject {
         return nil
     }
 
-    var codexUpdateConfirmationText: String {
-        let target = hosts.count == 1
-            ? "Update Codex on this machine?"
-            : "Update Codex on all \(hosts.count) machines?"
-        guard codexUpdateAvailableCount > 0, let latestCodexVersion else { return target }
-        return target + " \(codexUpdateAvailableCount) currently have version \(latestCodexVersion) available."
+    var codexAvailableUpdateConfirmationText: String {
+        let count = codexUpdateAvailableCount
+        let target = count == 1 ? "the outdated online machine" : "\(count) outdated online machines"
+        if let latestCodexVersion {
+            return "Update Codex on \(target) to \(latestCodexVersion)?"
+        }
+        return "Update Codex on \(target)?"
+    }
+
+    var codexAllUpdateConfirmationText: String {
+        let target = hosts.count == 1 ? "this machine" : "all \(hosts.count) machines"
+        return "Update Codex on \(target)? Offline machines cannot complete until they are reachable."
     }
 
     var attentionDescription: String {
@@ -299,6 +316,31 @@ final class FleetModel: ObservableObject {
         codexReleaseCheckFailed = false
         UserDefaults.standard.set(version, forKey: "latestCodexVersion")
         UserDefaults.standard.set(false, forKey: "codexReleaseCheckFailed")
+    }
+
+    func checkCodexReleaseNow() async {
+        guard !isCheckingCodexRelease else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+        isCheckingCodexRelease = true
+        notice = nil
+        applyCodexReleaseResult(await Self.fetchLatestCodexRelease())
+        if codexReleaseCheckFailed {
+            notice = "Couldn’t check the latest Codex version"
+        } else if let latestCodexVersion {
+            notice = "Latest stable Codex is \(latestCodexVersion)"
+        }
+    }
+
+    func updateCodexOnAvailableHosts() async {
+        let targets = codexUpdateAvailableHosts
+        guard !targets.isEmpty else {
+            notice = "No outdated online machines were found"
+            return
+        }
+        await performCodexUpdates(on: targets)
     }
 
     func updateCodexOnAllHosts() async {

@@ -133,6 +133,33 @@ test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-a
 test.require(CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-alpha.1", latestVersion: "0.145.0"), "a stable release should supersede the matching prerelease")
 test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "Not installed", latestVersion: "0.144.3"), "non-version installation states should not produce false update badges")
 
+let codexPlannerHosts = [
+    FleetHost(id: "outdated", displayName: "Outdated", systemImage: "desktopcomputer"),
+    FleetHost(id: "current", displayName: "Current", systemImage: "desktopcomputer"),
+    FleetHost(id: "offline", displayName: "Offline", systemImage: "desktopcomputer"),
+    FleetHost(id: "missing", displayName: "Missing", systemImage: "desktopcomputer"),
+]
+let codexPlannerSnapshots = [
+    "outdated": HostSnapshot(state: .online, codexVersion: "0.144.2"),
+    "current": HostSnapshot(state: .online, codexVersion: "0.144.3"),
+    "offline": HostSnapshot(state: .unreachable, codexVersion: "0.140.0"),
+    "missing": HostSnapshot(state: .online, codexVersion: "Not installed"),
+]
+let codexAvailableHosts = CodexUpdatePlanner.availableHosts(
+    hosts: codexPlannerHosts,
+    snapshots: codexPlannerSnapshots,
+    latestVersion: "0.144.3"
+)
+test.require(codexAvailableHosts.map(\.id) == ["outdated"], "smart Codex updates should target only outdated online machines")
+test.require(
+    CodexUpdatePlanner.availableHosts(
+        hosts: codexPlannerHosts,
+        snapshots: codexPlannerSnapshots,
+        latestVersion: nil
+    ).isEmpty,
+    "smart Codex updates should wait until the latest stable version is known"
+)
+
 let codexUpdateCommand = CodexUpdateCommandBuilder.build()
 test.require(codexUpdateCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_UPDATE"), "Codex updater should emit a verification marker before changing anything")
 test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'codex update'"), "Codex updater should honor interactive-shell functions and wrappers")

@@ -75,6 +75,7 @@ Supported machine fields:
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
+- Smart Codex updates that target only outdated online machines by default, with a manual latest-version check and an explicit Update All override
 - Confirmed one-click Codex updates across the fleet, with restart-safe resume, sequential progress, version verification, and individual update actions
 - Clear Codex update outcomes for not-yet-attempted, offline, failed, and verified machines, including shell-wrapper-aware updates
 - Configurable performance-warning thresholds

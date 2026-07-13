@@ -1653,6 +1653,23 @@ public enum CodexReleaseChecker {
     }
 }
 
+public enum CodexUpdatePlanner {
+    public static func availableHosts(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        latestVersion: String?
+    ) -> [FleetHost] {
+        hosts.filter { host in
+            let snapshot = snapshots[host.id]
+            return snapshot?.state == .online
+                && CodexReleaseChecker.isUpdateAvailable(
+                    installedVersion: snapshot?.codexVersion,
+                    latestVersion: latestVersion
+                )
+        }
+    }
+}
+
 public enum CodexUpdateStatus: Equatable, Sendable {
     case succeeded
     case offline

@@ -79,6 +79,7 @@ Supported machine fields:
 - Separate Mac App and CLI views in the Codex dashboard, opening on the Mac App view so signed app versions and builds are immediately visible
 - Mac App summaries for current, update available, offline, missing, and unknown states, with explicit per-machine last-check times and a copyable version report
 - Cached checks of OpenAI’s official Codex Mac app feed, with latest version/build details, per-Mac Current or Update Available status, and targeted updates for outdated Macs only
+- Optional one-time macOS alerts when a new Codex CLI or Mac app release affects an online machine, with visible feed-check freshness and per-release deduplication
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

@@ -420,7 +420,7 @@ private struct FleetMenuView: View {
             .buttonStyle(.borderless)
 
             HStack {
-                Toggle("Notifications", isOn: Binding(
+                Toggle("Fleet alerts", isOn: Binding(
                     get: { model.notificationsEnabled },
                     set: { model.setNotificationsEnabled($0) }
                 ))
@@ -550,12 +550,23 @@ private struct CodexView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Codex view", selection: $selectedSubview) {
-                Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
-                Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
+            HStack(spacing: 10) {
+                Picker("Codex view", selection: $selectedSubview) {
+                    Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
+                    Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                Toggle("Alerts", isOn: Binding(
+                    get: { model.codexUpdateAlertsEnabled },
+                    set: { model.setCodexUpdateAlertsEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .fixedSize()
+                .help("Notify once when a new Codex release affects an online machine")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
 
@@ -571,6 +582,11 @@ private struct CodexView: View {
                     Text(releaseDetail)
                         .font(.caption)
                         .foregroundStyle(model.codexReleaseCheckFailed ? Color.orange : Color.secondary)
+                    if !model.isCheckingCodexRelease {
+                        Text(model.codexReleaseFreshnessText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Spacer()
@@ -700,6 +716,11 @@ private struct CodexView: View {
                     Text(desktopAppReleaseDetail)
                         .font(.caption)
                         .foregroundStyle(model.codexDesktopAppReleaseCheckFailed ? Color.orange : Color.primary.opacity(0.78))
+                    if !model.isCheckingCodexDesktopAppRelease {
+                        Text(model.codexDesktopAppReleaseFreshnessText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(desktopAppVersionDetail)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -2139,6 +2160,10 @@ private struct FleetSettingsView: View {
                 Toggle("Notify on confirmed outages and recoveries", isOn: Binding(
                     get: { model.notificationsEnabled },
                     set: { model.setNotificationsEnabled($0) }
+                ))
+                Toggle("Notify when Codex updates are available", isOn: Binding(
+                    get: { model.codexUpdateAlertsEnabled },
+                    set: { model.setCodexUpdateAlertsEnabled($0) }
                 ))
                 Toggle("Open Fleetlight at login", isOn: Binding(
                     get: { model.launchAtLogin },

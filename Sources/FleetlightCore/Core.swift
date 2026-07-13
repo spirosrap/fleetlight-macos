@@ -938,6 +938,79 @@ public enum CodexDesktopAppReleaseChecker {
     }
 }
 
+public enum ReleaseCheckFreshness {
+    public static func label(
+        checkedAt: Date?,
+        now: Date = Date(),
+        failed: Bool
+    ) -> String {
+        guard let checkedAt else { return "Not checked yet" }
+        let elapsed = max(0, now.timeIntervalSince(checkedAt))
+        let age: String
+        switch elapsed {
+        case ..<60:
+            age = "just now"
+        case ..<3_600:
+            age = "\(max(1, Int(elapsed / 60)))m ago"
+        case ..<86_400:
+            age = "\(max(1, Int(elapsed / 3_600)))h ago"
+        default:
+            age = "\(max(1, Int(elapsed / 86_400)))d ago"
+        }
+        return failed ? "Last attempt \(age)" : "Checked \(age)"
+    }
+}
+
+public struct CodexUpdateAlert: Sendable, Equatable {
+    public let releaseKey: String
+    public let title: String
+    public let body: String
+    public let identifier: String
+
+    public init(releaseKey: String, title: String, body: String, identifier: String) {
+        self.releaseKey = releaseKey
+        self.title = title
+        self.body = body
+        self.identifier = identifier
+    }
+}
+
+public enum CodexUpdateAlertPlanner {
+    public static func cliAlert(
+        latestVersion: String?,
+        updateCount: Int,
+        lastNotifiedVersion: String?
+    ) -> CodexUpdateAlert? {
+        guard updateCount > 0,
+              let latestVersion,
+              latestVersion != lastNotifiedVersion else { return nil }
+        let machines = updateCount == 1 ? "1 machine" : "\(updateCount) machines"
+        return CodexUpdateAlert(
+            releaseKey: latestVersion,
+            title: "Codex CLI update available",
+            body: "Version \(latestVersion) is available for \(machines).",
+            identifier: "codex-cli-update-\(latestVersion)"
+        )
+    }
+
+    public static func desktopAppAlert(
+        latestRelease: CodexDesktopAppRelease?,
+        updateCount: Int,
+        lastNotifiedBuild: String?
+    ) -> CodexUpdateAlert? {
+        guard updateCount > 0,
+              let latestRelease,
+              latestRelease.build != lastNotifiedBuild else { return nil }
+        let macs = updateCount == 1 ? "1 Mac" : "\(updateCount) Macs"
+        return CodexUpdateAlert(
+            releaseKey: latestRelease.build,
+            title: "Codex Mac app update available",
+            body: "Version \(latestRelease.version) (build \(latestRelease.build)) is available for \(macs).",
+            identifier: "codex-mac-app-update-\(latestRelease.build)"
+        )
+    }
+}
+
 public enum CodexDesktopAppReportBuilder {
     public static func summarize(
         hosts: [FleetHost],

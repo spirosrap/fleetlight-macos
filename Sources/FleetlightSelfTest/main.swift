@@ -190,6 +190,31 @@ let releaseReport = CodexDesktopAppReportBuilder.build(
 test.require(releaseReport.contains("Latest 26.708.10000 (build 5220)"), "Mac app reports should name the official latest release")
 test.require(releaseReport.contains("update available"), "Mac app reports should mark outdated builds")
 
+let freshnessNow = Date(timeIntervalSince1970: 10_000)
+test.require(ReleaseCheckFreshness.label(checkedAt: nil, now: freshnessNow, failed: false) == "Not checked yet", "release freshness should identify missing checks")
+test.require(ReleaseCheckFreshness.label(checkedAt: freshnessNow.addingTimeInterval(-45), now: freshnessNow, failed: false) == "Checked just now", "fresh release checks should read naturally")
+test.require(ReleaseCheckFreshness.label(checkedAt: freshnessNow.addingTimeInterval(-125), now: freshnessNow, failed: true) == "Last attempt 2m ago", "failed release checks should label the attempt age")
+test.require(ReleaseCheckFreshness.label(checkedAt: freshnessNow.addingTimeInterval(-7_200), now: freshnessNow, failed: false) == "Checked 2h ago", "older release checks should expose stale hours")
+
+let cliUpdateAlert = CodexUpdateAlertPlanner.cliAlert(
+    latestVersion: "0.145.0",
+    updateCount: 2,
+    lastNotifiedVersion: nil
+)
+test.require(cliUpdateAlert?.releaseKey == "0.145.0", "CLI update alerts should remember the published version")
+test.require(cliUpdateAlert?.body.contains("2 machines") == true, "CLI update alerts should name the affected machine count")
+test.require(CodexUpdateAlertPlanner.cliAlert(latestVersion: "0.145.0", updateCount: 2, lastNotifiedVersion: "0.145.0") == nil, "CLI update alerts should not repeat for the same release")
+test.require(CodexUpdateAlertPlanner.cliAlert(latestVersion: "0.145.0", updateCount: 0, lastNotifiedVersion: nil) == nil, "CLI update alerts should require an outdated online machine")
+
+let desktopUpdateAlert = CodexUpdateAlertPlanner.desktopAppAlert(
+    latestRelease: latestAppRelease,
+    updateCount: 1,
+    lastNotifiedBuild: nil
+)
+test.require(desktopUpdateAlert?.releaseKey == "5220", "Mac app update alerts should deduplicate by signed build")
+test.require(desktopUpdateAlert?.body.contains("1 Mac") == true, "Mac app update alerts should name the affected Mac count")
+test.require(CodexUpdateAlertPlanner.desktopAppAlert(latestRelease: latestAppRelease, updateCount: 1, lastNotifiedBuild: "5220") == nil, "Mac app update alerts should not repeat for the same build")
+
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")

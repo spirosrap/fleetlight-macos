@@ -34,6 +34,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var fleetSortMode: FleetSortMode
     @Published var launchAtLogin = false
     @Published var notificationsEnabled: Bool
+    @Published var codexUpdateAlertsEnabled: Bool
     @Published private(set) var performanceThresholds: PerformanceThresholds
     @Published var notice: String?
 
@@ -63,7 +64,10 @@ final class FleetModel: ObservableObject {
         fleetSortMode = UserDefaults.standard.string(forKey: "fleetSortMode")
             .flatMap(FleetSortMode.init(rawValue:))
             ?? .priority
-        notificationsEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
+        let fleetNotificationsEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
+        notificationsEnabled = fleetNotificationsEnabled
+        codexUpdateAlertsEnabled = (UserDefaults.standard.object(forKey: "codexUpdateAlertsEnabled") as? Bool)
+            ?? fleetNotificationsEnabled
         performanceThresholds = UserDefaults.standard.data(forKey: "performanceThresholds")
             .flatMap { try? JSONDecoder().decode(PerformanceThresholds.self, from: $0) }
             ?? .default
@@ -215,6 +219,20 @@ final class FleetModel: ObservableObject {
         if isCheckingCodexRelease { return "Checking latest Codex…" }
         if codexReleaseCheckFailed { return "Latest Codex version unavailable" }
         return nil
+    }
+
+    var codexReleaseFreshnessText: String {
+        ReleaseCheckFreshness.label(
+            checkedAt: codexReleaseCheckedAt,
+            failed: codexReleaseCheckFailed
+        )
+    }
+
+    var codexDesktopAppReleaseFreshnessText: String {
+        ReleaseCheckFreshness.label(
+            checkedAt: codexDesktopAppReleaseCheckedAt,
+            failed: codexDesktopAppReleaseCheckFailed
+        )
     }
 
     var codexAvailableUpdateConfirmationText: String {
@@ -449,6 +467,7 @@ final class FleetModel: ObservableObject {
         if let appReleaseTask {
             applyCodexDesktopAppReleaseResult(await appReleaseTask.value)
         }
+        await postCodexUpdateAlertsIfNeeded()
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
         isRefreshing = false
@@ -481,6 +500,7 @@ final class FleetModel: ObservableObject {
         isCheckingCodexRelease = true
         notice = nil
         applyCodexReleaseResult(await Self.fetchLatestCodexRelease())
+        await postCodexUpdateAlertsIfNeeded()
         if codexReleaseCheckFailed {
             notice = "Couldn’t check the latest Codex version"
         } else if let latestCodexVersion {
@@ -512,6 +532,7 @@ final class FleetModel: ObservableObject {
         isCheckingCodexDesktopAppRelease = true
         notice = nil
         applyCodexDesktopAppReleaseResult(await Self.fetchLatestCodexDesktopAppRelease())
+        await postCodexUpdateAlertsIfNeeded()
         if codexDesktopAppReleaseCheckFailed {
             notice = "Couldn’t check the latest Codex Mac app release"
         } else if let release = latestCodexDesktopAppRelease {
@@ -1250,6 +1271,25 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    func setCodexUpdateAlertsEnabled(_ enabled: Bool) {
+        guard enabled else {
+            codexUpdateAlertsEnabled = false
+            UserDefaults.standard.set(false, forKey: "codexUpdateAlertsEnabled")
+            notice = "Codex update alerts disabled"
+            return
+        }
+
+        Task {
+            let allowed = await NotificationManager.shared.requestAuthorization()
+            codexUpdateAlertsEnabled = allowed
+            UserDefaults.standard.set(allowed, forKey: "codexUpdateAlertsEnabled")
+            notice = allowed ? "Codex update alerts enabled" : "Notification permission was not granted"
+            if allowed {
+                await postCodexUpdateAlertsIfNeeded()
+            }
+        }
+    }
+
     private func logProbe(hostID: String, snapshot: HostSnapshot) async {
         let services = snapshot.services
             .map { "\($0.kind.rawValue)=\($0.state.rawValue)" }
@@ -1454,6 +1494,39 @@ final class FleetModel: ObservableObject {
         let identifier = "\(host)-\(event)-\(Int(Date().timeIntervalSince1970))"
         await NotificationManager.shared.send(title: title, body: body, identifier: identifier)
         await ActivityLogger.shared.append(event: "notification-sent", host: host, detail: "\(title): \(body)")
+    }
+
+    private func postCodexUpdateAlertsIfNeeded() async {
+        guard codexUpdateAlertsEnabled else { return }
+        let defaults = UserDefaults.standard
+
+        if let alert = CodexUpdateAlertPlanner.cliAlert(
+            latestVersion: latestCodexVersion,
+            updateCount: codexReleaseCheckFailed ? 0 : codexUpdateAvailableCount,
+            lastNotifiedVersion: defaults.string(forKey: "lastNotifiedCodexVersion")
+        ) {
+            await NotificationManager.shared.send(
+                title: alert.title,
+                body: alert.body,
+                identifier: alert.identifier
+            )
+            defaults.set(alert.releaseKey, forKey: "lastNotifiedCodexVersion")
+            await ActivityLogger.shared.append(event: "codex-update-alert", host: "fleet", detail: alert.body)
+        }
+
+        if let alert = CodexUpdateAlertPlanner.desktopAppAlert(
+            latestRelease: latestCodexDesktopAppRelease,
+            updateCount: codexDesktopAppReleaseCheckFailed ? 0 : codexDesktopAppReleaseSummary.updateAvailableCount,
+            lastNotifiedBuild: defaults.string(forKey: "lastNotifiedCodexDesktopAppBuild")
+        ) {
+            await NotificationManager.shared.send(
+                title: alert.title,
+                body: alert.body,
+                identifier: alert.identifier
+            )
+            defaults.set(alert.releaseKey, forKey: "lastNotifiedCodexDesktopAppBuild")
+            await ActivityLogger.shared.append(event: "codex-update-alert", host: "fleet", detail: alert.body)
+        }
     }
 
     nonisolated private static func fetchLatestCodexRelease() async -> String? {

@@ -167,6 +167,79 @@ final class FleetModel: ObservableObject {
         return "Update Codex on \(target)? Offline machines cannot complete until they are reachable."
     }
 
+    var codexUpdateVerifiedCount: Int {
+        codexUpdates.values.filter { $0.phase == .succeeded }.count
+    }
+
+    var codexUpdateOfflineCount: Int {
+        codexUpdates.values.filter { $0.phase == .offline }.count
+    }
+
+    var codexUpdateFailedCount: Int {
+        codexUpdates.values.filter { $0.phase == .failed }.count
+    }
+
+    var codexUpdateProblemCount: Int {
+        codexUpdateOfflineCount + codexUpdateFailedCount
+    }
+
+    var codexUpdateRetryReadyHosts: [FleetHost] {
+        let onlineHostIDs = Set(hosts.compactMap { host in
+            snapshots[host.id]?.state == .online ? host.id : nil
+        })
+        let retryHostIDs = CodexUpdateRecoveryPlanner.retryHostIDs(
+            orderedHostIDs: codexUpdateBatch?.targetHostIDs ?? hosts.map(\.id),
+            problemHostIDs: codexUpdateProblemHostIDs,
+            onlineHostIDs: onlineHostIDs
+        )
+        let hostsByID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
+        return retryHostIDs.compactMap { hostsByID[$0] }
+    }
+
+    var codexUpdateRetryReadyCount: Int {
+        codexUpdateRetryReadyHosts.count
+    }
+
+    var codexUpdateOutcomeSummary: String? {
+        guard !codexUpdates.isEmpty else { return nil }
+        var parts: [String] = []
+        if codexUpdateVerifiedCount > 0 {
+            parts.append("\(codexUpdateVerifiedCount) verified")
+        }
+        if codexUpdateOfflineCount > 0 {
+            parts.append("\(codexUpdateOfflineCount) offline")
+        }
+        if codexUpdateFailedCount > 0 {
+            parts.append("\(codexUpdateFailedCount) failed")
+        }
+        let incomplete = codexUpdates.values.filter { !$0.phase.isTerminal }.count
+        if incomplete > 0 {
+            parts.append("\(incomplete) pending")
+        }
+        return parts.isEmpty ? nil : "Last update · " + parts.joined(separator: " · ")
+    }
+
+    var codexRetryConfirmationText: String {
+        let ready = codexUpdateRetryReadyCount
+        let target = ready == 1 ? "the reachable problem machine" : "\(ready) reachable problem machines"
+        let remaining = max(0, codexUpdateProblemCount - ready)
+        let suffix = remaining == 0
+            ? ""
+            : " \(remaining) machine\(remaining == 1 ? " is" : "s are") still unreachable and will remain listed."
+        return "Retry Codex on \(target)?\(suffix)"
+    }
+
+    private var codexUpdateProblemHostIDs: Set<String> {
+        Set(codexUpdates.compactMap { entry in
+            switch entry.value.phase {
+            case .offline, .failed:
+                entry.key
+            case .notAttempted, .updating, .succeeded:
+                nil
+            }
+        })
+    }
+
     var attentionDescription: String {
         var parts: [String] = []
         if unreachableCount > 0 {
@@ -347,6 +420,17 @@ final class FleetModel: ObservableObject {
         await performCodexUpdates(on: hosts)
     }
 
+    func retryReadyCodexUpdates() async {
+        let targets = codexUpdateRetryReadyHosts
+        guard !targets.isEmpty else {
+            notice = codexUpdateProblemCount > 0
+                ? "Problem machines are still offline — refresh after they reconnect"
+                : "No Codex update problems need a retry"
+            return
+        }
+        await performCodexUpdates(on: targets, preservingProgress: true)
+    }
+
     func updateCodex(on host: FleetHost) async {
         await performCodexUpdates(on: [host])
     }
@@ -359,7 +443,11 @@ final class FleetModel: ObservableObject {
         await performCodexUpdates(on: targets, resuming: true)
     }
 
-    private func performCodexUpdates(on targets: [FleetHost], resuming: Bool = false) async {
+    private func performCodexUpdates(
+        on targets: [FleetHost],
+        resuming: Bool = false,
+        preservingProgress: Bool = false
+    ) async {
         guard !isUpdatingCodex else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
@@ -378,6 +466,43 @@ final class FleetModel: ObservableObject {
                 event: "codex-update-resumed",
                 detail: "batch=\(batch.id.uuidString); remaining=\(remaining)"
             )
+        } else if preservingProgress {
+            let knownHostIDs = Set(hosts.map(\.id))
+            var retainedHostIDs = (codexUpdateBatch?.targetHostIDs ?? [])
+                .filter { knownHostIDs.contains($0) }
+            for host in hosts where codexUpdates[host.id] != nil && !retainedHostIDs.contains(host.id) {
+                retainedHostIDs.append(host.id)
+            }
+            for host in targets where !retainedHostIDs.contains(host.id) {
+                retainedHostIDs.append(host.id)
+            }
+
+            var retainedProgress = Dictionary(uniqueKeysWithValues: retainedHostIDs.compactMap { hostID in
+                codexUpdates[hostID].map { (hostID, $0) }
+            })
+            for host in targets {
+                retainedProgress[host.id] = HostCodexUpdateProgress(
+                    phase: .notAttempted,
+                    detail: "Ready to retry"
+                )
+            }
+            codexUpdates = retainedProgress
+            codexUpdateTotalCount = retainedHostIDs.count
+            codexUpdateCompletedCount = retainedProgress.values.filter { $0.phase.isTerminal }.count
+            codexUpdateBatch = PersistedCodexUpdateBatch(
+                targetHostIDs: retainedHostIDs,
+                progress: retainedProgress
+            )
+            persistCodexUpdateBatch()
+            notice = targets.count == 1
+                ? "Retrying Codex on \(targets[0].displayName)"
+                : "Retrying Codex on \(targets.count) reachable machines"
+            if let batch = codexUpdateBatch {
+                await ActivityLogger.shared.append(
+                    event: "codex-update-retry-started",
+                    detail: "batch=\(batch.id.uuidString); targets=\(targets.count); retained=\(retainedHostIDs.count)"
+                )
+            }
         } else {
             codexUpdateCompletedCount = 0
             codexUpdateTotalCount = targets.count

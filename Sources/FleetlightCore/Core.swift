@@ -1670,6 +1670,18 @@ public enum CodexUpdatePlanner {
     }
 }
 
+public enum CodexUpdateRecoveryPlanner {
+    public static func retryHostIDs(
+        orderedHostIDs: [String],
+        problemHostIDs: Set<String>,
+        onlineHostIDs: Set<String>
+    ) -> [String] {
+        orderedHostIDs.filter { hostID in
+            problemHostIDs.contains(hostID) && onlineHostIDs.contains(hostID)
+        }
+    }
+}
+
 public enum CodexUpdateStatus: Equatable, Sendable {
     case succeeded
     case offline

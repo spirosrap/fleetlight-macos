@@ -160,6 +160,21 @@ test.require(
     "smart Codex updates should wait until the latest stable version is known"
 )
 
+let retryableCodexHostIDs = CodexUpdateRecoveryPlanner.retryHostIDs(
+    orderedHostIDs: ["offline", "current", "failed", "outdated"],
+    problemHostIDs: ["offline", "failed"],
+    onlineHostIDs: ["current", "failed", "outdated"]
+)
+test.require(retryableCodexHostIDs == ["failed"], "Codex recovery should retry only problem machines that are currently online")
+test.require(
+    CodexUpdateRecoveryPlanner.retryHostIDs(
+        orderedHostIDs: ["failed", "offline"],
+        problemHostIDs: ["failed", "offline"],
+        onlineHostIDs: []
+    ).isEmpty,
+    "Codex recovery should keep unreachable problems pending instead of retrying them immediately"
+)
+
 let codexUpdateCommand = CodexUpdateCommandBuilder.build()
 test.require(codexUpdateCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_UPDATE"), "Codex updater should emit a verification marker before changing anything")
 test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'codex update'"), "Codex updater should honor interactive-shell functions and wrappers")

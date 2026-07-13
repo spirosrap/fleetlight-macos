@@ -69,11 +69,13 @@ private enum TrendRange: Double, CaseIterable, Identifiable {
 private enum CodexFleetUpdateScope {
     case available
     case all
+    case retryReady
 
     var confirmationButtonTitle: String {
         switch self {
         case .available: "Update Available"
         case .all: "Update All"
+        case .retryReady: "Retry Ready"
         }
     }
 }
@@ -284,6 +286,48 @@ private struct FleetMenuView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if let codexUpdateOutcomeSummary = model.codexUpdateOutcomeSummary,
+               !model.isUpdatingCodex {
+                HStack(spacing: 8) {
+                    Label(
+                        codexUpdateOutcomeSummary,
+                        systemImage: model.codexUpdateFailedCount > 0
+                            ? "exclamationmark.octagon.fill"
+                            : model.codexUpdateOfflineCount > 0
+                                ? "wifi.slash"
+                                : "checkmark.circle.fill"
+                    )
+                    .font(.caption2.weight(model.codexUpdateProblemCount > 0 ? .semibold : .regular))
+                    .foregroundStyle(
+                        model.codexUpdateFailedCount > 0
+                            ? Color.red
+                            : model.codexUpdateOfflineCount > 0
+                                ? Color.orange
+                                : Color.green
+                    )
+                    .lineLimit(1)
+                    .help("Offline means Fleetlight could not connect. Failed means the updater ran but the new version was not verified.")
+
+                    Spacer(minLength: 4)
+
+                    if model.codexUpdateRetryReadyCount > 0 {
+                        Button("Retry \(model.codexUpdateRetryReadyCount) Ready") {
+                            pendingCodexFleetUpdate = .retryReady
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    } else if model.codexUpdateProblemCount > 0 {
+                        Button("Check Again") {
+                            Task { await model.refreshAll() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(model.isRefreshing)
+                        .help("Refresh reachability so reconnected machines become retryable")
+                    }
+                }
+            }
+
             HStack {
                 Button {
                     if model.codexUpdateAvailableCount > 0 {
@@ -384,6 +428,8 @@ private struct FleetMenuView: View {
             return model.codexAvailableUpdateConfirmationText
         case .all:
             return model.codexAllUpdateConfirmationText
+        case .retryReady:
+            return model.codexRetryConfirmationText
         }
     }
 
@@ -395,6 +441,8 @@ private struct FleetMenuView: View {
                 await model.updateCodexOnAvailableHosts()
             case .all:
                 await model.updateCodexOnAllHosts()
+            case .retryReady:
+                await model.retryReadyCodexUpdates()
             }
         }
     }

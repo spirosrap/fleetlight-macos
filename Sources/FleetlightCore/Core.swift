@@ -1547,6 +1547,112 @@ public enum RemoteCommandBuilder {
     }
 }
 
+public enum CodexReleaseChecker {
+    private struct ParsedVersion {
+        let core: [Int]
+        let prerelease: [String]?
+    }
+
+    public static func latestVersion(fromRegistryJSON json: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any],
+              let rawVersion = dictionary["version"] as? String else { return nil }
+        return normalizedDisplayVersion(rawVersion)
+    }
+
+    public static func isUpdateAvailable(installedVersion: String?, latestVersion: String?) -> Bool {
+        guard let installedVersion,
+              let latestVersion,
+              let installed = parse(installedVersion),
+              let latest = parse(latestVersion) else { return false }
+        return compare(installed, latest) < 0
+    }
+
+    private static func normalizedDisplayVersion(_ raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = value.lowercased()
+        for prefix in ["codex-cli ", "codex "] where lowered.hasPrefix(prefix) {
+            value = String(value.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            break
+        }
+        if value.lowercased().hasPrefix("v"), value.dropFirst().first?.isNumber == true {
+            value.removeFirst()
+        }
+        return parse(value) == nil ? nil : value
+    }
+
+    private static func parse(_ raw: String) -> ParsedVersion? {
+        guard let normalized = normalizedForParsing(raw) else { return nil }
+        let withoutBuild = normalized.split(separator: "+", maxSplits: 1).first.map(String.init) ?? normalized
+        let sections = withoutBuild.split(
+            separator: "-",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let coreParts = sections[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard !coreParts.isEmpty else { return nil }
+        let core = coreParts.compactMap { Int($0) }
+        guard core.count == coreParts.count else { return nil }
+
+        var prerelease: [String]?
+        if sections.count == 2 {
+            let identifiers = sections[1].split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            guard !identifiers.isEmpty, identifiers.allSatisfy({ !$0.isEmpty }) else { return nil }
+            prerelease = identifiers
+        }
+        return ParsedVersion(core: core, prerelease: prerelease)
+    }
+
+    private static func normalizedForParsing(_ raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = value.lowercased()
+        for prefix in ["codex-cli ", "codex "] where lowered.hasPrefix(prefix) {
+            value = String(value.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            break
+        }
+        if value.lowercased().hasPrefix("v"), value.dropFirst().first?.isNumber == true {
+            value.removeFirst()
+        }
+        return value.isEmpty ? nil : value
+    }
+
+    private static func compare(_ lhs: ParsedVersion, _ rhs: ParsedVersion) -> Int {
+        for index in 0..<max(lhs.core.count, rhs.core.count) {
+            let left = index < lhs.core.count ? lhs.core[index] : 0
+            let right = index < rhs.core.count ? rhs.core[index] : 0
+            if left != right { return left < right ? -1 : 1 }
+        }
+
+        switch (lhs.prerelease, rhs.prerelease) {
+        case (nil, nil):
+            return 0
+        case (nil, _?):
+            return 1
+        case (_?, nil):
+            return -1
+        case let (left?, right?):
+            for index in 0..<min(left.count, right.count) {
+                let leftIdentifier = left[index]
+                let rightIdentifier = right[index]
+                if leftIdentifier == rightIdentifier { continue }
+                switch (Int(leftIdentifier), Int(rightIdentifier)) {
+                case let (leftNumber?, rightNumber?):
+                    return leftNumber < rightNumber ? -1 : 1
+                case (_?, nil):
+                    return -1
+                case (nil, _?):
+                    return 1
+                case (nil, nil):
+                    return leftIdentifier < rightIdentifier ? -1 : 1
+                }
+            }
+            if left.count == right.count { return 0 }
+            return left.count < right.count ? -1 : 1
+        }
+    }
+}
+
 public enum CodexUpdateStatus: Equatable, Sendable {
     case succeeded
     case offline

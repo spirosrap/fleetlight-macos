@@ -123,6 +123,16 @@ let noCodexResult = CommandResult(
 )
 test.require(ProbeParser.snapshot(from: noCodexResult).codexVersion == "Not installed", "missing Codex CLI should be explicit instead of unknown")
 
+let latestCodexJSON = #"{"version":"0.144.3"}"#
+test.require(CodexReleaseChecker.latestVersion(fromRegistryJSON: latestCodexJSON) == "0.144.3", "npm latest metadata should expose the published Codex version")
+test.require(CodexReleaseChecker.latestVersion(fromRegistryJSON: #"{"version":"v0.145.0"}"#) == "0.145.0", "published Codex versions should normalize an optional v prefix")
+test.require(CodexReleaseChecker.latestVersion(fromRegistryJSON: #"{"version":"invalid"}"#) == nil, "invalid registry versions should be rejected")
+test.require(CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.144.2", latestVersion: "0.144.3"), "older Codex installations should show an available update")
+test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.144.3", latestVersion: "0.144.3"), "the published Codex version should be reported as current")
+test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-alpha.1", latestVersion: "0.144.3"), "newer prerelease installations should not be offered a downgrade")
+test.require(CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-alpha.1", latestVersion: "0.145.0"), "a stable release should supersede the matching prerelease")
+test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "Not installed", latestVersion: "0.144.3"), "non-version installation states should not produce false update badges")
+
 let codexUpdateCommand = CodexUpdateCommandBuilder.build()
 test.require(codexUpdateCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_UPDATE"), "Codex updater should emit a verification marker before changing anything")
 test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'codex update'"), "Codex updater should honor interactive-shell functions and wrappers")

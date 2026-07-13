@@ -17,6 +17,9 @@ final class FleetModel: ObservableObject {
     @Published private(set) var isUpdatingCodex = false
     @Published private(set) var codexUpdateCompletedCount = 0
     @Published private(set) var codexUpdateTotalCount = 0
+    @Published private(set) var latestCodexVersion: String?
+    @Published private(set) var isCheckingCodexRelease = false
+    @Published private(set) var codexReleaseCheckFailed = false
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var hiddenHostIDs: Set<String>
     @Published private(set) var hosts: [FleetHost]
@@ -35,6 +38,10 @@ final class FleetModel: ObservableObject {
     private var performanceFailureCounts: [String: Int] = [:]
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
+    private var codexReleaseCheckedAt: Date?
+
+    private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
+    private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
@@ -54,6 +61,9 @@ final class FleetModel: ObservableObject {
         performanceThresholds = UserDefaults.standard.data(forKey: "performanceThresholds")
             .flatMap { try? JSONDecoder().decode(PerformanceThresholds.self, from: $0) }
             ?? .default
+        latestCodexVersion = UserDefaults.standard.string(forKey: "latestCodexVersion")
+        codexReleaseCheckedAt = UserDefaults.standard.object(forKey: "codexReleaseCheckedAt") as? Date
+        codexReleaseCheckFailed = UserDefaults.standard.bool(forKey: "codexReleaseCheckFailed")
         notice = configurationResult.notice
         restoreCodexUpdateBatch()
     }
@@ -92,6 +102,52 @@ final class FleetModel: ObservableObject {
 
     var serviceOrResourceAlertCount: Int {
         attentionSummary.serviceOrResourceAlertCount
+    }
+
+    var codexUpdateAvailableCount: Int {
+        hosts.filter { host in
+            let snapshot = snapshots[host.id]
+            return snapshot?.state == .online
+                && CodexReleaseChecker.isUpdateAvailable(
+                    installedVersion: snapshot?.codexVersion,
+                    latestVersion: latestCodexVersion
+                )
+        }.count
+    }
+
+    var codexReleaseSummary: String? {
+        if let latestCodexVersion {
+            if codexUpdateAvailableCount > 0 {
+                let qualifier = codexReleaseCheckFailed ? "last known latest" : "latest"
+                return "\(codexUpdateAvailableCount) update\(codexUpdateAvailableCount == 1 ? "" : "s") available · \(qualifier) \(latestCodexVersion)"
+            }
+            let hasComparableMachine = hosts.contains { host in
+                let snapshot = snapshots[host.id]
+                return snapshot?.state == .online
+                    && snapshot?.codexVersion != nil
+                    && snapshot?.codexVersion != "Not installed"
+                    && snapshot?.codexVersion != "Unavailable"
+            }
+            if codexReleaseCheckFailed {
+                return hasComparableMachine
+                    ? "No known updates · last known latest \(latestCodexVersion)"
+                    : "Last known Codex \(latestCodexVersion)"
+            }
+            return hasComparableMachine
+                ? "Online machines current · latest \(latestCodexVersion)"
+                : "Latest Codex \(latestCodexVersion)"
+        }
+        if isCheckingCodexRelease { return "Checking latest Codex…" }
+        if codexReleaseCheckFailed { return "Latest Codex version unavailable" }
+        return nil
+    }
+
+    var codexUpdateConfirmationText: String {
+        let target = hosts.count == 1
+            ? "Update Codex on this machine?"
+            : "Update Codex on all \(hosts.count) machines?"
+        guard codexUpdateAvailableCount > 0, let latestCodexVersion else { return target }
+        return target + " \(codexUpdateAvailableCount) currently have version \(latestCodexVersion) available."
     }
 
     var attentionDescription: String {
@@ -175,6 +231,20 @@ final class FleetModel: ObservableObject {
         isRefreshing = true
         notice = nil
 
+        let releaseRetryInterval = codexReleaseCheckFailed
+            ? Self.failedCodexReleaseRetryInterval
+            : Self.codexReleaseCheckInterval
+        let shouldCheckCodexRelease = codexReleaseCheckedAt.map {
+            Date().timeIntervalSince($0) >= releaseRetryInterval
+        } ?? true
+        let codexReleaseTask: Task<String?, Never>?
+        if shouldCheckCodexRelease {
+            isCheckingCodexRelease = true
+            codexReleaseTask = Task { await Self.fetchLatestCodexRelease() }
+        } else {
+            codexReleaseTask = nil
+        }
+
         let previousSnapshots = snapshots
         let isInitialRefresh = lastRefresh == nil
 
@@ -205,9 +275,30 @@ final class FleetModel: ObservableObject {
             }
         }
 
+        if let codexReleaseTask {
+            applyCodexReleaseResult(await codexReleaseTask.value)
+        }
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
         isRefreshing = false
+    }
+
+    private func applyCodexReleaseResult(_ registryJSON: String?) {
+        let checkedAt = Date()
+        codexReleaseCheckedAt = checkedAt
+        UserDefaults.standard.set(checkedAt, forKey: "codexReleaseCheckedAt")
+        isCheckingCodexRelease = false
+
+        guard let registryJSON,
+              let version = CodexReleaseChecker.latestVersion(fromRegistryJSON: registryJSON) else {
+            codexReleaseCheckFailed = true
+            UserDefaults.standard.set(true, forKey: "codexReleaseCheckFailed")
+            return
+        }
+        latestCodexVersion = version
+        codexReleaseCheckFailed = false
+        UserDefaults.standard.set(version, forKey: "latestCodexVersion")
+        UserDefaults.standard.set(false, forKey: "codexReleaseCheckFailed")
     }
 
     func updateCodexOnAllHosts() async {
@@ -981,6 +1072,20 @@ final class FleetModel: ObservableObject {
         let identifier = "\(host)-\(event)-\(Int(Date().timeIntervalSince1970))"
         await NotificationManager.shared.send(title: title, body: body, identifier: identifier)
         await ActivityLogger.shared.append(event: "notification-sent", host: host, detail: "\(title): \(body)")
+    }
+
+    nonisolated private static func fetchLatestCodexRelease() async -> String? {
+        guard let url = URL(string: "https://registry.npmjs.org/@openai%2Fcodex/latest") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
     }
 
     nonisolated private static func runCodexUpdate(

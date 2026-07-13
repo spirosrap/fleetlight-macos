@@ -74,6 +74,7 @@ Supported machine fields:
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
+- Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
 - Confirmed one-click Codex updates across the fleet, with restart-safe resume, sequential progress, version verification, and individual update actions
 - Clear Codex update outcomes for not-yet-attempted, offline, failed, and verified machines, including shell-wrapper-aware updates
 - Configurable performance-warning thresholds
@@ -88,7 +89,7 @@ Supported machine fields:
 
 ## Privacy
 
-Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
+Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. To check update availability, Fleetlight makes a cached HTTPS request to npm's public `@openai/codex` metadata at most once every 15 minutes; it sends no fleet configuration or machine measurements. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
 
 ## License
 

@@ -177,6 +177,7 @@ private struct FleetMenuView: View {
                                 isRefreshing: model.refreshingHostIDs.contains(host.id),
                                 isPinned: model.pinnedHostIDs.contains(host.id),
                                 codexUpdate: model.codexUpdates[host.id],
+                                latestCodexVersion: model.latestCodexVersion,
                                 isCodexUpdateBusy: model.isUpdatingCodex,
                                 onTogglePin: { model.togglePinned(host) },
                                 onWake: { Task { await model.wake(host) } },
@@ -237,9 +238,7 @@ private struct FleetMenuView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.up.circle")
                         .foregroundStyle(.blue)
-                    Text(model.hosts.count == 1
-                        ? "Update Codex on this machine?"
-                        : "Update Codex on all \(model.hosts.count) machines?")
+                    Text(model.codexUpdateConfirmationText)
                         .font(.caption.weight(.semibold))
                     Spacer()
                     Button("Cancel") { confirmingCodexFleetUpdate = false }
@@ -250,6 +249,28 @@ private struct FleetMenuView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 }
+            }
+
+            if let codexReleaseSummary = model.codexReleaseSummary {
+                Label(
+                    codexReleaseSummary,
+                    systemImage: model.isCheckingCodexRelease
+                        ? "arrow.triangle.2.circlepath"
+                        : model.codexUpdateAvailableCount > 0
+                            ? "arrow.up.circle.fill"
+                            : model.codexReleaseCheckFailed
+                                ? "exclamationmark.triangle"
+                                : "checkmark.circle"
+                )
+                .font(.caption2.weight(model.codexUpdateAvailableCount > 0 ? .semibold : .regular))
+                .foregroundStyle(
+                    model.codexUpdateAvailableCount > 0
+                        ? Color.blue
+                        : model.codexReleaseCheckFailed
+                            ? Color.orange
+                            : Color.secondary
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack {
@@ -1466,6 +1487,7 @@ private struct HostRow: View {
     let isRefreshing: Bool
     let isPinned: Bool
     let codexUpdate: HostCodexUpdateProgress?
+    let latestCodexVersion: String?
     let isCodexUpdateBusy: Bool
     let onTogglePin: () -> Void
     let onWake: () -> Void
@@ -1501,6 +1523,12 @@ private struct HostRow: View {
                         .font(.caption)
                         .foregroundStyle(snapshot.state == .unreachable ? .red : .secondary)
                         .lineLimit(2)
+                    if codexUpdateIsAvailable, let latestCodexVersion, !isCodexUpdateBusy {
+                        Label("Codex \(latestCodexVersion) available", systemImage: "arrow.up.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .lineLimit(1)
+                    }
                     if let codexUpdate {
                         Label(codexUpdate.detail, systemImage: codexUpdateSystemImage)
                             .font(.caption2)
@@ -1713,6 +1741,14 @@ private struct HostRow: View {
         case .failed: "exclamationmark.triangle.fill"
         case nil: "arrow.up.circle"
         }
+    }
+
+    private var codexUpdateIsAvailable: Bool {
+        snapshot.state == .online
+            && CodexReleaseChecker.isUpdateAvailable(
+                installedVersion: snapshot.codexVersion,
+                latestVersion: latestCodexVersion
+            )
     }
 
     private var codexUpdateColor: Color {

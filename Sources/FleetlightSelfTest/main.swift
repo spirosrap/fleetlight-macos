@@ -23,6 +23,8 @@ let verified = CommandResult(
     BOOT=2026-07-11 08:12:03
     CODEX=codex-cli 0.137.0
     CODEX=codex-cli 0.144.2
+    CODEX_APP_VERSION=26.707.62119
+    CODEX_APP_BUILD=5211
     DISK=42%
     LOAD=0.73
     MEM=38
@@ -44,6 +46,8 @@ verifiedSnapshot.packetLossPercent = 0
 test.require(verifiedSnapshot.state == .online, "verified probe should be online")
 test.require(verifiedSnapshot.operatingSystem == "Linux", "OS should be parsed")
 test.require(verifiedSnapshot.codexVersion == "0.144.2", "newest Codex CLI version should win when duplicate installs exist")
+test.require(verifiedSnapshot.codexDesktopAppVersion == "26.707.62119", "Codex desktop app version should be parsed separately from the CLI")
+test.require(verifiedSnapshot.codexDesktopAppBuild == "5211", "Codex desktop app build should be retained")
 test.require(verifiedSnapshot.diskPercent == 42, "disk percentage should be parsed")
 test.require(verifiedSnapshot.memoryPercent == 38, "memory percentage should be parsed")
 test.require(verifiedSnapshot.loadAverage == 0.73, "load average should be parsed")
@@ -93,6 +97,7 @@ let host = FleetHost(
 let report = FleetReportBuilder.build(hosts: [host], snapshots: [host.id: verifiedSnapshot])
 test.require(report.contains("Example [example]: Online"), "report should identify the host")
 test.require(report.contains("Codex 0.144.2"), "report should include the current Codex CLI version")
+test.require(report.contains("Codex app 26.707.62119 (build 5211)"), "report should include the Codex desktop app version")
 test.require(report.contains("disk 42%"), "report should include disk usage")
 test.require(report.contains("memory 38%"), "report should include memory usage")
 test.require(report.contains("load 0.73"), "report should include load average")
@@ -107,6 +112,7 @@ test.require(report.contains("Plex: stopped"), "report should include service he
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")
+test.require(command.contains("CODEX_APP_VERSION=%s"), "remote command should emit the signed Codex desktop app version on macOS")
 test.require(command.contains("find \"$HOME/.nvm/versions/node\""), "remote command should inspect every NVM Codex install without shell glob failures")
 test.require(command.contains("!seen[$0]++"), "remote command should avoid probing duplicate Codex paths")
 test.require(command.contains("SERVICE=tailscale"), "remote command should include Tailscale")
@@ -281,10 +287,52 @@ let offlineCodexOutcome = CodexUpdateParser.outcome(from: offlineCodexUpdate)
 test.require(offlineCodexOutcome.status == .offline, "SSH connection failures should be separate from updater failures")
 test.require(offlineCodexOutcome.detail == "Offline — SSH timed out", "offline Codex updates should explain the connection problem")
 
+let codexDesktopAppCommand = CodexDesktopAppUpdateCommandBuilder.build()
+test.require(codexDesktopAppCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_APP_UPDATE"), "Codex app updater should emit a verification marker")
+test.require(codexDesktopAppCommand.contains("com.openai.codex"), "Codex app updater should verify the OpenAI bundle identifier")
+test.require(codexDesktopAppCommand.contains("Check for Updates…"), "Codex app updater should delegate to the app’s own update menu")
+test.require(codexDesktopAppCommand.contains("Install and Relaunch"), "Codex app updater should accept Sparkle’s relaunch action")
+test.require(codexDesktopAppCommand.contains("AFTER_BUILD:"), "Codex app updater should verify the installed build after relaunch")
+
+let currentCodexDesktopApp = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nAFTER_VERSION:26.707.62119\nAFTER_BUILD:5211\nUPDATE:current\nVERIFY:current\n",
+    stderr: "",
+    elapsedMilliseconds: 1_500,
+    timedOut: false
+)
+let currentCodexDesktopOutcome = CodexDesktopAppUpdateParser.outcome(from: currentCodexDesktopApp)
+test.require(currentCodexDesktopOutcome.status == .current, "an up-to-date Codex app should be a successful current result")
+test.require(currentCodexDesktopOutcome.activeBuild == "5211", "current Codex app results should retain the verified build")
+
+let updatedCodexDesktopApp = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nAFTER_VERSION:26.708.10000\nAFTER_BUILD:5220\nUPDATE:ok\nVERIFY:updated\n",
+    stderr: "",
+    elapsedMilliseconds: 48_000,
+    timedOut: false
+)
+let updatedCodexDesktopOutcome = CodexDesktopAppUpdateParser.outcome(from: updatedCodexDesktopApp)
+test.require(updatedCodexDesktopOutcome.status == .updated, "a changed signed app build should be reported as updated")
+test.require(updatedCodexDesktopOutcome.detail.contains("26.708.10000"), "updated Codex app results should name the installed version")
+
+let permissionDeniedCodexDesktopApp = CommandResult(
+    exitCode: 3,
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nUPDATE:permission\nVERIFY:failed\n",
+    stderr: "",
+    elapsedMilliseconds: 400,
+    timedOut: false
+)
+test.require(
+    CodexDesktopAppUpdateParser.outcome(from: permissionDeniedCodexDesktopApp).detail.contains("Privacy & Security"),
+    "macOS automation denials should explain where to grant permission"
+)
+
 let defaultHost = FleetHost.defaults.first!
 test.require(FleetHost.defaults.count == 1, "the public default fleet should contain only this Mac")
 test.require(defaultHost.id == "local" && defaultHost.isLocal, "the public default should not contain a private SSH target")
 test.require(defaultHost.services.isEmpty, "the public default should not reveal configured services")
+test.require(defaultHost.supportsCodexDesktopApp, "the safe local default should expose Codex desktop app updates")
 
 let metricFromSnapshot = MetricSample(hostID: "example", snapshot: verifiedSnapshot)
 test.require(metricFromSnapshot.routeName == "Via Relay", "metric samples should retain the route")
@@ -430,6 +478,7 @@ let configuredServer = FleetHost(
 let publicConfiguration = FleetConfiguration(hosts: [thisMac, configuredServer])
 test.require(publicConfiguration.validationErrors.isEmpty, "a generic public fleet configuration should validate")
 test.require(configuredServer.canWake, "a configured MAC address should enable Wake-on-LAN")
+test.require(!configuredServer.supportsCodexDesktopApp, "remote hosts should opt in to Codex desktop app updates")
 let configurationRoundTrip = try decoder.decode(FleetConfiguration.self, from: encoder.encode(publicConfiguration))
 test.require(configurationRoundTrip == publicConfiguration, "fleet configuration should round-trip through JSON")
 let duplicateConfiguration = FleetConfiguration(hosts: [thisMac, thisMac])

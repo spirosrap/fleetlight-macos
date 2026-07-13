@@ -5,7 +5,8 @@
       "id": "local",
       "displayName": "This Mac",
       "systemImage": "laptopcomputer",
-      "isLocal": true
+      "isLocal": true,
+      "codexDesktopApp": true
     },
     {
       "id": "home-server",

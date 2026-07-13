@@ -61,6 +61,7 @@ Supported machine fields:
 - `displayName`: label shown in Fleetlight
 - `systemImage`: optional SF Symbol name
 - `isLocal`: use a local process instead of SSH; at most one entry may be local
+- `codexDesktopApp`: set to `true` on a macOS host to show its signed Codex/ChatGPT app version and enable app updates
 - `services`: optional checks for `tailscale`, `docker`, `plex`, or `samba`
 - `routes`: one or more SSH aliases tried in order
 - `wakeMACAddress`: optional MAC address enabling Wake-on-LAN
@@ -74,6 +75,8 @@ Supported machine fields:
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
+- Optional Codex desktop app version and build reporting for configured macOS hosts
+- Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
 - Smart Codex updates that target only outdated online machines by default, with a manual latest-version check and an explicit Update All override
@@ -93,6 +96,8 @@ Supported machine fields:
 ## Privacy
 
 Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. To check update availability, Fleetlight makes a cached HTTPS request to npm's public `@openai/codex` metadata at most once every 15 minutes; it sends no fleet configuration or machine measurements. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
+
+The first desktop app update may ask for permission to control System Events. Approve Fleetlight under **System Settings → Privacy & Security → Automation** (and Accessibility if macOS requests it). Fleetlight uses that access only to choose ChatGPT/Codex’s **Check for Updates…** command and its signed install/relaunch action.
 
 ## License
 

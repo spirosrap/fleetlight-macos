@@ -536,12 +536,14 @@ private struct FleetSummaryBar: View {
 private struct CodexView: View {
     @ObservedObject var model: FleetModel
     let onUpdateAvailable: () -> Void
+    @State private var pendingDesktopAppHost: FleetHost?
+    @State private var isConfirmingAllDesktopApps = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Codex versions")
+                    Text("Codex CLI")
                         .font(.headline)
                     Text(releaseDetail)
                         .font(.caption)
@@ -560,13 +562,13 @@ private struct CodexView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isUpdatingCodex)
+                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
 
                 if model.codexUpdateAvailableCount > 0 {
                     Button("Update \(model.codexUpdateAvailableCount)", action: onUpdateAvailable)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(model.isRefreshing || model.isUpdatingCodex)
+                        .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
                 }
             }
             .padding(12)
@@ -612,13 +614,81 @@ private struct CodexView: View {
                             state: model.codexFleetVersionState(for: host),
                             latestVersion: model.latestCodexVersion,
                             updateProgress: model.codexUpdates[host.id],
-                            isUpdateBusy: model.isUpdatingCodex,
+                            isUpdateBusy: model.isUpdatingCodex || model.isUpdatingCodexDesktopApps,
                             onUpdate: { Task { await model.updateCodex(on: host) } }
                         )
+                    }
+
+                    if !model.codexDesktopAppHosts.isEmpty {
+                        Divider()
+                            .padding(.vertical, 4)
+
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Codex desktop app")
+                                    .font(.headline)
+                                Text("Uses OpenAI’s updater and restarts Codex only when an update is installed")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button {
+                                isConfirmingAllDesktopApps = true
+                            } label: {
+                                Label(
+                                    model.isUpdatingCodexDesktopApps ? "Updating…" : "Check & Update All",
+                                    systemImage: "arrow.down.app"
+                                )
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                        }
+                        .padding(.top, 2)
+
+                        ForEach(model.codexDesktopAppHosts) { host in
+                            CodexDesktopAppMachineRow(
+                                host: host,
+                                snapshot: model.snapshots[host.id] ?? HostSnapshot(),
+                                updateProgress: model.codexDesktopAppUpdates[host.id],
+                                isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
+                                onUpdate: { pendingDesktopAppHost = host }
+                            )
+                        }
                     }
                 }
                 .padding(12)
             }
+        }
+        .confirmationDialog(
+            "Check and update the Codex app on \(pendingDesktopAppHost?.displayName ?? "this Mac")?",
+            isPresented: Binding(
+                get: { pendingDesktopAppHost != nil },
+                set: { if !$0 { pendingDesktopAppHost = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let host = pendingDesktopAppHost {
+                Button("Check & Update \(host.displayName)") {
+                    pendingDesktopAppHost = nil
+                    Task { await model.updateCodexDesktopApp(on: host) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingDesktopAppHost = nil }
+        } message: {
+            Text("If OpenAI has an update, Codex will close and reopen automatically. Fleetlight stays open.")
+        }
+        .confirmationDialog(
+            "Check and update Codex on all configured Macs?",
+            isPresented: $isConfirmingAllDesktopApps,
+            titleVisibility: .visible
+        ) {
+            Button("Check & Update \(model.codexDesktopAppHosts.count) Macs") {
+                Task { await model.updateCodexDesktopAppsOnAllHosts() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Each Mac is checked sequentially. Codex restarts only where OpenAI’s updater installs a newer version.")
         }
     }
 
@@ -634,6 +704,152 @@ private struct CodexView: View {
         return model.codexReleaseCheckFailed
             ? "Latest stable release is temporarily unavailable"
             : "Latest stable release has not been checked yet"
+    }
+}
+
+private struct CodexDesktopAppMachineRow: View {
+    let host: FleetHost
+    let snapshot: HostSnapshot
+    let updateProgress: HostCodexUpdateProgress?
+    let isUpdateBusy: Bool
+    let onUpdate: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(statusColor.opacity(0.15))
+                Image(systemName: host.systemImage)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(statusColor)
+            }
+            .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(host.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(host.id)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(versionDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let updateProgress {
+                    Label(updateProgress.detail, systemImage: progressImage)
+                        .font(.caption2)
+                        .foregroundStyle(progressColor)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Label(statusTitle, systemImage: statusImage)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                if canUpdate {
+                    Button("Check & Update", action: onUpdate)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isUpdateBusy)
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.primary.opacity(0.045))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.primary.opacity(0.06))
+                }
+        )
+    }
+
+    private var canUpdate: Bool {
+        snapshot.state == .online && snapshot.codexDesktopAppVersion != nil
+    }
+
+    private var versionDetail: String {
+        switch snapshot.state {
+        case .checking: return "Checking installed app version…"
+        case .waking: return "Machine is waking…"
+        case .unreachable: return "Could not connect to read the app version"
+        case .online:
+            guard let version = snapshot.codexDesktopAppVersion else {
+                return "Codex desktop app is not installed"
+            }
+            let build = snapshot.codexDesktopAppBuild.map { " · build \($0)" } ?? ""
+            return "Installed \(version)\(build)"
+        }
+    }
+
+    private var statusTitle: String {
+        if let phase = updateProgress?.phase {
+            switch phase {
+            case .notAttempted: return "Waiting"
+            case .updating: return "Checking"
+            case .succeeded: return "Verified"
+            case .offline: return "Offline"
+            case .failed: return "Needs attention"
+            }
+        }
+        switch snapshot.state {
+        case .checking: return "Checking"
+        case .waking: return "Waking"
+        case .unreachable: return "Offline"
+        case .online: return snapshot.codexDesktopAppVersion == nil ? "Not installed" : "Ready"
+        }
+    }
+
+    private var statusImage: String {
+        switch updateProgress?.phase {
+        case .updating: return "arrow.triangle.2.circlepath"
+        case .succeeded: return "checkmark.circle.fill"
+        case .offline: return "wifi.slash"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .notAttempted, nil:
+            if snapshot.state == .unreachable { return "wifi.slash" }
+            if snapshot.codexDesktopAppVersion == nil { return "questionmark.circle" }
+            return "checkmark.circle"
+        }
+    }
+
+    private var statusColor: Color {
+        switch updateProgress?.phase {
+        case .updating: return .blue
+        case .succeeded: return .green
+        case .offline: return .orange
+        case .failed: return .red
+        case .notAttempted, nil:
+            if snapshot.state == .unreachable { return .red }
+            if snapshot.codexDesktopAppVersion == nil { return .orange }
+            return .secondary
+        }
+    }
+
+    private var progressImage: String {
+        switch updateProgress?.phase {
+        case .notAttempted: "circle"
+        case .updating: "arrow.triangle.2.circlepath"
+        case .succeeded: "checkmark.circle.fill"
+        case .offline: "wifi.slash"
+        case .failed: "xmark.octagon.fill"
+        case nil: "circle"
+        }
+    }
+
+    private var progressColor: Color {
+        switch updateProgress?.phase {
+        case .notAttempted: .secondary
+        case .updating: .blue
+        case .succeeded: .green
+        case .offline: .orange
+        case .failed: .red
+        case nil: .secondary
+        }
     }
 }
 

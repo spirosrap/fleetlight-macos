@@ -15,6 +15,8 @@ final class FleetModel: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var codexUpdates: [String: HostCodexUpdateProgress] = [:]
     @Published private(set) var isUpdatingCodex = false
+    @Published private(set) var codexDesktopAppUpdates: [String: HostCodexUpdateProgress] = [:]
+    @Published private(set) var isUpdatingCodexDesktopApps = false
     @Published private(set) var codexUpdateCompletedCount = 0
     @Published private(set) var codexUpdateTotalCount = 0
     @Published private(set) var latestCodexVersion: String?
@@ -110,6 +112,18 @@ final class FleetModel: ObservableObject {
             snapshots: snapshots,
             latestVersion: latestCodexVersion
         )
+    }
+
+    var codexDesktopAppHosts: [FleetHost] {
+        hosts.filter(\.supportsCodexDesktopApp)
+    }
+
+    var codexDesktopAppVerifiedCount: Int {
+        codexDesktopAppUpdates.values.filter { $0.phase == .succeeded }.count
+    }
+
+    var codexDesktopAppProblemCount: Int {
+        codexDesktopAppUpdates.values.filter { $0.phase == .offline || $0.phase == .failed }.count
     }
 
     var codexUpdateAvailableCount: Int {
@@ -450,6 +464,87 @@ final class FleetModel: ObservableObject {
         await performCodexUpdates(on: [host])
     }
 
+    func updateCodexDesktopAppsOnAllHosts() async {
+        await performCodexDesktopAppUpdates(on: codexDesktopAppHosts)
+    }
+
+    func updateCodexDesktopApp(on host: FleetHost) async {
+        guard host.supportsCodexDesktopApp else {
+            notice = "Codex desktop app updates are not enabled for \(host.displayName)"
+            return
+        }
+        await performCodexDesktopAppUpdates(on: [host])
+    }
+
+    private func performCodexDesktopAppUpdates(on targets: [FleetHost]) async {
+        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex else { return }
+        guard !targets.isEmpty else {
+            notice = "No macOS Codex desktop app machines are configured"
+            return
+        }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+
+        pollTask?.cancel()
+        isUpdatingCodexDesktopApps = true
+        codexDesktopAppUpdates = Dictionary(uniqueKeysWithValues: targets.map {
+            ($0.id, HostCodexUpdateProgress(phase: .notAttempted, detail: "Waiting to check"))
+        })
+        notice = targets.count == 1
+            ? "Checking the Codex app on \(targets[0].displayName)"
+            : "Checking and updating the Codex app on \(targets.count) Macs sequentially"
+
+        for host in targets {
+            codexDesktopAppUpdates[host.id] = HostCodexUpdateProgress(
+                phase: .updating,
+                detail: "Checking OpenAI’s updater…"
+            )
+            let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+            let result = await Self.runCodexDesktopAppUpdate(host: host, routeAlias: routeAlias)
+            let outcome = CodexDesktopAppUpdateParser.outcome(from: result)
+            let phase: HostCodexUpdatePhase
+            let event: String
+            switch outcome.status {
+            case .current:
+                phase = .succeeded
+                event = "codex-app-current"
+            case .updated:
+                phase = .succeeded
+                event = "codex-app-updated"
+            case .offline:
+                phase = .offline
+                event = "codex-app-update-offline"
+            case .failed:
+                phase = .failed
+                event = "codex-app-update-failed"
+            }
+            codexDesktopAppUpdates[host.id] = HostCodexUpdateProgress(
+                phase: phase,
+                detail: outcome.detail
+            )
+            if let version = outcome.activeVersion {
+                snapshots[host.id]?.codexDesktopAppVersion = version
+            }
+            if let build = outcome.activeBuild {
+                snapshots[host.id]?.codexDesktopAppBuild = build
+            }
+            await ActivityLogger.shared.append(event: event, host: host.id, detail: outcome.detail)
+        }
+
+        for host in targets where codexDesktopAppUpdates[host.id]?.phase != .offline {
+            await refresh(host)
+        }
+        let verified = codexDesktopAppVerifiedCount
+        let problems = codexDesktopAppProblemCount
+        isUpdatingCodexDesktopApps = false
+        if started { schedulePolling() }
+        notice = problems == 0
+            ? "Codex app check completed on \(verified) Mac\(verified == 1 ? "" : "s")"
+            : "Codex app check: \(verified) verified · \(problems) need attention"
+    }
+
     private func resumeCodexUpdateBatch() async {
         guard let batch = codexUpdateBatch, batch.finishedAt == nil else { return }
         let targets = batch.targetHostIDs.compactMap { hostID in
@@ -463,7 +558,7 @@ final class FleetModel: ObservableObject {
         resuming: Bool = false,
         preservingProgress: Bool = false
     ) async {
-        guard !isUpdatingCodex else { return }
+        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -1304,6 +1399,44 @@ final class FleetModel: ObservableObject {
                     command,
                 ],
                 timeout: 300
+            )
+        }.value
+    }
+
+    nonisolated private static func runCodexDesktopAppUpdate(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        let command = CodexDesktopAppUpdateCommandBuilder.build()
+        return await Task.detached {
+            if host.isLocal {
+                return CommandRunner.run(
+                    executable: "/bin/sh",
+                    arguments: ["-c", command],
+                    timeout: 420
+                )
+            }
+            guard let routeAlias else {
+                return CommandResult(
+                    exitCode: -1,
+                    stdout: "",
+                    stderr: "No SSH route configured",
+                    elapsedMilliseconds: 0,
+                    timedOut: false
+                )
+            }
+            return CommandRunner.run(
+                executable: "/usr/bin/ssh",
+                arguments: [
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=12",
+                    "-o", "ConnectionAttempts=1",
+                    "-o", "ServerAliveInterval=15",
+                    "-o", "ServerAliveCountMax=2",
+                    routeAlias,
+                    command,
+                ],
+                timeout: 420
             )
         }.value
     }

@@ -76,6 +76,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
     public let isLocal: Bool
     public let wakeMACAddress: String?
     public let wakeBroadcastAddress: String?
+    public let supportsCodexDesktopApp: Bool
     public let services: [ServiceKind]
     public let routes: [SSHRoute]
 
@@ -86,6 +87,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         isLocal: Bool = false,
         wakeMACAddress: String? = nil,
         wakeBroadcastAddress: String? = nil,
+        supportsCodexDesktopApp: Bool = false,
         services: [ServiceKind] = [],
         routes: [SSHRoute] = []
     ) {
@@ -95,6 +97,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         self.isLocal = isLocal
         self.wakeMACAddress = wakeMACAddress
         self.wakeBroadcastAddress = wakeBroadcastAddress
+        self.supportsCodexDesktopApp = supportsCodexDesktopApp
         self.services = services
         self.routes = routes.isEmpty
             ? [SSHRoute(alias: isLocal ? "local" : id, displayName: isLocal ? "Local process" : "Direct")]
@@ -110,6 +113,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         case isLocal
         case wakeMACAddress
         case wakeBroadcastAddress
+        case supportsCodexDesktopApp = "codexDesktopApp"
         case services
         case routes
     }
@@ -127,6 +131,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
             isLocal: isLocal,
             wakeMACAddress: try container.decodeIfPresent(String.self, forKey: .wakeMACAddress),
             wakeBroadcastAddress: try container.decodeIfPresent(String.self, forKey: .wakeBroadcastAddress),
+            supportsCodexDesktopApp: try container.decodeIfPresent(Bool.self, forKey: .supportsCodexDesktopApp) ?? false,
             services: try container.decodeIfPresent([ServiceKind].self, forKey: .services) ?? [],
             routes: try container.decodeIfPresent([SSHRoute].self, forKey: .routes) ?? []
         )
@@ -137,7 +142,8 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
             id: "local",
             displayName: "This Mac",
             systemImage: "laptopcomputer",
-            isLocal: true
+            isLocal: true,
+            supportsCodexDesktopApp: true
         ),
     ]
 }
@@ -188,6 +194,8 @@ public struct HostSnapshot: Sendable, Equatable {
     public var operatingSystem: String?
     public var bootDescription: String?
     public var codexVersion: String?
+    public var codexDesktopAppVersion: String?
+    public var codexDesktopAppBuild: String?
     public var diskPercent: Int?
     public var memoryPercent: Int?
     public var loadAverage: Double?
@@ -209,6 +217,8 @@ public struct HostSnapshot: Sendable, Equatable {
         operatingSystem: String? = nil,
         bootDescription: String? = nil,
         codexVersion: String? = nil,
+        codexDesktopAppVersion: String? = nil,
+        codexDesktopAppBuild: String? = nil,
         diskPercent: Int? = nil,
         memoryPercent: Int? = nil,
         loadAverage: Double? = nil,
@@ -229,6 +239,8 @@ public struct HostSnapshot: Sendable, Equatable {
         self.operatingSystem = operatingSystem
         self.bootDescription = bootDescription
         self.codexVersion = codexVersion
+        self.codexDesktopAppVersion = codexDesktopAppVersion
+        self.codexDesktopAppBuild = codexDesktopAppBuild
         self.diskPercent = diskPercent
         self.memoryPercent = memoryPercent
         self.loadAverage = loadAverage
@@ -1359,6 +1371,8 @@ public enum ProbeParser {
         let os = value(after: "OS=", in: lines)
         let boot = value(after: "BOOT=", in: lines)
         let codexVersion = preferredCodexVersion(values(after: "CODEX=", in: lines))
+        let codexDesktopAppVersion = value(after: "CODEX_APP_VERSION=", in: lines)
+        let codexDesktopAppBuild = value(after: "CODEX_APP_BUILD=", in: lines)
         let diskText = value(after: "DISK=", in: lines)?.replacingOccurrences(of: "%", with: "")
         let disk = diskText.flatMap(Int.init)
         let memory = value(after: "MEM=", in: lines).flatMap(Int.init)
@@ -1374,6 +1388,8 @@ public enum ProbeParser {
             operatingSystem: os,
             bootDescription: normalizeBoot(boot),
             codexVersion: codexVersion,
+            codexDesktopAppVersion: codexDesktopAppVersion,
+            codexDesktopAppBuild: codexDesktopAppBuild,
             diskPercent: disk,
             memoryPercent: memory,
             loadAverage: load,
@@ -1511,6 +1527,17 @@ public enum RemoteCommandBuilder {
           done
         )
         if [ -n "$codex_versions" ]; then printf '%s\n' "$codex_versions"; else printf 'CODEX=not-installed\n'; fi
+        if [ "$os" = Darwin ]; then
+          codex_app_plist=/Applications/ChatGPT.app/Contents/Info.plist
+          if [ -r "$codex_app_plist" ]; then
+            codex_app_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$codex_app_plist" 2>/dev/null)
+            if [ "$codex_app_id" = com.openai.codex ]; then
+              codex_app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$codex_app_plist" 2>/dev/null)
+              codex_app_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$codex_app_plist" 2>/dev/null)
+              printf 'CODEX_APP_VERSION=%s\nCODEX_APP_BUILD=%s\n' "$codex_app_version" "$codex_app_build"
+            fi
+          fi
+        fi
         printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
         """
 
@@ -1953,6 +1980,248 @@ public enum CodexUpdateParser {
     }
 }
 
+public enum CodexDesktopAppUpdateStatus: Equatable, Sendable {
+    case current
+    case updated
+    case offline
+    case failed
+}
+
+public struct CodexDesktopAppUpdateOutcome: Equatable, Sendable {
+    public let status: CodexDesktopAppUpdateStatus
+    public let activeVersion: String?
+    public let activeBuild: String?
+    public let detail: String
+
+    public var succeeded: Bool { status == .current || status == .updated }
+
+    public init(
+        status: CodexDesktopAppUpdateStatus,
+        activeVersion: String?,
+        activeBuild: String?,
+        detail: String
+    ) {
+        self.status = status
+        self.activeVersion = activeVersion
+        self.activeBuild = activeBuild
+        self.detail = detail
+    }
+}
+
+public enum CodexDesktopAppUpdateCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_CODEX_APP_UPDATE\n'
+        if [ "$(uname -s)" != Darwin ]; then
+          printf 'UPDATE:unsupported\nVERIFY:failed\n'
+          exit 2
+        fi
+
+        app=/Applications/ChatGPT.app
+        plist="$app/Contents/Info.plist"
+        if [ ! -r "$plist" ]; then
+          printf 'UPDATE:missing\nVERIFY:failed\n'
+          exit 2
+        fi
+        bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null)
+        if [ "$bundle_id" != com.openai.codex ]; then
+          printf 'UPDATE:wrong-app\nVERIFY:failed\n'
+          exit 2
+        fi
+
+        read_version() { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null; }
+        read_build() { /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist" 2>/dev/null; }
+        before_version=$(read_version)
+        before_build=$(read_build)
+        printf 'BEFORE_VERSION:%s\nBEFORE_BUILD:%s\n' "$before_version" "$before_build"
+
+        if ! pgrep ChatGPT >/dev/null 2>&1; then
+          /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
+          launch_attempt=0
+          while ! pgrep ChatGPT >/dev/null 2>&1 && [ "$launch_attempt" -lt 20 ]; do
+            sleep 1
+            launch_attempt=$((launch_attempt + 1))
+          done
+        fi
+        if ! pgrep ChatGPT >/dev/null 2>&1; then
+          printf 'UPDATE:not-running\nVERIFY:failed\n'
+          exit 3
+        fi
+
+        click_result=$(/usr/bin/osascript 2>&1 <<'APPLESCRIPT'
+        tell application "System Events"
+          if not (exists process "ChatGPT") then error "ChatGPT process is unavailable"
+          tell process "ChatGPT"
+            click menu item "Check for Updates…" of menu 1 of menu bar item "ChatGPT" of menu bar 1
+          end tell
+        end tell
+        APPLESCRIPT
+        )
+        click_status=$?
+        if [ "$click_status" -ne 0 ]; then
+          printf 'ERROR:%s\nUPDATE:permission\nVERIFY:failed\n' "$(printf '%s' "$click_result" | tail -n 1 | tr '\n' ' ')"
+          exit 3
+        fi
+
+        inspect_update_dialog() {
+          /usr/bin/osascript 2>&1 <<'APPLESCRIPT'
+        set updateButtonNames to {"Install and Relaunch", "Update and Relaunch", "Restart to Update", "Install Update", "Download and Install", "Update Now", "Relaunch", "Download", "Update"}
+        tell application "System Events"
+          if not (exists process "ChatGPT") then return "restarting"
+          tell process "ChatGPT"
+            repeat with updateWindow in windows
+              set dialogText to ""
+              try
+                set dialogText to (value of every static text of updateWindow) as text
+              end try
+              ignoring case
+                if dialogText contains "up to date" or dialogText contains "newest version available" then
+                  try
+                    click button "OK" of updateWindow
+                  end try
+                  return "current"
+                end if
+              end ignoring
+              repeat with buttonName in updateButtonNames
+                set candidateName to buttonName as text
+                if exists button candidateName of updateWindow then
+                  click button candidateName of updateWindow
+                  return "acted:" & candidateName
+                end if
+              end repeat
+            end repeat
+          end tell
+        end tell
+        return "waiting"
+        APPLESCRIPT
+        }
+
+        elapsed=0
+        acted=0
+        saw_restart=0
+        while [ "$elapsed" -lt 360 ]; do
+          after_version=$(read_version)
+          after_build=$(read_build)
+          if { [ "$after_version" != "$before_version" ] || [ "$after_build" != "$before_build" ]; } && pgrep ChatGPT >/dev/null 2>&1; then
+            printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:ok\nVERIFY:updated\n' "$after_version" "$after_build"
+            exit 0
+          fi
+
+          if ! pgrep ChatGPT >/dev/null 2>&1; then
+            saw_restart=1
+            sleep 2
+            elapsed=$((elapsed + 2))
+            continue
+          fi
+
+          dialog_result=$(inspect_update_dialog)
+          dialog_status=$?
+          if [ "$dialog_status" -ne 0 ]; then
+            printf 'ERROR:%s\nUPDATE:permission\nVERIFY:failed\n' "$(printf '%s' "$dialog_result" | tail -n 1 | tr '\n' ' ')"
+            exit 3
+          fi
+          case "$dialog_result" in
+            current)
+              printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:current\nVERIFY:current\n' "$after_version" "$after_build"
+              exit 0
+              ;;
+            acted:*) acted=1 ;;
+            restarting) saw_restart=1 ;;
+          esac
+
+          if [ "$saw_restart" -eq 1 ] && [ "$elapsed" -ge 45 ]; then
+            /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
+          fi
+          if [ "$acted" -eq 0 ] && [ "$elapsed" -ge 45 ]; then
+            printf 'UPDATE:no-result\nVERIFY:failed\n'
+            exit 4
+          fi
+          sleep 2
+          elapsed=$((elapsed + 2))
+        done
+
+        after_version=$(read_version)
+        after_build=$(read_build)
+        printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:timeout\nVERIFY:failed\n' "$after_version" "$after_build"
+        exit 4
+        """
+    }
+}
+
+public enum CodexDesktopAppUpdateParser {
+    public static func outcome(from result: CommandResult) -> CodexDesktopAppUpdateOutcome {
+        let lines = result.stdout
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let activeVersion = value(after: "AFTER_VERSION:", in: lines)
+            ?? value(after: "BEFORE_VERSION:", in: lines)
+        let activeBuild = value(after: "AFTER_BUILD:", in: lines)
+            ?? value(after: "BEFORE_BUILD:", in: lines)
+
+        if result.timedOut {
+            return outcome(.failed, activeVersion, activeBuild, "Codex app update timed out")
+        }
+        if isOfflineFailure(result) {
+            return outcome(.offline, activeVersion, activeBuild, "Offline — SSH connection unavailable")
+        }
+        if lines.contains("VERIFY:updated") {
+            return outcome(.updated, activeVersion, activeBuild, versionDetail(prefix: "Updated Codex app to", version: activeVersion, build: activeBuild))
+        }
+        if lines.contains("VERIFY:current") {
+            return outcome(.current, activeVersion, activeBuild, versionDetail(prefix: "Codex app is current at", version: activeVersion, build: activeBuild))
+        }
+        if lines.contains("UPDATE:missing") {
+            return outcome(.failed, nil, nil, "Codex desktop app is not installed")
+        }
+        if lines.contains("UPDATE:unsupported") {
+            return outcome(.failed, nil, nil, "Codex desktop app updates require macOS")
+        }
+        if lines.contains("UPDATE:permission") {
+            return outcome(.failed, activeVersion, activeBuild, "Allow Fleetlight to control System Events in macOS Privacy & Security")
+        }
+        if lines.contains("UPDATE:not-running") {
+            return outcome(.failed, activeVersion, activeBuild, "Codex desktop app could not be opened")
+        }
+
+        let error = value(after: "ERROR:", in: lines)
+        return outcome(.failed, activeVersion, activeBuild, error.map { String($0.prefix(160)) } ?? "Codex app update did not complete")
+    }
+
+    private static func outcome(
+        _ status: CodexDesktopAppUpdateStatus,
+        _ version: String?,
+        _ build: String?,
+        _ detail: String
+    ) -> CodexDesktopAppUpdateOutcome {
+        CodexDesktopAppUpdateOutcome(status: status, activeVersion: version, activeBuild: build, detail: detail)
+    }
+
+    private static func versionDetail(prefix: String, version: String?, build: String?) -> String {
+        guard let version else { return prefix }
+        return build.map { "\(prefix) \(version) (build \($0))" } ?? "\(prefix) \(version)"
+    }
+
+    private static func value(after prefix: String, in lines: [String]) -> String? {
+        guard let line = lines.last(where: { $0.hasPrefix(prefix) }) else { return nil }
+        let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func isOfflineFailure(_ result: CommandResult) -> Bool {
+        if result.exitCode == 255 { return true }
+        let message = (result.stderr + "\n" + result.stdout).lowercased()
+        return message.contains("no ssh route configured")
+            || message.contains("connection refused")
+            || message.contains("connection timed out")
+            || message.contains("operation timed out")
+            || message.contains("no route to host")
+            || message.contains("could not resolve hostname")
+            || message.contains("network is unreachable")
+    }
+}
+
+
 public enum FleetReportBuilder {
     public static func build(
         hosts: [FleetHost],
@@ -1967,6 +2236,10 @@ public enum FleetReportBuilder {
             var facts = [snapshot.state.rawValue.capitalized]
             if let os = snapshot.operatingSystem { facts.append(os) }
             if let codexVersion = snapshot.codexVersion { facts.append("Codex \(codexVersion)") }
+            if let appVersion = snapshot.codexDesktopAppVersion {
+                let build = snapshot.codexDesktopAppBuild.map { " (build \($0))" } ?? ""
+                facts.append("Codex app \(appVersion)\(build)")
+            }
             if let disk = snapshot.diskPercent { facts.append("disk \(disk)%") }
             if let memory = snapshot.memoryPercent { facts.append("memory \(memory)%") }
             if let load = snapshot.loadAverage { facts.append(String(format: "load %.2f", load)) }

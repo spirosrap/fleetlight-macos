@@ -1358,7 +1358,7 @@ public enum ProbeParser {
 
         let os = value(after: "OS=", in: lines)
         let boot = value(after: "BOOT=", in: lines)
-        let codexVersion = normalizeCodexVersion(value(after: "CODEX=", in: lines))
+        let codexVersion = preferredCodexVersion(values(after: "CODEX=", in: lines))
         let diskText = value(after: "DISK=", in: lines)?.replacingOccurrences(of: "%", with: "")
         let disk = diskText.flatMap(Int.init)
         let memory = value(after: "MEM=", in: lines).flatMap(Int.init)
@@ -1388,6 +1388,14 @@ public enum ProbeParser {
         guard let line = lines.first(where: { $0.hasPrefix(prefix) }) else { return nil }
         let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+
+    private static func values(after prefix: String, in lines: [String]) -> [String] {
+        lines.compactMap { line in
+            guard line.hasPrefix(prefix) else { return nil }
+            let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        }
     }
 
     private static func parseService(_ line: String) -> ServiceSnapshot? {
@@ -1426,6 +1434,37 @@ public enum ProbeParser {
         }
     }
 
+    private static func preferredCodexVersion(_ rawValues: [String]) -> String? {
+        let normalized = rawValues.compactMap(normalizeCodexVersion)
+        let installed = normalized.filter { codexVersionComponents($0) != nil }
+
+        if let newest = installed.max(by: isOlderCodexVersion) {
+            return newest
+        }
+        if normalized.contains("Unavailable") { return "Unavailable" }
+        if normalized.contains("Not installed") { return "Not installed" }
+        return normalized.first
+    }
+
+    private static func codexVersionComponents(_ value: String) -> [Int]? {
+        let core = value.split(separator: "-", maxSplits: 1).first.map(String.init) ?? value
+        let parts = core.split(separator: ".", omittingEmptySubsequences: false)
+        guard !parts.isEmpty else { return nil }
+        let components = parts.compactMap { Int($0) }
+        return components.count == parts.count ? components : nil
+    }
+
+    private static func isOlderCodexVersion(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = codexVersionComponents(lhs),
+              let right = codexVersionComponents(rhs) else { return false }
+        for index in 0..<max(left.count, right.count) {
+            let leftPart = index < left.count ? left[index] : 0
+            let rightPart = index < right.count ? right[index] : 0
+            if leftPart != rightPart { return leftPart < rightPart }
+        }
+        return false
+    }
+
     private static func normalizeBoot(_ raw: String?) -> String? {
         guard let raw else { return nil }
 
@@ -1456,24 +1495,23 @@ public enum RemoteCommandBuilder {
           mem=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2} END{if(t>0)printf "%.0f",(t-a)*100/t}' /proc/meminfo 2>/dev/null)
         fi
         disk=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $5}')
-        codex_bin=$(command -v codex 2>/dev/null || true)
-        if [ -z "$codex_bin" ]; then
+        codex_candidates=$(
+          command -v codex 2>/dev/null || true
           for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
-            if [ -x "$candidate" ]; then codex_bin=$candidate; break; fi
+            if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; fi
           done
-        fi
-        if [ -z "$codex_bin" ] && [ -s "$HOME/.nvm/nvm.sh" ]; then
-          . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
-          nvm use --silent default >/dev/null 2>&1 || nvm use --silent node >/dev/null 2>&1 || true
-          codex_bin=$(command -v codex 2>/dev/null || true)
-        fi
-        if [ -n "$codex_bin" ]; then
-          codex_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | tr -d '\r')
-          if [ -z "$codex_version" ]; then codex_version=unavailable; fi
-        else
-          codex_version=not-installed
-        fi
-        printf 'OS=%s\nBOOT=%s\nCODEX=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$codex_version" "$disk" "$load" "$mem"
+          if [ -d "$HOME/.nvm/versions/node" ]; then
+            find "$HOME/.nvm/versions/node" -type f -path '*/bin/codex' 2>/dev/null
+          fi
+        )
+        codex_versions=$(
+          printf '%s\n' "$codex_candidates" | awk 'NF && !seen[$0]++' | while IFS= read -r codex_bin; do
+            codex_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | tr -d '\r')
+            if [ -n "$codex_version" ]; then printf 'CODEX=%s\n' "$codex_version"; else printf 'CODEX=unavailable\n'; fi
+          done
+        )
+        if [ -n "$codex_versions" ]; then printf '%s\n' "$codex_versions"; else printf 'CODEX=not-installed\n'; fi
+        printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
         """
 
         return ([base] + services.map(serviceCommand)).joined(separator: "\n")

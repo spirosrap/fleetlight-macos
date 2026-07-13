@@ -21,6 +21,7 @@ let verified = CommandResult(
     FLEETLIGHT_OK
     OS=Linux
     BOOT=2026-07-11 08:12:03
+    CODEX=codex-cli 0.137.0
     CODEX=codex-cli 0.144.2
     DISK=42%
     LOAD=0.73
@@ -42,7 +43,7 @@ verifiedSnapshot.pingJitterMilliseconds = 6
 verifiedSnapshot.packetLossPercent = 0
 test.require(verifiedSnapshot.state == .online, "verified probe should be online")
 test.require(verifiedSnapshot.operatingSystem == "Linux", "OS should be parsed")
-test.require(verifiedSnapshot.codexVersion == "0.144.2", "Codex CLI version should be parsed and normalized")
+test.require(verifiedSnapshot.codexVersion == "0.144.2", "newest Codex CLI version should win when duplicate installs exist")
 test.require(verifiedSnapshot.diskPercent == 42, "disk percentage should be parsed")
 test.require(verifiedSnapshot.memoryPercent == 38, "memory percentage should be parsed")
 test.require(verifiedSnapshot.loadAverage == 0.73, "load average should be parsed")
@@ -106,6 +107,8 @@ test.require(report.contains("Plex: stopped"), "report should include service he
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")
+test.require(command.contains("find \"$HOME/.nvm/versions/node\""), "remote command should inspect every NVM Codex install without shell glob failures")
+test.require(command.contains("!seen[$0]++"), "remote command should avoid probing duplicate Codex paths")
 test.require(command.contains("SERVICE=tailscale"), "remote command should include Tailscale")
 test.require(command.contains("SERVICE=plex"), "remote command should include Plex")
 test.require(command.contains("SERVICE=samba"), "remote command should include Samba")

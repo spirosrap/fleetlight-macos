@@ -73,7 +73,7 @@ Supported machine fields:
 - One combined menu-bar label that preserves simultaneous states, such as `1 offline · 2 slow · 1 alert`
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
-- Current Codex CLI version for every online machine, including user-level and NVM installations
+- Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
 - Configurable performance-warning thresholds
 - Seven-day local metric history with 1-hour, 6-hour, 24-hour, and 7-day charts
 - Live fleet timing comparison and plain-language network diagnosis

@@ -545,6 +545,7 @@ private struct CodexView: View {
     let onUpdateAvailable: () -> Void
     @State private var pendingDesktopAppHost: FleetHost?
     @State private var isConfirmingAllDesktopApps = false
+    @State private var isConfirmingAvailableDesktopApps = false
     @State private var selectedSubview: CodexSubview = .desktopApp
 
     var body: some View {
@@ -665,6 +666,18 @@ private struct CodexView: View {
             Text("If OpenAI has an update, Codex will close and reopen automatically. Fleetlight stays open.")
         }
         .confirmationDialog(
+            "Update Codex on \(model.codexDesktopAppUpdateAvailableHosts.count) Mac\(model.codexDesktopAppUpdateAvailableHosts.count == 1 ? "" : "s")?",
+            isPresented: $isConfirmingAvailableDesktopApps,
+            titleVisibility: .visible
+        ) {
+            Button("Update \(model.codexDesktopAppUpdateAvailableHosts.count)") {
+                Task { await model.updateCodexDesktopAppsOnAvailableHosts() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only Macs running an older signed Codex build will be updated. Codex restarts automatically after installation.")
+        }
+        .confirmationDialog(
             "Check and update Codex on all configured Macs?",
             isPresented: $isConfirmingAllDesktopApps,
             titleVisibility: .visible
@@ -684,10 +697,10 @@ private struct CodexView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex Mac app")
                         .font(.headline)
-                    Text(desktopAppVersionDetail)
+                    Text(desktopAppReleaseDetail)
                         .font(.caption)
-                        .foregroundStyle(Color.primary.opacity(0.78))
-                    Text("OpenAI’s updater restarts Codex only when it installs a newer version")
+                        .foregroundStyle(model.codexDesktopAppReleaseCheckFailed ? Color.orange : Color.primary.opacity(0.78))
+                    Text(desktopAppVersionDetail)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -703,42 +716,64 @@ private struct CodexView: View {
                 .controlSize(.small)
 
                 Button {
-                    isConfirmingAllDesktopApps = true
+                    Task { await model.checkCodexDesktopAppReleaseNow() }
                 } label: {
                     Label(
-                        model.isUpdatingCodexDesktopApps ? "Updating…" : "Check & Update All",
-                        systemImage: "arrow.down.app"
+                        model.isCheckingCodexDesktopAppRelease ? "Checking…" : "Check Latest",
+                        systemImage: "arrow.clockwise"
                     )
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                .disabled(model.isRefreshing || model.isCheckingCodexDesktopAppRelease || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+
+                if model.codexDesktopAppReleaseSummary.updateAvailableCount > 0 {
+                    Button("Update \(model.codexDesktopAppReleaseSummary.updateAvailableCount)") {
+                        isConfirmingAvailableDesktopApps = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                } else {
+                    Button("Check & Update All") {
+                        isConfirmingAllDesktopApps = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                }
             }
             .padding(12)
 
             HStack(spacing: 6) {
                 SummaryPill(
-                    label: "Installed",
-                    value: "\(model.codexDesktopAppSummary.installedCount)",
+                    label: "Current",
+                    value: "\(model.codexDesktopAppReleaseSummary.currentCount)",
                     color: .green,
                     isSelected: false
                 )
                 SummaryPill(
-                    label: "Verified",
-                    value: "\(model.codexDesktopAppVerifiedCount)",
-                    color: model.codexDesktopAppVerifiedCount > 0 ? .blue : .secondary,
+                    label: "Updates",
+                    value: "\(model.codexDesktopAppReleaseSummary.updateAvailableCount)",
+                    color: model.codexDesktopAppReleaseSummary.updateAvailableCount > 0 ? .blue : .secondary,
                     isSelected: false
                 )
                 SummaryPill(
                     label: "Offline",
-                    value: "\(model.codexDesktopAppSummary.offlineCount)",
-                    color: model.codexDesktopAppSummary.offlineCount > 0 ? .red : .secondary,
+                    value: "\(model.codexDesktopAppReleaseSummary.offlineCount)",
+                    color: model.codexDesktopAppReleaseSummary.offlineCount > 0 ? .red : .secondary,
                     isSelected: false
                 )
                 SummaryPill(
                     label: "Missing",
-                    value: "\(model.codexDesktopAppSummary.missingCount)",
-                    color: model.codexDesktopAppSummary.missingCount > 0 ? .orange : .secondary,
+                    value: "\(model.codexDesktopAppReleaseSummary.missingCount)",
+                    color: model.codexDesktopAppReleaseSummary.missingCount > 0 ? .orange : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Unknown",
+                    value: "\(model.codexDesktopAppReleaseSummary.unavailableCount)",
+                    color: model.codexDesktopAppReleaseSummary.unavailableCount > 0 ? .orange : .secondary,
                     isSelected: false
                 )
                 Spacer(minLength: 0)
@@ -754,6 +789,8 @@ private struct CodexView: View {
                         CodexDesktopAppMachineRow(
                             host: host,
                             snapshot: model.snapshots[host.id] ?? HostSnapshot(),
+                            releaseState: model.codexDesktopAppReleaseState(for: host),
+                            latestRelease: model.latestCodexDesktopAppRelease,
                             updateProgress: model.codexDesktopAppUpdates[host.id],
                             isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
                             onUpdate: { pendingDesktopAppHost = host }
@@ -779,6 +816,19 @@ private struct CodexView: View {
             : "Latest stable release has not been checked yet"
     }
 
+    private var desktopAppReleaseDetail: String {
+        if model.isCheckingCodexDesktopAppRelease {
+            return "Checking OpenAI’s official release feed…"
+        }
+        if let release = model.latestCodexDesktopAppRelease {
+            let prefix = model.codexDesktopAppReleaseCheckFailed ? "Last known latest" : "Latest"
+            return "\(prefix) \(release.version) (build \(release.build))"
+        }
+        return model.codexDesktopAppReleaseCheckFailed
+            ? "Latest Codex Mac app release is temporarily unavailable"
+            : "Latest release has not been checked yet"
+    }
+
     private var desktopAppVersionDetail: String {
         let installed = model.codexDesktopAppHosts.compactMap { host -> (name: String, version: String)? in
             guard let version = model.snapshots[host.id]?.codexDesktopAppVersion else { return nil }
@@ -800,6 +850,8 @@ private struct CodexView: View {
 private struct CodexDesktopAppMachineRow: View {
     let host: FleetHost
     let snapshot: HostSnapshot
+    let releaseState: CodexDesktopAppReleaseState
+    let latestRelease: CodexDesktopAppRelease?
     let updateProgress: HostCodexUpdateProgress?
     let isUpdateBusy: Bool
     let onUpdate: () -> Void
@@ -845,7 +897,7 @@ private struct CodexDesktopAppMachineRow: View {
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(statusColor)
                 if canUpdate {
-                    Button("Check & Update", action: onUpdate)
+                    Button(releaseState == .updateAvailable ? "Update" : "Check & Update", action: onUpdate)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(isUpdateBusy)
@@ -882,6 +934,9 @@ private struct CodexDesktopAppMachineRow: View {
                 return "Codex desktop app is not installed"
             }
             let build = snapshot.codexDesktopAppBuild.map { " · build \($0)" } ?? ""
+            if releaseState == .updateAvailable, let latestRelease {
+                return "Installed \(version)\(build) · latest \(latestRelease.version) (build \(latestRelease.build))"
+            }
             return "Installed \(version)\(build)"
         }
     }
@@ -896,11 +951,15 @@ private struct CodexDesktopAppMachineRow: View {
             case .failed: return "Needs attention"
             }
         }
-        switch snapshot.state {
-        case .checking: return "Checking"
-        case .waking: return "Waking"
-        case .unreachable: return "Offline"
-        case .online: return snapshot.codexDesktopAppVersion == nil ? "Not installed" : "Ready"
+        switch releaseState {
+        case .current: return "Current"
+        case .updateAvailable: return "Update available"
+        case .offline: return "Offline"
+        case .missing: return "Not installed"
+        case .unavailable:
+            if snapshot.state == .checking { return "Checking" }
+            if snapshot.state == .waking { return "Waking" }
+            return "Unknown"
         }
     }
 
@@ -911,9 +970,12 @@ private struct CodexDesktopAppMachineRow: View {
         case .offline: return "wifi.slash"
         case .failed: return "exclamationmark.triangle.fill"
         case .notAttempted, nil:
-            if snapshot.state == .unreachable { return "wifi.slash" }
-            if snapshot.codexDesktopAppVersion == nil { return "questionmark.circle" }
-            return "checkmark.circle"
+            switch releaseState {
+            case .current: return "checkmark.circle.fill"
+            case .updateAvailable: return "arrow.up.circle.fill"
+            case .offline: return "wifi.slash"
+            case .missing, .unavailable: return "questionmark.circle"
+            }
         }
     }
 
@@ -924,9 +986,12 @@ private struct CodexDesktopAppMachineRow: View {
         case .offline: return .orange
         case .failed: return .red
         case .notAttempted, nil:
-            if snapshot.state == .unreachable { return .red }
-            if snapshot.codexDesktopAppVersion == nil { return .orange }
-            return .secondary
+            switch releaseState {
+            case .current: return .green
+            case .updateAvailable: return .blue
+            case .offline: return .red
+            case .missing, .unavailable: return .orange
+            }
         }
     }
 

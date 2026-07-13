@@ -77,7 +77,8 @@ Supported machine fields:
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
 - Optional Codex desktop app version and build reporting for configured macOS hosts
 - Separate Mac App and CLI views in the Codex dashboard, opening on the Mac App view so signed app versions and builds are immediately visible
-- Mac App summaries for installed, verified, offline, and missing states, with explicit per-machine last-check times and a copyable version report
+- Mac App summaries for current, update available, offline, missing, and unknown states, with explicit per-machine last-check times and a copyable version report
+- Cached checks of OpenAI’s official Codex Mac app feed, with latest version/build details, per-Mac Current or Update Available status, and targeted updates for outdated Macs only
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
@@ -97,7 +98,7 @@ Supported machine fields:
 
 ## Privacy
 
-Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. To check update availability, Fleetlight makes a cached HTTPS request to npm's public `@openai/codex` metadata at most once every 15 minutes; it sends no fleet configuration or machine measurements. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
+Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. To check update availability, Fleetlight makes cached HTTPS requests to npm's public `@openai/codex` metadata and OpenAI’s public Codex Mac appcast at most once every 15 minutes; it sends no fleet configuration or machine measurements. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
 
 The first desktop app update may ask for permission to control System Events. Approve Fleetlight under **System Settings → Privacy & Security → Automation** (and Accessibility if macOS requests it). Fleetlight uses that access only to choose ChatGPT/Codex’s **Check for Updates…** command and its signed install/relaunch action.
 

@@ -22,6 +22,9 @@ final class FleetModel: ObservableObject {
     @Published private(set) var latestCodexVersion: String?
     @Published private(set) var isCheckingCodexRelease = false
     @Published private(set) var codexReleaseCheckFailed = false
+    @Published private(set) var latestCodexDesktopAppRelease: CodexDesktopAppRelease?
+    @Published private(set) var isCheckingCodexDesktopAppRelease = false
+    @Published private(set) var codexDesktopAppReleaseCheckFailed = false
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var hiddenHostIDs: Set<String>
     @Published private(set) var hosts: [FleetHost]
@@ -41,6 +44,7 @@ final class FleetModel: ObservableObject {
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
     private var codexReleaseCheckedAt: Date?
+    private var codexDesktopAppReleaseCheckedAt: Date?
 
     private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
     private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
@@ -66,6 +70,12 @@ final class FleetModel: ObservableObject {
         latestCodexVersion = UserDefaults.standard.string(forKey: "latestCodexVersion")
         codexReleaseCheckedAt = UserDefaults.standard.object(forKey: "codexReleaseCheckedAt") as? Date
         codexReleaseCheckFailed = UserDefaults.standard.bool(forKey: "codexReleaseCheckFailed")
+        if let version = UserDefaults.standard.string(forKey: "latestCodexDesktopAppVersion"),
+           let build = UserDefaults.standard.string(forKey: "latestCodexDesktopAppBuild") {
+            latestCodexDesktopAppRelease = CodexDesktopAppRelease(version: version, build: build)
+        }
+        codexDesktopAppReleaseCheckedAt = UserDefaults.standard.object(forKey: "codexDesktopAppReleaseCheckedAt") as? Date
+        codexDesktopAppReleaseCheckFailed = UserDefaults.standard.bool(forKey: "codexDesktopAppReleaseCheckFailed")
         notice = configurationResult.notice
         restoreCodexUpdateBatch()
     }
@@ -120,6 +130,27 @@ final class FleetModel: ObservableObject {
 
     var codexDesktopAppSummary: CodexDesktopAppSummary {
         CodexDesktopAppReportBuilder.summarize(hosts: codexDesktopAppHosts, snapshots: snapshots)
+    }
+
+    var codexDesktopAppReleaseSummary: CodexDesktopAppReleaseSummary {
+        CodexDesktopAppReleaseChecker.summarize(
+            hosts: codexDesktopAppHosts,
+            snapshots: snapshots,
+            latestRelease: latestCodexDesktopAppRelease
+        )
+    }
+
+    var codexDesktopAppUpdateAvailableHosts: [FleetHost] {
+        codexDesktopAppHosts.filter { host in
+            codexDesktopAppReleaseState(for: host) == .updateAvailable
+        }
+    }
+
+    func codexDesktopAppReleaseState(for host: FleetHost) -> CodexDesktopAppReleaseState {
+        CodexDesktopAppReleaseChecker.state(
+            snapshot: snapshots[host.id] ?? HostSnapshot(),
+            latestRelease: latestCodexDesktopAppRelease
+        )
     }
 
     var codexDesktopAppVerifiedCount: Int {
@@ -368,6 +399,20 @@ final class FleetModel: ObservableObject {
             codexReleaseTask = nil
         }
 
+        let appReleaseRetryInterval = codexDesktopAppReleaseCheckFailed
+            ? Self.failedCodexReleaseRetryInterval
+            : Self.codexReleaseCheckInterval
+        let shouldCheckAppRelease = codexDesktopAppReleaseCheckedAt.map {
+            Date().timeIntervalSince($0) >= appReleaseRetryInterval
+        } ?? true
+        let appReleaseTask: Task<String?, Never>?
+        if shouldCheckAppRelease {
+            isCheckingCodexDesktopAppRelease = true
+            appReleaseTask = Task { await Self.fetchLatestCodexDesktopAppRelease() }
+        } else {
+            appReleaseTask = nil
+        }
+
         let previousSnapshots = snapshots
         let isInitialRefresh = lastRefresh == nil
 
@@ -400,6 +445,9 @@ final class FleetModel: ObservableObject {
 
         if let codexReleaseTask {
             applyCodexReleaseResult(await codexReleaseTask.value)
+        }
+        if let appReleaseTask {
+            applyCodexDesktopAppReleaseResult(await appReleaseTask.value)
         }
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
@@ -440,6 +488,39 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    private func applyCodexDesktopAppReleaseResult(_ appcastXML: String?) {
+        let checkedAt = Date()
+        codexDesktopAppReleaseCheckedAt = checkedAt
+        UserDefaults.standard.set(checkedAt, forKey: "codexDesktopAppReleaseCheckedAt")
+        isCheckingCodexDesktopAppRelease = false
+
+        guard let appcastXML,
+              let release = CodexDesktopAppReleaseChecker.latestRelease(fromAppcastXML: appcastXML) else {
+            codexDesktopAppReleaseCheckFailed = true
+            UserDefaults.standard.set(true, forKey: "codexDesktopAppReleaseCheckFailed")
+            return
+        }
+        latestCodexDesktopAppRelease = release
+        codexDesktopAppReleaseCheckFailed = false
+        UserDefaults.standard.set(release.version, forKey: "latestCodexDesktopAppVersion")
+        UserDefaults.standard.set(release.build, forKey: "latestCodexDesktopAppBuild")
+        UserDefaults.standard.set(false, forKey: "codexDesktopAppReleaseCheckFailed")
+    }
+
+    func checkCodexDesktopAppReleaseNow() async {
+        guard !isCheckingCodexDesktopAppRelease else { return }
+        isCheckingCodexDesktopAppRelease = true
+        notice = nil
+        applyCodexDesktopAppReleaseResult(await Self.fetchLatestCodexDesktopAppRelease())
+        if codexDesktopAppReleaseCheckFailed {
+            notice = "Couldn’t check the latest Codex Mac app release"
+        } else if let release = latestCodexDesktopAppRelease {
+            notice = codexDesktopAppReleaseSummary.updateAvailableCount > 0
+                ? "Codex Mac app \(release.version) is available"
+                : "Codex Mac apps are current at \(release.version)"
+        }
+    }
+
     func updateCodexOnAvailableHosts() async {
         let targets = codexUpdateAvailableHosts
         guard !targets.isEmpty else {
@@ -470,6 +551,15 @@ final class FleetModel: ObservableObject {
 
     func updateCodexDesktopAppsOnAllHosts() async {
         await performCodexDesktopAppUpdates(on: codexDesktopAppHosts)
+    }
+
+    func updateCodexDesktopAppsOnAvailableHosts() async {
+        let targets = codexDesktopAppUpdateAvailableHosts
+        guard !targets.isEmpty else {
+            notice = "No Codex Mac app updates are available"
+            return
+        }
+        await performCodexDesktopAppUpdates(on: targets)
     }
 
     func updateCodexDesktopApp(on host: FleetHost) async {
@@ -1089,7 +1179,8 @@ final class FleetModel: ObservableObject {
     func copyCodexDesktopAppReport() {
         let report = CodexDesktopAppReportBuilder.build(
             hosts: codexDesktopAppHosts,
-            snapshots: snapshots
+            snapshots: snapshots,
+            latestRelease: latestCodexDesktopAppRelease
         )
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(report, forType: .string)
@@ -1369,6 +1460,20 @@ final class FleetModel: ObservableObject {
         guard let url = URL(string: "https://registry.npmjs.org/@openai%2Fcodex/latest") else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 8)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    nonisolated private static func fetchLatestCodexDesktopAppRelease() async -> String? {
+        guard let url = URL(string: "https://persistent.oaistatic.com/codex-app-prod/appcast.xml") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.setValue("application/xml", forHTTPHeaderField: "Accept")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,

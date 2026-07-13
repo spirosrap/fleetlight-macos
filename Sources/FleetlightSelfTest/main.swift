@@ -156,6 +156,40 @@ test.require(appReport.contains("Configured 3 · Installed 1 · Offline 1 · Mis
 test.require(appReport.contains("Example Mac: Installed 26.707.62119 (build 5211)"), "Mac app report should include the signed version and build")
 test.require(appReport.contains("checked"), "Mac app report should include the last check time")
 
+let appcastXML = """
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <item>
+      <title>26.708.10000</title>
+      <sparkle:version>5220</sparkle:version>
+      <sparkle:shortVersionString>26.708.10000</sparkle:shortVersionString>
+    </item>
+    <item>
+      <sparkle:version>5211</sparkle:version>
+      <sparkle:shortVersionString>26.707.62119</sparkle:shortVersionString>
+    </item>
+  </channel>
+</rss>
+"""
+let latestAppRelease = CodexDesktopAppReleaseChecker.latestRelease(fromAppcastXML: appcastXML)
+test.require(latestAppRelease == CodexDesktopAppRelease(version: "26.708.10000", build: "5220"), "Mac app release checks should use the newest appcast item")
+test.require(CodexDesktopAppReleaseChecker.latestRelease(fromAppcastXML: "<rss></rss>") == nil, "invalid appcasts should not invent a release")
+test.require(CodexDesktopAppReleaseChecker.state(snapshot: appSnapshot, latestRelease: latestAppRelease) == .updateAvailable, "older signed app builds should show an available update")
+var currentAppSnapshot = appSnapshot
+currentAppSnapshot.codexDesktopAppVersion = "26.708.10000"
+currentAppSnapshot.codexDesktopAppBuild = "5220"
+test.require(CodexDesktopAppReleaseChecker.state(snapshot: currentAppSnapshot, latestRelease: latestAppRelease) == .current, "matching signed app builds should be current")
+test.require(CodexDesktopAppReleaseChecker.state(snapshot: HostSnapshot(state: .unreachable), latestRelease: latestAppRelease) == .offline, "unreachable Mac app hosts should remain offline")
+test.require(CodexDesktopAppReleaseChecker.state(snapshot: HostSnapshot(state: .online), latestRelease: latestAppRelease) == .missing, "online hosts without the app should be missing")
+let releaseReport = CodexDesktopAppReportBuilder.build(
+    hosts: [appHost],
+    snapshots: [appHost.id: appSnapshot],
+    latestRelease: latestAppRelease,
+    generatedAt: appCheckedAt
+)
+test.require(releaseReport.contains("Latest 26.708.10000 (build 5220)"), "Mac app reports should name the official latest release")
+test.require(releaseReport.contains("update available"), "Mac app reports should mark outdated builds")
+
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")

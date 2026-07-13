@@ -829,6 +829,115 @@ public struct CodexDesktopAppSummary: Sendable, Equatable {
     }
 }
 
+public struct CodexDesktopAppRelease: Sendable, Equatable {
+    public let version: String
+    public let build: String
+
+    public init(version: String, build: String) {
+        self.version = version
+        self.build = build
+    }
+}
+
+public enum CodexDesktopAppReleaseState: String, Sendable {
+    case current
+    case updateAvailable
+    case offline
+    case missing
+    case unavailable
+}
+
+public struct CodexDesktopAppReleaseSummary: Sendable, Equatable {
+    public let currentCount: Int
+    public let updateAvailableCount: Int
+    public let offlineCount: Int
+    public let missingCount: Int
+    public let unavailableCount: Int
+
+    public init(
+        currentCount: Int,
+        updateAvailableCount: Int,
+        offlineCount: Int,
+        missingCount: Int,
+        unavailableCount: Int
+    ) {
+        self.currentCount = currentCount
+        self.updateAvailableCount = updateAvailableCount
+        self.offlineCount = offlineCount
+        self.missingCount = missingCount
+        self.unavailableCount = unavailableCount
+    }
+}
+
+public enum CodexDesktopAppReleaseChecker {
+    public static func latestRelease(fromAppcastXML xml: String) -> CodexDesktopAppRelease? {
+        guard let itemStart = xml.range(of: "<item>"),
+              let itemEnd = xml.range(of: "</item>", range: itemStart.upperBound..<xml.endIndex) else {
+            return nil
+        }
+        let item = String(xml[itemStart.upperBound..<itemEnd.lowerBound])
+        guard let version = value(forTag: "sparkle:shortVersionString", in: item),
+              let build = value(forTag: "sparkle:version", in: item),
+              Int(build) != nil else {
+            return nil
+        }
+        return CodexDesktopAppRelease(version: version, build: build)
+    }
+
+    public static func state(
+        snapshot: HostSnapshot,
+        latestRelease: CodexDesktopAppRelease?
+    ) -> CodexDesktopAppReleaseState {
+        if snapshot.state == .unreachable { return .offline }
+        guard snapshot.state == .online else { return .unavailable }
+        guard snapshot.codexDesktopAppVersion != nil else { return .missing }
+        guard let installedBuild = snapshot.codexDesktopAppBuild.flatMap(Int.init),
+              let latestBuild = latestRelease.flatMap({ Int($0.build) }) else {
+            return .unavailable
+        }
+        return installedBuild < latestBuild ? .updateAvailable : .current
+    }
+
+    public static func summarize(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        latestRelease: CodexDesktopAppRelease?
+    ) -> CodexDesktopAppReleaseSummary {
+        var current = 0
+        var updates = 0
+        var offline = 0
+        var missing = 0
+        var unavailable = 0
+
+        for host in hosts where host.supportsCodexDesktopApp {
+            switch state(snapshot: snapshots[host.id] ?? HostSnapshot(), latestRelease: latestRelease) {
+            case .current: current += 1
+            case .updateAvailable: updates += 1
+            case .offline: offline += 1
+            case .missing: missing += 1
+            case .unavailable: unavailable += 1
+            }
+        }
+
+        return CodexDesktopAppReleaseSummary(
+            currentCount: current,
+            updateAvailableCount: updates,
+            offlineCount: offline,
+            missingCount: missing,
+            unavailableCount: unavailable
+        )
+    }
+
+    private static func value(forTag tag: String, in xml: String) -> String? {
+        guard let start = xml.range(of: "<\(tag)>"),
+              let end = xml.range(of: "</\(tag)>", range: start.upperBound..<xml.endIndex) else {
+            return nil
+        }
+        let value = xml[start.upperBound..<end.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+}
+
 public enum CodexDesktopAppReportBuilder {
     public static func summarize(
         hosts: [FleetHost],
@@ -866,6 +975,7 @@ public enum CodexDesktopAppReportBuilder {
     public static func build(
         hosts: [FleetHost],
         snapshots: [String: HostSnapshot],
+        latestRelease: CodexDesktopAppRelease? = nil,
         generatedAt: Date = Date()
     ) -> String {
         let appHosts = hosts.filter(\.supportsCodexDesktopApp)
@@ -874,6 +984,14 @@ public enum CodexDesktopAppReportBuilder {
             "Fleetlight Codex Mac app report — \(generatedAt.formatted(date: .abbreviated, time: .standard))",
             "Configured \(appHosts.count) · Installed \(summary.installedCount) · Offline \(summary.offlineCount) · Missing \(summary.missingCount) · Checking \(summary.checkingCount)"
         ]
+        if let latestRelease {
+            let releaseSummary = CodexDesktopAppReleaseChecker.summarize(
+                hosts: appHosts,
+                snapshots: snapshots,
+                latestRelease: latestRelease
+            )
+            lines.append("Latest \(latestRelease.version) (build \(latestRelease.build)) · Current \(releaseSummary.currentCount) · Updates \(releaseSummary.updateAvailableCount)")
+        }
 
         for host in appHosts {
             let snapshot = snapshots[host.id] ?? HostSnapshot()
@@ -895,6 +1013,9 @@ public enum CodexDesktopAppReportBuilder {
             }
             if let checkedAt = snapshot.checkedAt {
                 facts.append("checked \(checkedAt.formatted(date: .abbreviated, time: .standard))")
+            }
+            if CodexDesktopAppReleaseChecker.state(snapshot: snapshot, latestRelease: latestRelease) == .updateAvailable {
+                facts.append("update available")
             }
             if let route = snapshot.routeName {
                 facts.append("route \(route)")

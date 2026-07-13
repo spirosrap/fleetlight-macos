@@ -74,6 +74,7 @@ Supported machine fields:
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
+- Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
 - Smart Codex updates that target only outdated online machines by default, with a manual latest-version check and an explicit Update All override
 - Persistent Codex update results with separate verified, offline, and failed totals plus reachable-only retries that keep unresolved machines listed

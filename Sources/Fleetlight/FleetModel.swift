@@ -116,6 +116,21 @@ final class FleetModel: ObservableObject {
         codexUpdateAvailableHosts.count
     }
 
+    var codexFleetVersionSummary: CodexFleetVersionSummary {
+        CodexFleetVersionAnalyzer.summarize(
+            hosts: hosts,
+            snapshots: snapshots,
+            latestVersion: latestCodexVersion
+        )
+    }
+
+    func codexFleetVersionState(for host: FleetHost) -> CodexFleetVersionState {
+        CodexFleetVersionAnalyzer.state(
+            snapshot: snapshots[host.id] ?? HostSnapshot(),
+            latestVersion: latestCodexVersion
+        )
+    }
+
     var hasComparableOnlineCodexMachine: Bool {
         hosts.contains { host in
             let snapshot = snapshots[host.id]

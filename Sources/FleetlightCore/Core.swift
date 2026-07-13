@@ -1569,6 +1569,11 @@ public enum CodexReleaseChecker {
         return compare(installed, latest) < 0
     }
 
+    public static func isComparableVersion(_ version: String?) -> Bool {
+        guard let version else { return false }
+        return parse(version) != nil
+    }
+
     private static func normalizedDisplayVersion(_ raw: String) -> String? {
         var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let lowered = value.lowercased()
@@ -1667,6 +1672,86 @@ public enum CodexUpdatePlanner {
                     latestVersion: latestVersion
                 )
         }
+    }
+}
+
+public enum CodexFleetVersionState: String, Sendable {
+    case current
+    case updateAvailable
+    case offline
+    case unavailable
+}
+
+public struct CodexFleetVersionSummary: Equatable, Sendable {
+    public let currentCount: Int
+    public let updateAvailableCount: Int
+    public let offlineCount: Int
+    public let unavailableCount: Int
+
+    public init(
+        currentCount: Int,
+        updateAvailableCount: Int,
+        offlineCount: Int,
+        unavailableCount: Int
+    ) {
+        self.currentCount = currentCount
+        self.updateAvailableCount = updateAvailableCount
+        self.offlineCount = offlineCount
+        self.unavailableCount = unavailableCount
+    }
+}
+
+public enum CodexFleetVersionAnalyzer {
+    public static func state(
+        snapshot: HostSnapshot,
+        latestVersion: String?
+    ) -> CodexFleetVersionState {
+        if snapshot.state == .unreachable {
+            return .offline
+        }
+        guard snapshot.state == .online,
+              CodexReleaseChecker.isComparableVersion(snapshot.codexVersion),
+              CodexReleaseChecker.isComparableVersion(latestVersion) else {
+            return .unavailable
+        }
+        return CodexReleaseChecker.isUpdateAvailable(
+            installedVersion: snapshot.codexVersion,
+            latestVersion: latestVersion
+        ) ? .updateAvailable : .current
+    }
+
+    public static func summarize(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        latestVersion: String?
+    ) -> CodexFleetVersionSummary {
+        var currentCount = 0
+        var updateAvailableCount = 0
+        var offlineCount = 0
+        var unavailableCount = 0
+
+        for host in hosts {
+            switch state(
+                snapshot: snapshots[host.id] ?? HostSnapshot(),
+                latestVersion: latestVersion
+            ) {
+            case .current:
+                currentCount += 1
+            case .updateAvailable:
+                updateAvailableCount += 1
+            case .offline:
+                offlineCount += 1
+            case .unavailable:
+                unavailableCount += 1
+            }
+        }
+
+        return CodexFleetVersionSummary(
+            currentCount: currentCount,
+            updateAvailableCount: updateAvailableCount,
+            offlineCount: offlineCount,
+            unavailableCount: unavailableCount
+        )
     }
 }
 

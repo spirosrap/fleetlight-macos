@@ -31,6 +31,7 @@ struct FleetlightApp: App {
 
 private enum PanelSection: String, CaseIterable, Identifiable {
     case fleet = "Fleet"
+    case codex = "Codex"
     case compare = "Compare"
     case trends = "Trends"
     case events = "Events"
@@ -105,6 +106,11 @@ private struct FleetMenuView: View {
                 switch selectedSection {
                 case .fleet:
                     fleetContent
+                case .codex:
+                    CodexView(
+                        model: model,
+                        onUpdateAvailable: { pendingCodexFleetUpdate = .available }
+                    )
                 case .compare:
                     CompareView(model: model)
                 case .trends:
@@ -524,6 +530,259 @@ private struct FleetSummaryBar: View {
         }
         .buttonStyle(.plain)
         .help(model.fleetStatusFilter == filter ? "Show all visible machines" : "Show \(filter.displayName.lowercased()) machines")
+    }
+}
+
+private struct CodexView: View {
+    @ObservedObject var model: FleetModel
+    let onUpdateAvailable: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Codex versions")
+                        .font(.headline)
+                    Text(releaseDetail)
+                        .font(.caption)
+                        .foregroundStyle(model.codexReleaseCheckFailed ? Color.orange : Color.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await model.checkCodexReleaseNow() }
+                } label: {
+                    Label(
+                        model.isCheckingCodexRelease ? "Checking…" : "Check Latest",
+                        systemImage: "arrow.clockwise"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isUpdatingCodex)
+
+                if model.codexUpdateAvailableCount > 0 {
+                    Button("Update \(model.codexUpdateAvailableCount)", action: onUpdateAvailable)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(model.isRefreshing || model.isUpdatingCodex)
+                }
+            }
+            .padding(12)
+
+            HStack(spacing: 6) {
+                SummaryPill(
+                    label: "Current",
+                    value: "\(model.codexFleetVersionSummary.currentCount)",
+                    color: .green,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Updates",
+                    value: "\(model.codexFleetVersionSummary.updateAvailableCount)",
+                    color: model.codexFleetVersionSummary.updateAvailableCount > 0 ? .blue : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Offline",
+                    value: "\(model.codexFleetVersionSummary.offlineCount)",
+                    color: model.codexFleetVersionSummary.offlineCount > 0 ? .red : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Unknown",
+                    value: "\(model.codexFleetVersionSummary.unavailableCount)",
+                    color: model.codexFleetVersionSummary.unavailableCount > 0 ? .orange : .secondary,
+                    isSelected: false
+                )
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(model.hosts) { host in
+                        CodexMachineRow(
+                            host: host,
+                            snapshot: model.snapshots[host.id] ?? HostSnapshot(),
+                            state: model.codexFleetVersionState(for: host),
+                            latestVersion: model.latestCodexVersion,
+                            updateProgress: model.codexUpdates[host.id],
+                            isUpdateBusy: model.isUpdatingCodex,
+                            onUpdate: { Task { await model.updateCodex(on: host) } }
+                        )
+                    }
+                }
+                .padding(12)
+            }
+        }
+    }
+
+    private var releaseDetail: String {
+        if model.isCheckingCodexRelease {
+            return "Checking npm for the latest stable release…"
+        }
+        if let latestCodexVersion = model.latestCodexVersion {
+            return model.codexReleaseCheckFailed
+                ? "Last known stable \(latestCodexVersion)"
+                : "Latest stable \(latestCodexVersion)"
+        }
+        return model.codexReleaseCheckFailed
+            ? "Latest stable release is temporarily unavailable"
+            : "Latest stable release has not been checked yet"
+    }
+}
+
+private struct CodexMachineRow: View {
+    let host: FleetHost
+    let snapshot: HostSnapshot
+    let state: CodexFleetVersionState
+    let latestVersion: String?
+    let updateProgress: HostCodexUpdateProgress?
+    let isUpdateBusy: Bool
+    let onUpdate: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(statusColor.opacity(0.15))
+                Image(systemName: host.systemImage)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(statusColor)
+            }
+            .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(host.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(host.id)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(versionDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let updateProgress {
+                    Label(updateProgress.detail, systemImage: updateProgressImage)
+                        .font(.caption2)
+                        .foregroundStyle(updateProgressColor)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Label(statusTitle, systemImage: statusImage)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+
+                if state == .updateAvailable {
+                    Button("Update", action: onUpdate)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isUpdateBusy)
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.primary.opacity(0.045))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.primary.opacity(0.06))
+                }
+        )
+    }
+
+    private var versionDetail: String {
+        switch snapshot.state {
+        case .checking:
+            return "Checking installed version…"
+        case .waking:
+            return "Machine is waking…"
+        case .unreachable:
+            return "Could not connect to read the installed version"
+        case .online:
+            guard let installedVersion = snapshot.codexVersion else {
+                return "Installed version unavailable"
+            }
+            if installedVersion == "Not installed" {
+                return "Codex is not installed"
+            }
+            if installedVersion == "Unavailable" {
+                return "Installed version unavailable"
+            }
+            if state == .updateAvailable, let latestVersion {
+                return "Installed \(installedVersion) · latest \(latestVersion)"
+            }
+            return "Installed \(installedVersion)"
+        }
+    }
+
+    private var statusTitle: String {
+        switch state {
+        case .current:
+            return "Current"
+        case .updateAvailable:
+            return "Update available"
+        case .offline:
+            return "Offline"
+        case .unavailable:
+            if snapshot.state == .checking { return "Checking" }
+            if snapshot.state == .waking { return "Waking" }
+            if snapshot.codexVersion == "Not installed" { return "Not installed" }
+            return "Unknown"
+        }
+    }
+
+    private var statusImage: String {
+        switch state {
+        case .current: "checkmark.circle.fill"
+        case .updateAvailable: "arrow.up.circle.fill"
+        case .offline: "wifi.slash"
+        case .unavailable: "questionmark.circle"
+        }
+    }
+
+    private var statusColor: Color {
+        switch state {
+        case .current: .green
+        case .updateAvailable: .blue
+        case .offline: .red
+        case .unavailable: .orange
+        }
+    }
+
+    private var updateProgressImage: String {
+        switch updateProgress?.phase {
+        case .notAttempted: "circle"
+        case .updating: "arrow.triangle.2.circlepath"
+        case .succeeded: "checkmark.circle.fill"
+        case .offline: "wifi.slash"
+        case .failed: "xmark.octagon.fill"
+        case nil: "circle"
+        }
+    }
+
+    private var updateProgressColor: Color {
+        switch updateProgress?.phase {
+        case .notAttempted: .secondary
+        case .updating: .blue
+        case .succeeded: .green
+        case .offline: .orange
+        case .failed: .red
+        case nil: .secondary
+        }
     }
 }
 

@@ -132,6 +132,8 @@ test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.144.3",
 test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-alpha.1", latestVersion: "0.144.3"), "newer prerelease installations should not be offered a downgrade")
 test.require(CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-alpha.1", latestVersion: "0.145.0"), "a stable release should supersede the matching prerelease")
 test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "Not installed", latestVersion: "0.144.3"), "non-version installation states should not produce false update badges")
+test.require(CodexReleaseChecker.isComparableVersion("codex-cli 0.144.3"), "reported Codex CLI versions should be recognized as comparable")
+test.require(!CodexReleaseChecker.isComparableVersion("Unavailable"), "non-version Codex states should not be treated as comparable")
 
 let codexPlannerHosts = [
     FleetHost(id: "outdated", displayName: "Outdated", systemImage: "desktopcomputer"),
@@ -158,6 +160,63 @@ test.require(
         latestVersion: nil
     ).isEmpty,
     "smart Codex updates should wait until the latest stable version is known"
+)
+
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: codexPlannerSnapshots["outdated"]!,
+        latestVersion: "0.144.3"
+    ) == .updateAvailable,
+    "the Codex dashboard should classify older online installations as updateable"
+)
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: codexPlannerSnapshots["current"]!,
+        latestVersion: "0.144.3"
+    ) == .current,
+    "the Codex dashboard should classify matching versions as current"
+)
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: HostSnapshot(state: .online, codexVersion: "0.145.0"),
+        latestVersion: "0.144.3"
+    ) == .current,
+    "the Codex dashboard should not offer a downgrade to newer installations"
+)
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: codexPlannerSnapshots["offline"]!,
+        latestVersion: "0.144.3"
+    ) == .offline,
+    "the Codex dashboard should keep connection failures separate from version state"
+)
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: codexPlannerSnapshots["missing"]!,
+        latestVersion: "0.144.3"
+    ) == .unavailable,
+    "the Codex dashboard should identify missing installations as unavailable"
+)
+test.require(
+    CodexFleetVersionAnalyzer.state(
+        snapshot: codexPlannerSnapshots["current"]!,
+        latestVersion: nil
+    ) == .unavailable,
+    "the Codex dashboard should avoid claiming current status before a release check"
+)
+let codexFleetVersionSummary = CodexFleetVersionAnalyzer.summarize(
+    hosts: codexPlannerHosts,
+    snapshots: codexPlannerSnapshots,
+    latestVersion: "0.144.3"
+)
+test.require(
+    codexFleetVersionSummary == CodexFleetVersionSummary(
+        currentCount: 1,
+        updateAvailableCount: 1,
+        offlineCount: 1,
+        unavailableCount: 1
+    ),
+    "the Codex dashboard summary should count every configured machine exactly once"
 )
 
 let retryableCodexHostIDs = CodexUpdateRecoveryPlanner.retryHostIDs(

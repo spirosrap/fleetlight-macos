@@ -74,7 +74,8 @@ Supported machine fields:
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
-- Confirmed one-click Codex updates across the fleet, with sequential progress, per-machine results, version verification, and individual update actions
+- Confirmed one-click Codex updates across the fleet, with restart-safe resume, sequential progress, version verification, and individual update actions
+- Clear Codex update outcomes for not-yet-attempted, offline, failed, and verified machines, including shell-wrapper-aware updates
 - Configurable performance-warning thresholds
 - Seven-day local metric history with 1-hour, 6-hour, 24-hour, and 7-day charts
 - Live fleet timing comparison and plain-language network diagnosis

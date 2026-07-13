@@ -1706,9 +1706,10 @@ private struct HostRow: View {
 
     private var codexUpdateSystemImage: String {
         switch codexUpdate?.phase {
-        case .queued: "clock"
+        case .notAttempted: "clock"
         case .updating: "arrow.triangle.2.circlepath"
         case .succeeded: "checkmark.circle.fill"
+        case .offline: "wifi.slash"
         case .failed: "exclamationmark.triangle.fill"
         case nil: "arrow.up.circle"
         }
@@ -1716,9 +1717,10 @@ private struct HostRow: View {
 
     private var codexUpdateColor: Color {
         switch codexUpdate?.phase {
-        case .queued: .secondary
+        case .notAttempted: .secondary
         case .updating: .blue
         case .succeeded: .green
+        case .offline: .orange
         case .failed: .red
         case nil: .secondary
         }

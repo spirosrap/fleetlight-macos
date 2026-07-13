@@ -1547,13 +1547,21 @@ public enum RemoteCommandBuilder {
     }
 }
 
+public enum CodexUpdateStatus: Equatable, Sendable {
+    case succeeded
+    case offline
+    case failed
+}
+
 public struct CodexUpdateOutcome: Equatable, Sendable {
-    public let succeeded: Bool
+    public let status: CodexUpdateStatus
     public let activeVersion: String?
     public let detail: String
 
-    public init(succeeded: Bool, activeVersion: String?, detail: String) {
-        self.succeeded = succeeded
+    public var succeeded: Bool { status == .succeeded }
+
+    public init(status: CodexUpdateStatus, activeVersion: String?, detail: String) {
+        self.status = status
         self.activeVersion = activeVersion
         self.detail = detail
     }
@@ -1564,36 +1572,53 @@ public enum CodexUpdateCommandBuilder {
         """
         printf 'FLEETLIGHT_CODEX_UPDATE\n'
         shell_bin=${SHELL:-/bin/sh}
-        codex_bin=$("$shell_bin" -ic 'command -v codex 2>/dev/null || true' 2>/dev/null | sed -n '1p' | tr -d '\r')
-        if [ -z "$codex_bin" ]; then
-          codex_bin=$(command -v codex 2>/dev/null || true)
+        interactive_before=$("$shell_bin" -ic 'codex -V 2>/dev/null' 2>/dev/null)
+        before_version=$(printf '%s\n' "$interactive_before" | sed -n 's/^codex-cli //p' | tail -n 1 | tr -d '\r')
+        update_mode=interactive
+        codex_bin=
+        if [ -z "$before_version" ]; then
+          update_mode=binary
+          interactive_path=$("$shell_bin" -ic 'printf "FLEETLIGHT_PATH=%s\n" "$PATH"' 2>/dev/null | sed -n 's/^FLEETLIGHT_PATH=//p' | tail -n 1 | tr -d '\r')
+          old_ifs=$IFS
+          IFS=:
+          for directory in $interactive_path; do
+            if [ -n "$directory" ] && [ -x "$directory/codex" ]; then codex_bin="$directory/codex"; break; fi
+          done
+          IFS=$old_ifs
         fi
         if [ -z "$codex_bin" ]; then
-          for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+          for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex /usr/bin/codex; do
             if [ -x "$candidate" ]; then codex_bin=$candidate; break; fi
           done
         fi
         if [ -z "$codex_bin" ] && [ -d "$HOME/.nvm/versions/node" ]; then
           codex_bin=$(find "$HOME/.nvm/versions/node" -type f -path '*/bin/codex' 2>/dev/null | sed -n '1p')
         fi
-        if [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; then
+        if [ "$update_mode" = binary ] && { [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; }; then
           printf 'UPDATE:missing\nVERIFY:failed\n'
           exit 2
         fi
 
-        PATH=$(dirname "$codex_bin"):$PATH
-        export PATH
-        before_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | sed 's/^codex-cli //' | tr -d '\r')
+        if [ "$update_mode" = binary ]; then
+          PATH=$(dirname "$codex_bin"):$PATH
+          export PATH
+          before_version=$("$codex_bin" -V 2>/dev/null | sed -n 's/^codex-cli //p' | tail -n 1 | tr -d '\r')
+        fi
         printf 'BEFORE_VERSION:%s\n' "$before_version"
         update_log=$(mktemp "${TMPDIR:-/tmp}/fleetlight-codex-update.XXXXXX")
-        "$codex_bin" update >"$update_log" 2>&1
+        if [ "$update_mode" = interactive ]; then
+          "$shell_bin" -ic 'codex update' >"$update_log" 2>&1
+        else
+          "$codex_bin" update >"$update_log" 2>&1
+        fi
         update_status=$?
         tail -n 12 "$update_log" 2>/dev/null || true
         rm -f "$update_log"
 
-        active_version=$("$shell_bin" -ic 'codex -V 2>/dev/null || true' 2>/dev/null | sed -n '$p' | sed 's/^codex-cli //' | tr -d '\r')
-        if [ -z "$active_version" ]; then
-          active_version=$("$codex_bin" -V 2>/dev/null | sed -n '1p' | sed 's/^codex-cli //' | tr -d '\r')
+        interactive_after=$("$shell_bin" -ic 'codex -V 2>/dev/null' 2>/dev/null)
+        active_version=$(printf '%s\n' "$interactive_after" | sed -n 's/^codex-cli //p' | tail -n 1 | tr -d '\r')
+        if [ -z "$active_version" ] && [ -n "$codex_bin" ]; then
+          active_version=$("$codex_bin" -V 2>/dev/null | sed -n 's/^codex-cli //p' | tail -n 1 | tr -d '\r')
         fi
         printf 'ACTIVE_VERSION:%s\n' "$active_version"
         if [ "$update_status" -eq 0 ] && [ -n "$active_version" ]; then
@@ -1616,20 +1641,28 @@ public enum CodexUpdateParser {
 
         if result.timedOut {
             return CodexUpdateOutcome(
-                succeeded: false,
+                status: .failed,
                 activeVersion: activeVersion,
                 detail: "Update timed out"
             )
         }
 
+        if isOfflineFailure(result) {
+            return CodexUpdateOutcome(
+                status: .offline,
+                activeVersion: activeVersion,
+                detail: offlineDetail(for: result)
+            )
+        }
+
         if result.exitCode == 0, lines.contains("VERIFY:ok") {
             let detail = activeVersion.map { "Codex \($0) is current" } ?? "Codex update completed"
-            return CodexUpdateOutcome(succeeded: true, activeVersion: activeVersion, detail: detail)
+            return CodexUpdateOutcome(status: .succeeded, activeVersion: activeVersion, detail: detail)
         }
 
         if lines.contains("UPDATE:missing") {
             return CodexUpdateOutcome(
-                succeeded: false,
+                status: .failed,
                 activeVersion: nil,
                 detail: "Codex is not installed"
             )
@@ -1637,7 +1670,7 @@ public enum CodexUpdateParser {
 
         if let activeVersion {
             return CodexUpdateOutcome(
-                succeeded: false,
+                status: .failed,
                 activeVersion: activeVersion,
                 detail: "Update failed; still using Codex \(activeVersion)"
             )
@@ -1654,10 +1687,35 @@ public enum CodexUpdateParser {
                     && !line.hasPrefix("VERIFY:")
             })
         return CodexUpdateOutcome(
-            succeeded: false,
+            status: .failed,
             activeVersion: nil,
             detail: errorLine.map { String($0.prefix(140)) } ?? "Codex update failed"
         )
+    }
+
+    private static func isOfflineFailure(_ result: CommandResult) -> Bool {
+        if result.exitCode == 255 { return true }
+        let message = (result.stderr + "\n" + result.stdout).lowercased()
+        return message.contains("no ssh route configured")
+            || message.contains("connection refused")
+            || message.contains("connection timed out")
+            || message.contains("operation timed out")
+            || message.contains("no route to host")
+            || message.contains("could not resolve hostname")
+            || message.contains("network is unreachable")
+            || message.contains("connection closed")
+    }
+
+    private static func offlineDetail(for result: CommandResult) -> String {
+        let message = (result.stderr + "\n" + result.stdout).lowercased()
+        if message.contains("no ssh route configured") { return "Offline — no SSH route configured" }
+        if message.contains("could not resolve hostname") { return "Offline — SSH host was not found" }
+        if message.contains("connection refused") { return "Offline — SSH connection was refused" }
+        if message.contains("timed out") { return "Offline — SSH timed out" }
+        if message.contains("no route to host") || message.contains("network is unreachable") {
+            return "Offline — network route unavailable"
+        }
+        return "Offline — SSH connection unavailable"
     }
 
     private static func value(after prefix: String, in lines: [String]) -> String? {

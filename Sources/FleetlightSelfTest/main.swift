@@ -125,8 +125,10 @@ test.require(ProbeParser.snapshot(from: noCodexResult).codexVersion == "Not inst
 
 let codexUpdateCommand = CodexUpdateCommandBuilder.build()
 test.require(codexUpdateCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_UPDATE"), "Codex updater should emit a verification marker before changing anything")
-test.require(codexUpdateCommand.contains("\"$codex_bin\" update"), "Codex updater should use the supported self-update command")
-test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'command -v codex"), "Codex updater should resolve the interactive-shell installation")
+test.require(codexUpdateCommand.contains("$shell_bin\" -ic 'codex update'"), "Codex updater should honor interactive-shell functions and wrappers")
+test.require(codexUpdateCommand.contains("FLEETLIGHT_PATH="), "Codex updater should capture the interactive PATH for executable fallback")
+test.require(codexUpdateCommand.contains("[ -x \"$directory/codex\" ]"), "Codex updater should reject non-executable aliases and shell function names")
+test.require(codexUpdateCommand.contains("\"$codex_bin\" update"), "Codex updater should retain a direct executable fallback")
 
 let successfulCodexUpdate = CommandResult(
     exitCode: 0,
@@ -156,6 +158,17 @@ let timedOutCodexUpdate = CommandResult(
     timedOut: true
 )
 test.require(CodexUpdateParser.outcome(from: timedOutCodexUpdate).detail == "Update timed out", "Codex update timeouts should be explicit")
+
+let offlineCodexUpdate = CommandResult(
+    exitCode: 255,
+    stdout: "",
+    stderr: "ssh: connect to host example port 22: Connection timed out",
+    elapsedMilliseconds: 12_000,
+    timedOut: false
+)
+let offlineCodexOutcome = CodexUpdateParser.outcome(from: offlineCodexUpdate)
+test.require(offlineCodexOutcome.status == .offline, "SSH connection failures should be separate from updater failures")
+test.require(offlineCodexOutcome.detail == "Offline — SSH timed out", "offline Codex updates should explain the connection problem")
 
 let defaultHost = FleetHost.defaults.first!
 test.require(FleetHost.defaults.count == 1, "the public default fleet should contain only this Mac")

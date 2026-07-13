@@ -4,18 +4,6 @@ import FleetlightCore
 import ServiceManagement
 import UniformTypeIdentifiers
 
-enum HostCodexUpdatePhase: Equatable {
-    case queued
-    case updating
-    case succeeded
-    case failed
-}
-
-struct HostCodexUpdateProgress: Equatable {
-    let phase: HostCodexUpdatePhase
-    let detail: String
-}
-
 @MainActor
 final class FleetModel: ObservableObject {
     @Published private(set) var snapshots: [String: HostSnapshot]
@@ -46,6 +34,7 @@ final class FleetModel: ObservableObject {
     private var failureCounts: [String: Int] = [:]
     private var performanceFailureCounts: [String: Int] = [:]
     private var activeIncidentState = ActiveIncidentState()
+    private var codexUpdateBatch: PersistedCodexUpdateBatch?
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
@@ -66,6 +55,7 @@ final class FleetModel: ObservableObject {
             .flatMap { try? JSONDecoder().decode(PerformanceThresholds.self, from: $0) }
             ?? .default
         notice = configurationResult.notice
+        restoreCodexUpdateBatch()
     }
 
     deinit {
@@ -173,7 +163,11 @@ final class FleetModel: ObservableObject {
             performanceFailureCounts[hostID] = 2
         }
         await refreshAll()
-        schedulePolling()
+        if let batch = codexUpdateBatch, batch.finishedAt == nil {
+            await resumeCodexUpdateBatch()
+        } else {
+            schedulePolling()
+        }
     }
 
     func refreshAll() async {
@@ -224,8 +218,17 @@ final class FleetModel: ObservableObject {
         await performCodexUpdates(on: [host])
     }
 
-    private func performCodexUpdates(on targets: [FleetHost]) async {
-        guard !targets.isEmpty, !isUpdatingCodex else { return }
+    private func resumeCodexUpdateBatch() async {
+        guard let batch = codexUpdateBatch, batch.finishedAt == nil else { return }
+        let targets = batch.targetHostIDs.compactMap { hostID in
+            hosts.first { $0.id == hostID }
+        }
+        await performCodexUpdates(on: targets, resuming: true)
+    }
+
+    private func performCodexUpdates(on targets: [FleetHost], resuming: Bool = false) async {
+        guard !isUpdatingCodex else { return }
+        guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -233,38 +236,88 @@ final class FleetModel: ObservableObject {
 
         pollTask?.cancel()
         isUpdatingCodex = true
-        codexUpdateCompletedCount = 0
-        codexUpdateTotalCount = targets.count
-        codexUpdates = Dictionary(uniqueKeysWithValues: targets.map {
-            ($0.id, HostCodexUpdateProgress(phase: .queued, detail: "Waiting to update…"))
-        })
-        notice = targets.count == 1
-            ? "Preparing Codex update for \(targets[0].displayName)"
-            : "Updating Codex sequentially on \(targets.count) machines"
-        await ActivityLogger.shared.append(
-            event: "codex-update-started",
-            detail: "targets=\(targets.count)"
-        )
+        if resuming, let batch = codexUpdateBatch {
+            codexUpdateTotalCount = batch.targetHostIDs.count
+            codexUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
+            let remaining = max(0, codexUpdateTotalCount - codexUpdateCompletedCount)
+            notice = "Resuming Codex update on \(remaining) machine\(remaining == 1 ? "" : "s")"
+            await ActivityLogger.shared.append(
+                event: "codex-update-resumed",
+                detail: "batch=\(batch.id.uuidString); remaining=\(remaining)"
+            )
+        } else {
+            codexUpdateCompletedCount = 0
+            codexUpdateTotalCount = targets.count
+            codexUpdates = Dictionary(uniqueKeysWithValues: targets.map {
+                ($0.id, HostCodexUpdateProgress(phase: .notAttempted, detail: "Not attempted yet"))
+            })
+            codexUpdateBatch = PersistedCodexUpdateBatch(
+                targetHostIDs: targets.map(\.id),
+                progress: codexUpdates
+            )
+            persistCodexUpdateBatch()
+            notice = targets.count == 1
+                ? "Preparing Codex update for \(targets[0].displayName)"
+                : "Updating Codex sequentially on \(targets.count) machines"
+            if let batch = codexUpdateBatch {
+                await ActivityLogger.shared.append(
+                    event: "codex-update-started",
+                    detail: "batch=\(batch.id.uuidString); targets=\(targets.count)"
+                )
+            }
+        }
 
         for host in targets {
+            guard !(codexUpdates[host.id]?.phase.isTerminal ?? false) else { continue }
             codexUpdates[host.id] = HostCodexUpdateProgress(
                 phase: .updating,
                 detail: "Updating Codex…"
             )
+            persistCodexUpdateBatch()
             let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
             let result = await Self.runCodexUpdate(host: host, routeAlias: routeAlias)
             let outcome = CodexUpdateParser.outcome(from: result)
+            let phase: HostCodexUpdatePhase
+            let event: String
+            switch outcome.status {
+            case .succeeded:
+                phase = .succeeded
+                event = "codex-update-succeeded"
+            case .offline:
+                phase = .offline
+                event = "codex-update-offline"
+            case .failed:
+                phase = .failed
+                event = "codex-update-failed"
+            }
             codexUpdates[host.id] = HostCodexUpdateProgress(
-                phase: outcome.succeeded ? .succeeded : .failed,
+                phase: phase,
                 detail: outcome.detail
             )
             codexUpdateCompletedCount += 1
+            persistCodexUpdateBatch()
             await ActivityLogger.shared.append(
-                event: outcome.succeeded ? "codex-update-succeeded" : "codex-update-failed",
+                event: event,
                 host: host.id,
                 detail: outcome.detail
             )
         }
+
+        if var batch = codexUpdateBatch {
+            batch.finishedAt = Date()
+            batch.progress = codexUpdates
+            codexUpdateBatch = batch
+            persistCodexUpdateBatch()
+        }
+
+        let succeeded = codexUpdates.values.filter { $0.phase == .succeeded }.count
+        let offline = codexUpdates.values.filter { $0.phase == .offline }.count
+        let failed = codexUpdates.values.filter { $0.phase == .failed }.count
+        let notAttempted = codexUpdates.values.filter { !$0.phase.isTerminal }.count
+        await ActivityLogger.shared.append(
+            event: "codex-update-finished",
+            detail: "verified=\(succeeded); offline=\(offline); failed=\(failed); not-attempted=\(notAttempted)"
+        )
 
         if targets.count == 1, let host = targets.first {
             await refresh(host)
@@ -272,17 +325,64 @@ final class FleetModel: ObservableObject {
             await refreshAll()
         }
 
-        let succeeded = codexUpdates.values.filter { $0.phase == .succeeded }.count
-        let failed = codexUpdates.values.filter { $0.phase == .failed }.count
         isUpdatingCodex = false
         if started { schedulePolling() }
-        notice = failed == 0
+        notice = offline == 0 && failed == 0 && notAttempted == 0
             ? "Codex update verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
-            : "Codex update: \(succeeded) verified · \(failed) failed"
-        await ActivityLogger.shared.append(
-            event: "codex-update-finished",
-            detail: "verified=\(succeeded); failed=\(failed)"
-        )
+            : codexUpdateSummary(
+                succeeded: succeeded,
+                offline: offline,
+                failed: failed,
+                notAttempted: notAttempted
+            )
+    }
+
+    private func restoreCodexUpdateBatch() {
+        guard var batch = CodexUpdateBatchStore.load() else { return }
+        let knownHostIDs = Set(hosts.map(\.id))
+        for hostID in batch.targetHostIDs {
+            if !knownHostIDs.contains(hostID) {
+                batch.progress[hostID] = HostCodexUpdateProgress(
+                    phase: .failed,
+                    detail: "Failed — machine is no longer configured"
+                )
+            } else if batch.progress[hostID]?.phase == .updating {
+                batch.progress[hostID] = HostCodexUpdateProgress(
+                    phase: .notAttempted,
+                    detail: "Not completed — retrying after restart"
+                )
+            } else if batch.progress[hostID] == nil {
+                batch.progress[hostID] = HostCodexUpdateProgress(
+                    phase: .notAttempted,
+                    detail: "Not attempted yet"
+                )
+            }
+        }
+        codexUpdateBatch = batch
+        codexUpdates = batch.progress
+        codexUpdateTotalCount = batch.targetHostIDs.count
+        codexUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
+        CodexUpdateBatchStore.save(batch)
+    }
+
+    private func persistCodexUpdateBatch() {
+        guard var batch = codexUpdateBatch else { return }
+        batch.progress = codexUpdates
+        codexUpdateBatch = batch
+        CodexUpdateBatchStore.save(batch)
+    }
+
+    private func codexUpdateSummary(
+        succeeded: Int,
+        offline: Int,
+        failed: Int,
+        notAttempted: Int
+    ) -> String {
+        var parts = ["\(succeeded) verified"]
+        if offline > 0 { parts.append("\(offline) offline") }
+        if failed > 0 { parts.append("\(failed) failed") }
+        if notAttempted > 0 { parts.append("\(notAttempted) not attempted") }
+        return "Codex update: " + parts.joined(separator: " · ")
     }
 
     func setRefreshInterval(_ interval: TimeInterval) {

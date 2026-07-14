@@ -31,6 +31,7 @@ struct FleetlightApp: App {
 
 private enum PanelSection: String, CaseIterable, Identifiable {
     case fleet = "Fleet"
+    case services = "Services"
     case codex = "Codex"
     case compare = "Compare"
     case trends = "Trends"
@@ -113,6 +114,8 @@ private struct FleetMenuView: View {
                 switch selectedSection {
                 case .fleet:
                     fleetContent
+                case .services:
+                    ServicesView(model: model)
                 case .codex:
                     CodexView(
                         model: model,
@@ -564,6 +567,147 @@ private struct FleetSummaryBar: View {
         }
         .buttonStyle(.plain)
         .help(model.fleetStatusFilter == filter ? "Show all visible machines" : "Show \(filter.displayName.lowercased()) machines")
+    }
+}
+
+private struct ServicesView: View {
+    @ObservedObject var model: FleetModel
+
+    private var entries: [FleetServiceEntry] {
+        FleetServiceAnalyzer.entries(hosts: model.visibleHosts, snapshots: model.snapshots)
+    }
+
+    private var summary: FleetServiceSummary {
+        FleetServiceAnalyzer.summarize(entries: entries)
+    }
+
+    private var configuredKinds: [ServiceKind] {
+        ServiceKind.allCases.filter { kind in entries.contains(where: { $0.kind == kind }) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 9) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Fleet services")
+                            .font(.headline)
+                        Text("\(entries.count) configured check\(entries.count == 1 ? "" : "s") from \(FleetObserver.currentDisplayName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        Task { await model.refreshAll() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(model.isRefreshing)
+                }
+
+                HStack(spacing: 7) {
+                    SummaryPill(label: "Healthy", value: "\(summary.healthyCount)", color: .green, isSelected: false)
+                    SummaryPill(label: "Attention", value: "\(summary.attentionCount)", color: summary.attentionCount > 0 ? .orange : .secondary, isSelected: false)
+                    SummaryPill(label: "Unavailable", value: "\(summary.unavailableCount)", color: summary.unavailableCount > 0 ? .gray : .secondary, isSelected: false)
+                    Spacer()
+                }
+            }
+            .padding(12)
+
+            Divider()
+
+            if entries.isEmpty {
+                ContentUnavailableView(
+                    "No configured service checks",
+                    systemImage: "wrench.and.screwdriver",
+                    description: Text("Add services to a machine to see fleet-wide health here.")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(configuredKinds) { kind in
+                            ServiceDashboardGroup(
+                                kind: kind,
+                                entries: entries.filter { $0.kind == kind }
+                            )
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+    }
+}
+
+private struct ServiceDashboardGroup: View {
+    let kind: ServiceKind
+    let entries: [FleetServiceEntry]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label(kind.displayName, systemImage: kind.systemImage)
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text("\(entries.filter { $0.state == .healthy }.count)/\(entries.count) healthy")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(9)
+
+            Divider()
+
+            ForEach(entries) { entry in
+                ServiceDashboardRow(entry: entry)
+                if entry.id != entries.last?.id { Divider().padding(.leading, 28) }
+            }
+        }
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct ServiceDashboardRow: View {
+    let entry: FleetServiceEntry
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.hostName)
+                    .font(.caption.weight(.medium))
+                Text(entry.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text(stateLabel)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(color)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+    }
+
+    private var stateLabel: String {
+        switch entry.state {
+        case .healthy: "Healthy"
+        case .degraded: "Degraded"
+        case .stopped: "Stopped"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    private var color: Color {
+        switch entry.state {
+        case .healthy: .green
+        case .degraded: .orange
+        case .stopped: .red
+        case .unavailable: .gray
+        }
     }
 }
 

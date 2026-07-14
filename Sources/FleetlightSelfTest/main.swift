@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.18", build: "22") == "v1.18 (22)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.18", build: nil) == "v1.18", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "22") == "Build 22", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.19", build: "23") == "v1.19 (23)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.19", build: nil) == "v1.19", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "23") == "Build 23", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -782,6 +782,31 @@ let attentionSlow = FleetHost(id: "attention-slow", displayName: "Slow", systemI
 let attentionService = FleetHost(id: "attention-service", displayName: "Service", systemImage: "desktopcomputer")
 let attentionBoth = FleetHost(id: "attention-both", displayName: "Both", systemImage: "desktopcomputer")
 let stoppedDocker = ServiceSnapshot(kind: .docker, state: .stopped, detail: "Stopped")
+
+let serviceHealthyHost = FleetHost(id: "service-healthy", displayName: "Healthy Host", systemImage: "server.rack", services: [.tailscale, .docker])
+let serviceOfflineHost = FleetHost(id: "service-offline", displayName: "Offline Host", systemImage: "server.rack", services: [.plex])
+let serviceAccessHost = FleetHost(id: "service-access", displayName: "Access Host", systemImage: "server.rack", services: [.samba])
+let serviceMissingHost = FleetHost(id: "service-missing", displayName: "Missing Host", systemImage: "server.rack", services: [.tailscale])
+let serviceDashboardSnapshots = [
+    serviceHealthyHost.id: HostSnapshot(state: .online, services: [
+        ServiceSnapshot(kind: .tailscale, state: .healthy, detail: "Connected"),
+        ServiceSnapshot(kind: .docker, state: .stopped, detail: "Stopped"),
+    ]),
+    serviceOfflineHost.id: HostSnapshot(state: .unreachable),
+    serviceAccessHost.id: HostSnapshot(state: .unreachable, pingMilliseconds: 20, packetLossPercent: 0, detail: "Permission denied"),
+    serviceMissingHost.id: HostSnapshot(state: .online),
+]
+let serviceDashboardEntries = FleetServiceAnalyzer.entries(
+    hosts: [serviceHealthyHost, serviceOfflineHost, serviceAccessHost, serviceMissingHost],
+    snapshots: serviceDashboardSnapshots
+)
+let serviceDashboardSummary = FleetServiceAnalyzer.summarize(entries: serviceDashboardEntries)
+test.require(serviceDashboardEntries.count == 5, "services dashboard should include every configured host service")
+test.require(serviceDashboardSummary == FleetServiceSummary(healthyCount: 1, attentionCount: 1, unavailableCount: 3), "services dashboard should separate healthy, attention, and unavailable checks")
+test.require(serviceDashboardEntries.first(where: { $0.hostID == serviceOfflineHost.id })?.detail == "Machine offline", "offline machines should not make their services look stopped")
+test.require(serviceDashboardEntries.first(where: { $0.hostID == serviceAccessHost.id })?.detail == "Monitoring access issue", "access failures should explain why service state is unavailable")
+test.require(serviceDashboardEntries.first(where: { $0.hostID == serviceMissingHost.id })?.detail == "No service result returned", "online hosts with missing checks should be explicit")
+test.require(serviceDashboardEntries.first(where: { $0.hostID == serviceHealthyHost.id && $0.kind == .docker })?.state == .stopped, "live service failures should remain actionable")
 let attentionSnapshots = [
     attentionOffline.id: HostSnapshot(state: .unreachable),
     attentionAccess.id: HostSnapshot(state: .unreachable, pingMilliseconds: 38, packetLossPercent: 0, detail: "Permission denied"),

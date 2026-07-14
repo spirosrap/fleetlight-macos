@@ -373,6 +373,103 @@ public struct HostSnapshot: Sendable, Equatable {
     }
 }
 
+public struct FleetServiceEntry: Identifiable, Equatable, Sendable {
+    public let hostID: String
+    public let hostName: String
+    public let kind: ServiceKind
+    public let state: ServiceState
+    public let detail: String
+
+    public var id: String { "\(hostID):\(kind.rawValue)" }
+
+    public init(hostID: String, hostName: String, kind: ServiceKind, state: ServiceState, detail: String) {
+        self.hostID = hostID
+        self.hostName = hostName
+        self.kind = kind
+        self.state = state
+        self.detail = detail
+    }
+}
+
+public struct FleetServiceSummary: Equatable, Sendable {
+    public let healthyCount: Int
+    public let attentionCount: Int
+    public let unavailableCount: Int
+
+    public init(healthyCount: Int, attentionCount: Int, unavailableCount: Int) {
+        self.healthyCount = healthyCount
+        self.attentionCount = attentionCount
+        self.unavailableCount = unavailableCount
+    }
+}
+
+public enum FleetServiceAnalyzer {
+    public static func entries(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot]
+    ) -> [FleetServiceEntry] {
+        hosts.flatMap { host in
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            return host.services.map { kind in
+                if snapshot.state == .online,
+                   let service = snapshot.services.first(where: { $0.kind == kind }) {
+                    return FleetServiceEntry(
+                        hostID: host.id,
+                        hostName: host.displayName,
+                        kind: kind,
+                        state: service.state,
+                        detail: service.detail
+                    )
+                }
+
+                let detail: String
+                if snapshot.state == .online {
+                    detail = "No service result returned"
+                } else {
+                    detail = switch FleetConnectionClassifier.status(for: snapshot) {
+                    case .pending: "Waiting for machine check"
+                    case .accessIssue: "Monitoring access issue"
+                    case .offline: "Machine offline"
+                    case .online: "No service result returned"
+                    }
+                }
+                return FleetServiceEntry(
+                    hostID: host.id,
+                    hostName: host.displayName,
+                    kind: kind,
+                    state: .unavailable,
+                    detail: detail
+                )
+            }
+        }.sorted { left, right in
+            if left.kind != right.kind {
+                return left.kind.displayName.localizedCaseInsensitiveCompare(right.kind.displayName) == .orderedAscending
+            }
+            let leftRank = stateRank(left.state)
+            let rightRank = stateRank(right.state)
+            if leftRank != rightRank { return leftRank < rightRank }
+            return left.hostName.localizedCaseInsensitiveCompare(right.hostName) == .orderedAscending
+        }
+    }
+
+    public static func summarize(entries: [FleetServiceEntry]) -> FleetServiceSummary {
+        FleetServiceSummary(
+            healthyCount: entries.filter { $0.state == .healthy }.count,
+            attentionCount: entries.filter { $0.state == .degraded || $0.state == .stopped }.count,
+            unavailableCount: entries.filter { $0.state == .unavailable }.count
+        )
+    }
+
+    private static func stateRank(_ state: ServiceState) -> Int {
+        switch state {
+        case .stopped: 0
+        case .degraded: 1
+        case .unavailable: 2
+        case .healthy: 3
+        }
+    }
+}
+
 public struct PerformanceThresholds: Codable, Equatable, Sendable {
     public var pingWarningMilliseconds: Int
     public var jitterWarningMilliseconds: Int

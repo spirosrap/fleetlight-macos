@@ -46,7 +46,7 @@ On first launch Fleetlight creates:
 
 Open Settings → Fleet configuration → Open `fleet.json`, edit it, then choose Reload Configuration. A documented generic template is included as [`fleet.example.json`](fleet.example.json).
 
-When a configured machine ID matches the current Mac's hostname, Fleetlight automatically treats that entry as This Mac and moves the previously local entry back to its SSH route. This lets one fleet configuration travel between Macs without making either machine SSH into itself.
+When a configured machine ID matches the current Mac's localized computer name or hostname, Fleetlight automatically treats that entry as This Mac and moves the previously local entry back to its SSH route. This DNS-resistant check lets one fleet configuration travel between Macs without making either machine SSH into itself.
 
 Remote routes are SSH aliases, not addresses or credentials. For example:
 
@@ -71,6 +71,7 @@ Supported machine fields:
 
 ## Features
 
+- Always-visible Fleetlight version and build badge sourced directly from the running app bundle
 - Concurrent local and SSH health checks with verification markers and hard timeouts
 - Online, Offline, Slow, Alerts, and All Issues drill-down filters
 - One combined menu-bar label that preserves simultaneous states, such as `1 offline · 2 slow · 1 alert`

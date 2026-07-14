@@ -14,6 +14,10 @@ private final class Harness {
 }
 
 private let test = Harness()
+test.require(FleetlightVersion.displayLabel(version: "1.15", build: "19") == "v1.15 (19)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.15", build: nil) == "v1.15", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "19") == "Build 19", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 let route = SSHRoute(alias: "example-via-relay", displayName: "Via Relay")
 let verified = CommandResult(
     exitCode: 0,
@@ -471,6 +475,10 @@ test.require(studioResolvedHosts.filter(\.isLocal).map(\.id) == ["studio"], "the
 test.require(resolvedStudio.displayName == "This Mac" && resolvedStudio.routes.first?.alias == "local", "the running Mac should use the local process route")
 test.require(resolvedWorkstation.displayName == "Workstation" && resolvedWorkstation.routes.first?.alias == "workstation", "the previous local Mac should become a named SSH host")
 test.require(FleetHost.resolvingLocalHost(in: portableHosts, hostname: "unknown") == portableHosts, "an unknown hostname should preserve the configured local host")
+test.require(
+    FleetHost.resolvingLocalHost(in: portableHosts, hostnames: ["customer.example.net", "studio"]).first(where: { $0.id == "studio" })!.isLocal,
+    "the localized Mac name should win when DNS reports an unrelated provider hostname"
+)
 
 let metricFromSnapshot = MetricSample(hostID: "example", snapshot: verifiedSnapshot)
 test.require(metricFromSnapshot.routeName == "Via Relay", "metric samples should retain the route")

@@ -53,10 +53,7 @@ final class FleetModel: ObservableObject {
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
-        let resolvedHosts = FleetHost.resolvingLocalHost(
-            in: configurationResult.configuration.hosts,
-            hostname: ProcessInfo.processInfo.hostName
-        )
+        let resolvedHosts = FleetHost.resolvingLocalHost(in: configurationResult.configuration.hosts)
         hosts = resolvedHosts
         snapshots = Dictionary(uniqueKeysWithValues: resolvedHosts.map { ($0.id, HostSnapshot()) })
         hiddenHostIDs = Set(UserDefaults.standard.stringArray(forKey: "hiddenHostIDs") ?? [])
@@ -1204,10 +1201,7 @@ final class FleetModel: ObservableObject {
         do {
             let configuration = try FleetConfigurationStore.load()
             let previousSnapshots = snapshots
-            hosts = FleetHost.resolvingLocalHost(
-                in: configuration.hosts,
-                hostname: ProcessInfo.processInfo.hostName
-            )
+            hosts = FleetHost.resolvingLocalHost(in: configuration.hosts)
             snapshots = Dictionary(uniqueKeysWithValues: hosts.map {
                 ($0.id, previousSnapshots[$0.id] ?? HostSnapshot())
             })

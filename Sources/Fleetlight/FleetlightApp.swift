@@ -147,8 +147,17 @@ private struct FleetMenuView: View {
             .frame(width: 38, height: 38)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Fleetlight")
-                    .font(.headline)
+                HStack(spacing: 7) {
+                    Text("Fleetlight")
+                        .font(.headline)
+                    Text(FleetlightVersion.currentDisplayLabel)
+                        .font(.caption2.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+                        .help("Installed Fleetlight version and build")
+                }
                 Text(summaryText)
                     .font(.caption)
                     .foregroundStyle(.secondary)

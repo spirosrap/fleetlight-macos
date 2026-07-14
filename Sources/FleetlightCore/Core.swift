@@ -7,6 +7,31 @@ public enum HostState: String, Codable, Sendable {
     case unreachable
 }
 
+public enum FleetlightVersion {
+    public static func displayLabel(version: String?, build: String?) -> String {
+        let version = version?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let build = build?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch (version?.isEmpty == false ? version : nil, build?.isEmpty == false ? build : nil) {
+        case let (.some(version), .some(build)):
+            return "v\(version) (\(build))"
+        case let (.some(version), .none):
+            return "v\(version)"
+        case let (.none, .some(build)):
+            return "Build \(build)"
+        case (.none, .none):
+            return "Development"
+        }
+    }
+
+    public static var currentDisplayLabel: String {
+        displayLabel(
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        )
+    }
+}
+
 public enum ServiceState: String, Codable, Sendable {
     case healthy
     case degraded
@@ -148,9 +173,24 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
     ]
 
     public static func resolvingLocalHost(in hosts: [FleetHost], hostname: String) -> [FleetHost] {
-        let normalizedHostname = normalizedHostIdentifier(hostname)
+        resolvingLocalHost(in: hosts, hostnames: [hostname])
+    }
+
+    public static func resolvingLocalHost(in hosts: [FleetHost]) -> [FleetHost] {
+        resolvingLocalHost(
+            in: hosts,
+            hostnames: [
+                Host.current().localizedName,
+                Host.current().name,
+                ProcessInfo.processInfo.hostName,
+            ].compactMap { $0 }
+        )
+    }
+
+    public static func resolvingLocalHost(in hosts: [FleetHost], hostnames: [String]) -> [FleetHost] {
+        let normalizedHostnames = Set(hostnames.map(normalizedHostIdentifier).filter { !$0.isEmpty })
         guard let localHostID = hosts.first(where: {
-            normalizedHostIdentifier($0.id) == normalizedHostname
+            normalizedHostnames.contains(normalizedHostIdentifier($0.id))
         })?.id else {
             return hosts
         }

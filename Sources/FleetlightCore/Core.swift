@@ -1756,11 +1756,7 @@ public struct NetworkDiagnosis: Equatable, Sendable {
 public enum NetworkDiagnoser {
     public static func diagnose(snapshot: HostSnapshot) -> NetworkDiagnosis? {
         if snapshot.state == .unreachable, let ping = snapshot.pingMilliseconds {
-            return NetworkDiagnosis(
-                level: .warning,
-                title: "Network reachable, SSH failed",
-                detail: "The host answered ping in \(ping) ms, so the failure is in SSH, authentication, or the remote service."
-            )
+            return sshFailureDiagnosis(detail: snapshot.detail, ping: ping)
         }
 
         if let loss = snapshot.packetLossPercent, loss > 0 {
@@ -1798,6 +1794,70 @@ public enum NetworkDiagnoser {
         }
 
         return nil
+    }
+
+    private static func sshFailureDiagnosis(detail: String, ping: Int) -> NetworkDiagnosis {
+        let message = detail.lowercased()
+        let answered = "The host answered ping in \(ping) ms"
+
+        if contains(message, any: ["host key verification failed", "remote host identification has changed"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH host identity blocked",
+                detail: "\(answered), but SSH rejected its saved identity. Verify the fingerprint before updating this observer’s known_hosts entry."
+            )
+        }
+        if contains(message, any: ["permission denied", "publickey", "authentication failed", "too many authentication failures"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH authentication rejected",
+                detail: "\(answered), but non-interactive authentication was rejected. Diagnose in Terminal and verify this observer’s SSH key or agent."
+            )
+        }
+        if contains(message, any: ["could not resolve hostname", "name or service not known", "nodename nor servname"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH name could not be resolved",
+                detail: "\(answered), but the SSH alias did not resolve correctly. Check its HostName entry in this observer’s ~/.ssh/config."
+            )
+        }
+        if message.contains("connection refused") {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH service refused connection",
+                detail: "\(answered), but the configured SSH port refused the connection. Verify sshd, the port, and the target firewall."
+            )
+        }
+        if contains(message, any: ["connection timed out", "operation timed out", "ssh timed out", "timed out after"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH connection timed out",
+                detail: "\(answered), but the SSH handshake timed out. Check the route, firewall, VPN policy, and any jump host."
+            )
+        }
+        if contains(message, any: ["connection closed", "connection reset", "kex_exchange_identification", "port 65535"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH connection closed early",
+                detail: "\(answered), but SSH was closed before Fleetlight’s verification marker. Check proxy, jump-host, VPN SSH policy, and server logs."
+            )
+        }
+        if contains(message, any: ["no route to host", "network is unreachable"]) {
+            return NetworkDiagnosis(
+                level: .warning,
+                title: "SSH route unavailable",
+                detail: "\(answered), but SSH used a route that is unavailable from this observer. Check the SSH alias and recovery routes."
+            )
+        }
+        return NetworkDiagnosis(
+            level: .warning,
+            title: "Network reachable, SSH failed",
+            detail: "\(answered), but SSH monitoring did not complete. Diagnose in Terminal to inspect the interactive error."
+        )
+    }
+
+    private static func contains(_ message: String, any patterns: [String]) -> Bool {
+        patterns.contains { message.contains($0) }
     }
 }
 

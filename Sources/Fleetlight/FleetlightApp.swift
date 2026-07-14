@@ -2457,8 +2457,11 @@ private struct HostRow: View {
                     Button("Update Codex", action: onUpdateCodex)
                         .disabled(isCodexUpdateBusy || isRefreshing || snapshot.state != .online)
                     if !host.isLocal {
-                        Button("Open SSH", action: onSSH)
-                            .disabled(snapshot.state != .online)
+                        Button(
+                            connectionStatus == .accessIssue ? "Diagnose SSH in Terminal" : "Open SSH",
+                            action: onSSH
+                        )
+                        .disabled(connectionStatus != .online && connectionStatus != .accessIssue)
                     }
                     if host.routes.count > 1 {
                         Button("Test All Routes", action: onTestRoutes)

@@ -96,6 +96,7 @@ Supported machine fields:
 - Runtime host detection for portable fleet configurations, with direct local monitoring and no SSH loopback on whichever configured Mac is running Fleetlight
 - Seven-day local metric history with 1-hour, 6-hour, 24-hour, and 7-day charts
 - Live fleet timing comparison and plain-language network diagnosis
+- Actionable SSH diagnosis for authentication, host-key, DNS, refused, timeout, route, and early-close errors, plus interactive Terminal troubleshooting from Access-state cards
 - Thirty-day incident history with restart-safe active issue reconstruction
 - Optional notifications for confirmed outages, recoveries, and service transitions
 - Multiple SSH recovery routes per machine

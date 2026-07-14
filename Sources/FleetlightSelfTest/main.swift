@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.17", build: "21") == "v1.17 (21)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.17", build: nil) == "v1.17", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "21") == "Build 21", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.18", build: "22") == "v1.18 (22)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.18", build: nil) == "v1.18", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "22") == "Build 22", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -736,7 +736,14 @@ let lossyNetwork = HostSnapshot(state: .online, pingMilliseconds: 50, pingJitter
 test.require(NetworkDiagnoser.diagnose(snapshot: lossyNetwork)?.title == "Packet loss detected", "packet loss should take diagnostic priority")
 
 let pingableSSHFailure = HostSnapshot(state: .unreachable, pingMilliseconds: 45, detail: "SSH timed out")
-test.require(NetworkDiagnoser.diagnose(snapshot: pingableSSHFailure)?.title == "Network reachable, SSH failed", "pingable SSH failures should be attributed correctly")
+test.require(NetworkDiagnoser.diagnose(snapshot: pingableSSHFailure)?.title == "SSH connection timed out", "SSH timeouts should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: pingableSSHFailure)?.detail.contains("firewall") == true, "timeout guidance should name likely route and policy causes")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Permission denied (publickey)"))?.title == "SSH authentication rejected", "SSH authentication failures should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Host key verification failed"))?.title == "SSH host identity blocked", "SSH host-key failures should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Could not resolve hostname example"))?.title == "SSH name could not be resolved", "SSH DNS failures should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Connection refused"))?.title == "SSH service refused connection", "refused SSH services should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Connection closed by UNKNOWN port 65535"))?.title == "SSH connection closed early", "early SSH disconnects should be classified precisely")
+test.require(NetworkDiagnoser.diagnose(snapshot: HostSnapshot(state: .unreachable, pingMilliseconds: 20, detail: "Unexpected SSH error"))?.detail.contains("Diagnose in Terminal") == true, "unknown SSH failures should provide an interactive next step")
 
 let warningSnapshot = HostSnapshot(
     state: .online,
@@ -802,6 +809,7 @@ test.require(FleetConnectionClassifier.status(for: attentionSnapshots[attentionA
 test.require(FleetConnectionClassifier.status(for: HostSnapshot(state: .unreachable, pingMilliseconds: 38, packetLossPercent: 100)) == .offline, "complete packet loss should remain offline")
 test.require(HealthScorer.score(snapshot: attentionSnapshots[attentionAccess.id]!, availability: 100) == 15, "access failures should score above fully offline machines")
 test.require(FleetReportBuilder.build(hosts: [attentionAccess], snapshots: attentionSnapshots).contains("Access issue"), "copied diagnostics should describe monitoring access failures accurately")
+test.require(FleetReportBuilder.build(hosts: [attentionAccess], snapshots: attentionSnapshots).contains("SSH authentication rejected"), "copied diagnostics should retain the specific SSH failure diagnosis")
 test.require(!FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionOffline.id]!, thresholds: .default, filter: .online), "online filter should exclude unreachable machines")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionSlow.id]!, thresholds: .default, filter: .slow), "slow filter should include connected performance warnings")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionService.id]!, thresholds: .default, filter: .alerts), "alerts filter should include service and resource issues")

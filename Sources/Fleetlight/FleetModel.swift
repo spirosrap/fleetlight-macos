@@ -17,6 +17,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var isUpdatingCodex = false
     @Published private(set) var codexDesktopAppUpdates: [String: HostCodexUpdateProgress] = [:]
     @Published private(set) var isUpdatingCodexDesktopApps = false
+    @Published private(set) var isUpdatingAllCodex = false
     @Published private(set) var codexUpdateCompletedCount = 0
     @Published private(set) var codexUpdateTotalCount = 0
     @Published private(set) var latestCodexVersion: String?
@@ -167,6 +168,37 @@ final class FleetModel: ObservableObject {
 
     var codexUpdateAvailableCount: Int {
         codexUpdateAvailableHosts.count
+    }
+
+    var codexUpdateCenterSummary: CodexUpdateCenterSummary {
+        CodexUpdateCenterSummary(
+            cliUpdateCount: codexUpdateAvailableCount,
+            desktopAppUpdateCount: codexDesktopAppReleaseSummary.updateAvailableCount
+        )
+    }
+
+    var isAnyCodexUpdateRunning: Bool {
+        isUpdatingCodex || isUpdatingCodexDesktopApps || isUpdatingAllCodex
+    }
+
+    var codexUpdateCenterStatusText: String {
+        if isUpdatingAllCodex { return "Updating CLI first, then Mac app" }
+        if isCheckingCodexRelease || isCheckingCodexDesktopAppRelease {
+            return "Checking CLI and Mac app releases…"
+        }
+        if codexUpdateCenterSummary.totalUpdateCount > 0 {
+            return codexUpdateCenterSummary.detail + " available"
+        }
+        if codexReleaseCheckFailed && codexDesktopAppReleaseCheckFailed {
+            return "Both release feeds are unavailable"
+        }
+        if codexReleaseCheckFailed || codexDesktopAppReleaseCheckFailed {
+            return "No known updates · one release feed unavailable"
+        }
+        if latestCodexVersion != nil, latestCodexDesktopAppRelease != nil {
+            return "No available updates on online machines"
+        }
+        return "Check both release feeds"
     }
 
     var codexFleetVersionSummary: CodexFleetVersionSummary {
@@ -540,6 +572,79 @@ final class FleetModel: ObservableObject {
                 ? "Codex Mac app \(release.version) is available"
                 : "Codex Mac apps are current at \(release.version)"
         }
+    }
+
+    func checkAllCodexReleasesNow() async {
+        guard !isCheckingCodexRelease, !isCheckingCodexDesktopAppRelease else { return }
+        guard !isRefreshing, !isAnyCodexUpdateRunning else {
+            notice = "Wait for the current fleet operation to finish"
+            return
+        }
+
+        isCheckingCodexRelease = true
+        isCheckingCodexDesktopAppRelease = true
+        notice = nil
+        async let registryTask = Self.fetchLatestCodexRelease()
+        async let appcastTask = Self.fetchLatestCodexDesktopAppRelease()
+        let registryJSON = await registryTask
+        let appcastXML = await appcastTask
+        applyCodexReleaseResult(registryJSON)
+        applyCodexDesktopAppReleaseResult(appcastXML)
+        await postCodexUpdateAlertsIfNeeded()
+
+        let failedChecks = (codexReleaseCheckFailed ? 1 : 0) + (codexDesktopAppReleaseCheckFailed ? 1 : 0)
+        if failedChecks == 2 {
+            notice = "Couldn’t check the Codex release feeds"
+        } else if failedChecks == 1 {
+            notice = "Checked Codex releases · one feed is unavailable"
+        } else if codexUpdateCenterSummary.totalUpdateCount > 0 {
+            notice = "Found \(codexUpdateCenterSummary.totalUpdateCount) available Codex update\(codexUpdateCenterSummary.totalUpdateCount == 1 ? "" : "s")"
+        } else {
+            notice = "No Codex updates are available on online machines"
+        }
+    }
+
+    func updateAllAvailableCodex() async {
+        guard !isAnyCodexUpdateRunning else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+
+        let cliTargets = codexUpdateAvailableHosts
+        let desktopTargets = codexDesktopAppUpdateAvailableHosts
+        let total = cliTargets.count + desktopTargets.count
+        guard total > 0 else {
+            notice = "No Codex updates are available"
+            return
+        }
+
+        isUpdatingAllCodex = true
+        defer { isUpdatingAllCodex = false }
+        await ActivityLogger.shared.append(
+            event: "codex-update-center-started",
+            detail: "cli=\(cliTargets.count); mac-app=\(desktopTargets.count)"
+        )
+
+        if !cliTargets.isEmpty {
+            await performCodexUpdates(on: cliTargets)
+        }
+        guard !Task.isCancelled else { return }
+        if !desktopTargets.isEmpty {
+            await performCodexDesktopAppUpdates(on: desktopTargets)
+        }
+
+        let cliVerified = cliTargets.filter { codexUpdates[$0.id]?.phase == .succeeded }.count
+        let desktopVerified = desktopTargets.filter { codexDesktopAppUpdates[$0.id]?.phase == .succeeded }.count
+        let verified = cliVerified + desktopVerified
+        let problems = total - verified
+        await ActivityLogger.shared.append(
+            event: "codex-update-center-finished",
+            detail: "verified=\(verified); attention=\(problems)"
+        )
+        notice = problems == 0
+            ? "All \(verified) available Codex update\(verified == 1 ? "" : "s") verified"
+            : "Codex Update Center: \(verified) verified · \(problems) need attention"
     }
 
     func updateCodexOnAvailableHosts() async {

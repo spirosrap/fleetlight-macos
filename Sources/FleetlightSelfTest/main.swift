@@ -215,6 +215,15 @@ test.require(desktopUpdateAlert?.releaseKey == "5220", "Mac app update alerts sh
 test.require(desktopUpdateAlert?.body.contains("1 Mac") == true, "Mac app update alerts should name the affected Mac count")
 test.require(CodexUpdateAlertPlanner.desktopAppAlert(latestRelease: latestAppRelease, updateCount: 1, lastNotifiedBuild: "5220") == nil, "Mac app update alerts should not repeat for the same build")
 
+let updateCenterSummary = CodexUpdateCenterSummary(cliUpdateCount: 2, desktopAppUpdateCount: 1)
+test.require(updateCenterSummary.totalUpdateCount == 3, "the Update Center should combine CLI and Mac app actions")
+test.require(updateCenterSummary.detail == "2 CLI · 1 Mac app", "the Update Center should keep update types visible")
+test.require(updateCenterSummary.confirmationTitle == "Run 3 Codex updates?", "combined updates should use a clear confirmation title")
+test.require(updateCenterSummary.confirmationDetail.contains("2 CLI updates, then 1 Mac app update"), "combined updates should explain their execution order")
+let emptyUpdateCenter = CodexUpdateCenterSummary(cliUpdateCount: -1, desktopAppUpdateCount: 0)
+test.require(emptyUpdateCenter.totalUpdateCount == 0 && emptyUpdateCenter.detail == "No updates available", "the Update Center should clamp invalid counts and explain an empty plan")
+test.require(CodexUpdateCenterSummary(cliUpdateCount: 1, desktopAppUpdateCount: 0).confirmationTitle == "Run 1 Codex update?", "single combined actions should use singular wording")
+
 let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")

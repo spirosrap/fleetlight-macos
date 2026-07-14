@@ -546,26 +546,59 @@ private struct CodexView: View {
     @State private var pendingDesktopAppHost: FleetHost?
     @State private var isConfirmingAllDesktopApps = false
     @State private var isConfirmingAvailableDesktopApps = false
+    @State private var isConfirmingUpdateCenter = false
     @State private var selectedSubview: CodexSubview = .desktopApp
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("Codex view", selection: $selectedSubview) {
-                    Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
-                    Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Picker("Codex view", selection: $selectedSubview) {
+                        Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
+                        Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
 
-                Toggle("Alerts", isOn: Binding(
-                    get: { model.codexUpdateAlertsEnabled },
-                    set: { model.setCodexUpdateAlertsEnabled($0) }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .fixedSize()
-                .help("Notify once when a new Codex release affects an online machine")
+                    Toggle("Alerts", isOn: Binding(
+                        get: { model.codexUpdateAlertsEnabled },
+                        set: { model.setCodexUpdateAlertsEnabled($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help("Notify once when a new Codex release affects an online machine")
+                }
+
+                HStack(spacing: 10) {
+                    Image(systemName: updateCenterIcon)
+                        .font(.title3)
+                        .foregroundStyle(updateCenterColor)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Update Center")
+                            .font(.subheadline.weight(.semibold))
+                        Text(model.codexUpdateCenterStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.codexUpdateCenterSummary.totalUpdateCount > 0 {
+                        Button(model.isUpdatingAllCodex ? "Updating…" : "Update All \(model.codexUpdateCenterSummary.totalUpdateCount)") {
+                            isConfirmingUpdateCenter = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    } else {
+                        Button("Check Both") {
+                            Task { await model.checkAllCodexReleasesNow() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(10)
+                .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+                .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning || model.isCheckingCodexRelease || model.isCheckingCodexDesktopAppRelease)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -601,13 +634,13 @@ private struct CodexView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isAnyCodexUpdateRunning)
 
                 if model.codexUpdateAvailableCount > 0 {
                     Button("Update \(model.codexUpdateAvailableCount)", action: onUpdateAvailable)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                        .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
                 }
             }
             .padding(12)
@@ -653,7 +686,7 @@ private struct CodexView: View {
                             state: model.codexFleetVersionState(for: host),
                             latestVersion: model.latestCodexVersion,
                             updateProgress: model.codexUpdates[host.id],
-                            isUpdateBusy: model.isUpdatingCodex || model.isUpdatingCodexDesktopApps,
+                            isUpdateBusy: model.isAnyCodexUpdateRunning,
                             onUpdate: { Task { await model.updateCodex(on: host) } }
                         )
                     }
@@ -662,6 +695,18 @@ private struct CodexView: View {
                 .padding(12)
             }
             }
+        }
+        .confirmationDialog(
+            model.codexUpdateCenterSummary.confirmationTitle,
+            isPresented: $isConfirmingUpdateCenter,
+            titleVisibility: .visible
+        ) {
+            Button("Update All Available") {
+                Task { await model.updateAllAvailableCodex() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(updateCenterConfirmationDetail)
         }
         .confirmationDialog(
             "Check and update the Codex app on \(pendingDesktopAppHost?.displayName ?? "this Mac")?",
@@ -746,7 +791,7 @@ private struct CodexView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isRefreshing || model.isCheckingCodexDesktopAppRelease || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                .disabled(model.isRefreshing || model.isCheckingCodexDesktopAppRelease || model.isAnyCodexUpdateRunning)
 
                 if model.codexDesktopAppReleaseSummary.updateAvailableCount > 0 {
                     Button("Update \(model.codexDesktopAppReleaseSummary.updateAvailableCount)") {
@@ -754,14 +799,14 @@ private struct CodexView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                    .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
                 } else {
                     Button("Check & Update All") {
                         isConfirmingAllDesktopApps = true
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isRefreshing || model.isUpdatingCodex || model.isUpdatingCodexDesktopApps)
+                    .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
                 }
             }
             .padding(12)
@@ -813,7 +858,7 @@ private struct CodexView: View {
                             releaseState: model.codexDesktopAppReleaseState(for: host),
                             latestRelease: model.latestCodexDesktopAppRelease,
                             updateProgress: model.codexDesktopAppUpdates[host.id],
-                            isUpdateBusy: model.isUpdatingCodexDesktopApps || model.isUpdatingCodex,
+                            isUpdateBusy: model.isAnyCodexUpdateRunning,
                             onUpdate: { pendingDesktopAppHost = host }
                         )
                     }
@@ -821,6 +866,27 @@ private struct CodexView: View {
                 .padding(12)
             }
         }
+    }
+
+    private var updateCenterIcon: String {
+        if model.codexReleaseCheckFailed || model.codexDesktopAppReleaseCheckFailed {
+            return "exclamationmark.triangle.fill"
+        }
+        return model.codexUpdateCenterSummary.totalUpdateCount > 0
+            ? "arrow.down.circle.fill"
+            : "checkmark.circle.fill"
+    }
+
+    private var updateCenterColor: Color {
+        if model.codexReleaseCheckFailed || model.codexDesktopAppReleaseCheckFailed { return .orange }
+        return model.codexUpdateCenterSummary.totalUpdateCount > 0 ? .blue : .green
+    }
+
+    private var updateCenterConfirmationDetail: String {
+        let restart = model.codexUpdateCenterSummary.desktopAppUpdateCount > 0
+            ? " The Codex Mac app may restart after its signed update."
+            : ""
+        return model.codexUpdateCenterSummary.confirmationDetail + restart
     }
 
     private var releaseDetail: String {

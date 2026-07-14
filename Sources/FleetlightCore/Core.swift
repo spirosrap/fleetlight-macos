@@ -1011,6 +1011,50 @@ public enum CodexUpdateAlertPlanner {
     }
 }
 
+public struct CodexUpdateCenterSummary: Sendable, Equatable {
+    public let cliUpdateCount: Int
+    public let desktopAppUpdateCount: Int
+
+    public init(cliUpdateCount: Int, desktopAppUpdateCount: Int) {
+        self.cliUpdateCount = max(0, cliUpdateCount)
+        self.desktopAppUpdateCount = max(0, desktopAppUpdateCount)
+    }
+
+    public var totalUpdateCount: Int {
+        cliUpdateCount + desktopAppUpdateCount
+    }
+
+    public var detail: String {
+        guard totalUpdateCount > 0 else { return "No updates available" }
+        var parts: [String] = []
+        if cliUpdateCount > 0 {
+            parts.append("\(cliUpdateCount) CLI")
+        }
+        if desktopAppUpdateCount > 0 {
+            parts.append("\(desktopAppUpdateCount) Mac app")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    public var confirmationTitle: String {
+        let noun = totalUpdateCount == 1 ? "update" : "updates"
+        return "Run \(totalUpdateCount) Codex \(noun)?"
+    }
+
+    public var confirmationDetail: String {
+        var phases: [String] = []
+        if cliUpdateCount > 0 {
+            phases.append("\(cliUpdateCount) CLI update\(cliUpdateCount == 1 ? "" : "s")")
+        }
+        if desktopAppUpdateCount > 0 {
+            phases.append("\(desktopAppUpdateCount) Mac app update\(desktopAppUpdateCount == 1 ? "" : "s")")
+        }
+        return phases.isEmpty
+            ? "There are no available updates to run."
+            : "Fleetlight will run " + phases.joined(separator: ", then ") + "."
+    }
+}
+
 public enum CodexDesktopAppReportBuilder {
     public static func summarize(
         hosts: [FleetHost],

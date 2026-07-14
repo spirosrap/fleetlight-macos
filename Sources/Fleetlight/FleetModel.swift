@@ -1310,6 +1310,20 @@ final class FleetModel: ObservableObject {
         notice = "Full diagnosis copied"
     }
 
+    func copyServiceReport() {
+        let entries = FleetServiceAnalyzer.entries(hosts: visibleHosts, snapshots: snapshots)
+        let report = FleetServiceReportBuilder.build(entries: entries)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+        notice = "Service report copied"
+        Task {
+            await ActivityLogger.shared.append(
+                event: "service-report-copied",
+                detail: "services=\(entries.count)"
+            )
+        }
+    }
+
     func copyCodexDesktopAppReport() {
         let report = CodexDesktopAppReportBuilder.build(
             hosts: codexDesktopAppHosts,

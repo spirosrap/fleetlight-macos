@@ -572,9 +572,14 @@ private struct FleetSummaryBar: View {
 
 private struct ServicesView: View {
     @ObservedObject var model: FleetModel
+    @State private var selectedFilter: FleetServiceFilter = .all
 
     private var entries: [FleetServiceEntry] {
         FleetServiceAnalyzer.entries(hosts: model.visibleHosts, snapshots: model.snapshots)
+    }
+
+    private var filteredEntries: [FleetServiceEntry] {
+        FleetServiceAnalyzer.filtered(entries: entries, by: selectedFilter)
     }
 
     private var summary: FleetServiceSummary {
@@ -582,7 +587,12 @@ private struct ServicesView: View {
     }
 
     private var configuredKinds: [ServiceKind] {
-        ServiceKind.allCases.filter { kind in entries.contains(where: { $0.kind == kind }) }
+        ServiceKind.allCases.filter { kind in filteredEntries.contains(where: { $0.kind == kind }) }
+    }
+
+    private var freshnessText: String {
+        guard let lastRefresh = model.lastRefresh else { return "not yet checked" }
+        return "checked \(lastRefresh.formatted(date: .omitted, time: .standard))"
     }
 
     var body: some View {
@@ -592,24 +602,37 @@ private struct ServicesView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Fleet services")
                             .font(.headline)
-                        Text("\(entries.count) configured check\(entries.count == 1 ? "" : "s") from \(FleetObserver.currentDisplayName)")
+                        Text("\(entries.count) configured check\(entries.count == 1 ? "" : "s") · \(FleetObserver.currentDisplayName) · \(freshnessText)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button {
+                        model.copyServiceReport()
+                    } label: {
+                        Label("Copy service report", systemImage: "doc.on.doc")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(entries.isEmpty)
+                    .help("Copy the full service report")
+
+                    Button {
                         Task { await model.refreshAll() }
                     } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
+                        Label("Refresh services", systemImage: "arrow.clockwise")
+                            .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless)
                     .disabled(model.isRefreshing)
+                    .help("Refresh all machine and service checks")
                 }
 
                 HStack(spacing: 7) {
-                    SummaryPill(label: "Healthy", value: "\(summary.healthyCount)", color: .green, isSelected: false)
-                    SummaryPill(label: "Attention", value: "\(summary.attentionCount)", color: summary.attentionCount > 0 ? .orange : .secondary, isSelected: false)
-                    SummaryPill(label: "Unavailable", value: "\(summary.unavailableCount)", color: summary.unavailableCount > 0 ? .gray : .secondary, isSelected: false)
+                    serviceFilterButton(.all, value: entries.count, color: .accentColor)
+                    serviceFilterButton(.healthy, value: summary.healthyCount, color: .green)
+                    serviceFilterButton(.attention, value: summary.attentionCount, color: summary.attentionCount > 0 ? .orange : .secondary)
+                    serviceFilterButton(.unavailable, value: summary.unavailableCount, color: summary.unavailableCount > 0 ? .gray : .secondary)
                     Spacer()
                 }
             }
@@ -623,13 +646,19 @@ private struct ServicesView: View {
                     systemImage: "wrench.and.screwdriver",
                     description: Text("Add services to a machine to see fleet-wide health here.")
                 )
+            } else if filteredEntries.isEmpty {
+                ContentUnavailableView(
+                    "No \(selectedFilter.displayName.lowercased()) services",
+                    systemImage: "line.3.horizontal.decrease.circle",
+                    description: Text("Choose another status filter to see the remaining service checks.")
+                )
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(configuredKinds) { kind in
                             ServiceDashboardGroup(
                                 kind: kind,
-                                entries: entries.filter { $0.kind == kind }
+                                entries: filteredEntries.filter { $0.kind == kind }
                             )
                         }
                     }
@@ -637,6 +666,21 @@ private struct ServicesView: View {
                 }
             }
         }
+    }
+
+    private func serviceFilterButton(_ filter: FleetServiceFilter, value: Int, color: Color) -> some View {
+        Button {
+            selectedFilter = selectedFilter == filter && filter != .all ? .all : filter
+        } label: {
+            SummaryPill(
+                label: filter.displayName,
+                value: "\(value)",
+                color: color,
+                isSelected: selectedFilter == filter
+            )
+        }
+        .buttonStyle(.plain)
+        .help(selectedFilter == filter && filter != .all ? "Show all service checks" : "Show \(filter.displayName.lowercased()) service checks")
     }
 }
 
@@ -684,9 +728,15 @@ private struct ServiceDashboardRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text(stateLabel)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(color)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(stateLabel)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(color)
+                Text(checkedText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            .help(checkedHelp)
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
@@ -708,6 +758,16 @@ private struct ServiceDashboardRow: View {
         case .stopped: .red
         case .unavailable: .gray
         }
+    }
+
+    private var checkedText: String {
+        guard let checkedAt = entry.checkedAt else { return "Not checked" }
+        return "Checked \(checkedAt.formatted(date: .omitted, time: .shortened))"
+    }
+
+    private var checkedHelp: String {
+        guard let checkedAt = entry.checkedAt else { return "This service has not been checked yet" }
+        return "Checked \(checkedAt.formatted(date: .abbreviated, time: .standard))"
     }
 }
 

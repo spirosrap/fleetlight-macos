@@ -78,6 +78,7 @@ Supported machine fields:
 - One combined menu-bar label that preserves simultaneous states, such as `1 offline · 1 access issue · 2 slow · 1 alert`
 - Persistent pinned machines plus Issues First, Lowest Health, Ping, and Name sorting
 - Fleet-wide Services dashboard grouped by check type, with Healthy, Attention, and Unavailable totals plus clear per-machine reasons
+- Clickable service-status filters, per-machine check times, manual refresh, and a copyable fleet service report with observer and app-version provenance
 - Ping, jitter, packet loss, SSH-ready time, full-probe time, disk, memory, load, and uptime
 - Current Codex CLI version for every online machine, choosing the newest user-level or NVM installation when duplicates exist
 - Optional Codex desktop app version and build reporting for configured macOS hosts

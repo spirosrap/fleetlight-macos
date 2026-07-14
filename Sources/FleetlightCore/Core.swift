@@ -379,15 +379,42 @@ public struct FleetServiceEntry: Identifiable, Equatable, Sendable {
     public let kind: ServiceKind
     public let state: ServiceState
     public let detail: String
+    public let checkedAt: Date?
 
     public var id: String { "\(hostID):\(kind.rawValue)" }
 
-    public init(hostID: String, hostName: String, kind: ServiceKind, state: ServiceState, detail: String) {
+    public init(
+        hostID: String,
+        hostName: String,
+        kind: ServiceKind,
+        state: ServiceState,
+        detail: String,
+        checkedAt: Date? = nil
+    ) {
         self.hostID = hostID
         self.hostName = hostName
         self.kind = kind
         self.state = state
         self.detail = detail
+        self.checkedAt = checkedAt
+    }
+}
+
+public enum FleetServiceFilter: String, CaseIterable, Identifiable, Sendable {
+    case all
+    case healthy
+    case attention
+    case unavailable
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .all: "All"
+        case .healthy: "Healthy"
+        case .attention: "Attention"
+        case .unavailable: "Unavailable"
+        }
     }
 }
 
@@ -418,7 +445,8 @@ public enum FleetServiceAnalyzer {
                         hostName: host.displayName,
                         kind: kind,
                         state: service.state,
-                        detail: service.detail
+                        detail: service.detail,
+                        checkedAt: snapshot.checkedAt
                     )
                 }
 
@@ -438,7 +466,8 @@ public enum FleetServiceAnalyzer {
                     hostName: host.displayName,
                     kind: kind,
                     state: .unavailable,
-                    detail: detail
+                    detail: detail,
+                    checkedAt: snapshot.checkedAt
                 )
             }
         }.sorted { left, right in
@@ -460,6 +489,26 @@ public enum FleetServiceAnalyzer {
         )
     }
 
+    public static func filtered(
+        entries: [FleetServiceEntry],
+        by filter: FleetServiceFilter
+    ) -> [FleetServiceEntry] {
+        entries.filter { matches(entry: $0, filter: filter) }
+    }
+
+    public static func matches(entry: FleetServiceEntry, filter: FleetServiceFilter) -> Bool {
+        switch filter {
+        case .all:
+            true
+        case .healthy:
+            entry.state == .healthy
+        case .attention:
+            entry.state == .degraded || entry.state == .stopped
+        case .unavailable:
+            entry.state == .unavailable
+        }
+    }
+
     private static func stateRank(_ state: ServiceState) -> Int {
         switch state {
         case .stopped: 0
@@ -467,6 +516,46 @@ public enum FleetServiceAnalyzer {
         case .unavailable: 2
         case .healthy: 3
         }
+    }
+}
+
+public enum FleetServiceReportBuilder {
+    public static func build(
+        entries: [FleetServiceEntry],
+        generatedAt: Date = Date(),
+        observerName: String = FleetObserver.currentDisplayName,
+        appVersion: String = FleetlightVersion.currentDisplayLabel
+    ) -> String {
+        let summary = FleetServiceAnalyzer.summarize(entries: entries)
+        var lines = [
+            "Fleetlight service report — \(generatedAt.formatted(date: .abbreviated, time: .standard))",
+            "Observer: \(observerName) · Fleetlight \(appVersion)",
+            "Configured \(entries.count) · Healthy \(summary.healthyCount) · Attention \(summary.attentionCount) · Unavailable \(summary.unavailableCount)",
+        ]
+
+        if entries.isEmpty {
+            lines.append("No configured service checks")
+            return lines.joined(separator: "\n")
+        }
+
+        for kind in ServiceKind.allCases {
+            let serviceEntries = entries.filter { $0.kind == kind }
+            guard !serviceEntries.isEmpty else { continue }
+            let healthyCount = serviceEntries.filter { $0.state == .healthy }.count
+            lines.append("")
+            lines.append("\(kind.displayName) — \(healthyCount)/\(serviceEntries.count) healthy")
+            for entry in serviceEntries {
+                var facts = ["\(entry.state.rawValue.capitalized)", entry.detail]
+                if let checkedAt = entry.checkedAt {
+                    facts.append("checked \(checkedAt.formatted(date: .abbreviated, time: .standard))")
+                } else {
+                    facts.append("not yet checked")
+                }
+                lines.append("• \(entry.hostName) [\(entry.hostID)]: \(facts.joined(separator: " · "))")
+            }
+        }
+
+        return lines.joined(separator: "\n")
     }
 }
 

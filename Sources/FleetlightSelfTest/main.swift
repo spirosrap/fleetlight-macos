@@ -449,6 +449,29 @@ test.require(defaultHost.id == "local" && defaultHost.isLocal, "the public defau
 test.require(defaultHost.services.isEmpty, "the public default should not reveal configured services")
 test.require(defaultHost.supportsCodexDesktopApp, "the safe local default should expose Codex desktop app updates")
 
+let portableHosts = [
+    FleetHost(
+        id: "workstation",
+        displayName: "This Mac",
+        systemImage: "laptopcomputer",
+        isLocal: true,
+        routes: [SSHRoute(alias: "local", displayName: "Local process")]
+    ),
+    FleetHost(
+        id: "studio",
+        displayName: "Studio",
+        systemImage: "macmini",
+        routes: [SSHRoute(alias: "studio", displayName: "Direct")]
+    ),
+]
+let studioResolvedHosts = FleetHost.resolvingLocalHost(in: portableHosts, hostname: "STUDIO.example.net")
+let resolvedStudio = studioResolvedHosts.first(where: { $0.id == "studio" })!
+let resolvedWorkstation = studioResolvedHosts.first(where: { $0.id == "workstation" })!
+test.require(studioResolvedHosts.filter(\.isLocal).map(\.id) == ["studio"], "the running Mac should become the only local host")
+test.require(resolvedStudio.displayName == "This Mac" && resolvedStudio.routes.first?.alias == "local", "the running Mac should use the local process route")
+test.require(resolvedWorkstation.displayName == "Workstation" && resolvedWorkstation.routes.first?.alias == "workstation", "the previous local Mac should become a named SSH host")
+test.require(FleetHost.resolvingLocalHost(in: portableHosts, hostname: "unknown") == portableHosts, "an unknown hostname should preserve the configured local host")
+
 let metricFromSnapshot = MetricSample(hostID: "example", snapshot: verifiedSnapshot)
 test.require(metricFromSnapshot.routeName == "Via Relay", "metric samples should retain the route")
 test.require(metricFromSnapshot.pingMilliseconds == 42, "metric samples should retain ping")

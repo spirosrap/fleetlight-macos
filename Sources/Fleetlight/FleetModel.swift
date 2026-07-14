@@ -53,8 +53,12 @@ final class FleetModel: ObservableObject {
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
-        hosts = configurationResult.configuration.hosts
-        snapshots = Dictionary(uniqueKeysWithValues: configurationResult.configuration.hosts.map { ($0.id, HostSnapshot()) })
+        let resolvedHosts = FleetHost.resolvingLocalHost(
+            in: configurationResult.configuration.hosts,
+            hostname: ProcessInfo.processInfo.hostName
+        )
+        hosts = resolvedHosts
+        snapshots = Dictionary(uniqueKeysWithValues: resolvedHosts.map { ($0.id, HostSnapshot()) })
         hiddenHostIDs = Set(UserDefaults.standard.stringArray(forKey: "hiddenHostIDs") ?? [])
         let configuredInterval = UserDefaults.standard.double(forKey: "refreshInterval")
         refreshInterval = configuredInterval >= 30 ? configuredInterval : 60
@@ -1200,7 +1204,10 @@ final class FleetModel: ObservableObject {
         do {
             let configuration = try FleetConfigurationStore.load()
             let previousSnapshots = snapshots
-            hosts = configuration.hosts
+            hosts = FleetHost.resolvingLocalHost(
+                in: configuration.hosts,
+                hostname: ProcessInfo.processInfo.hostName
+            )
             snapshots = Dictionary(uniqueKeysWithValues: hosts.map {
                 ($0.id, previousSnapshots[$0.id] ?? HostSnapshot())
             })

@@ -46,6 +46,8 @@ On first launch Fleetlight creates:
 
 Open Settings → Fleet configuration → Open `fleet.json`, edit it, then choose Reload Configuration. A documented generic template is included as [`fleet.example.json`](fleet.example.json).
 
+When a configured machine ID matches the current Mac's hostname, Fleetlight automatically treats that entry as This Mac and moves the previously local entry back to its SSH route. This lets one fleet configuration travel between Macs without making either machine SSH into itself.
+
 Remote routes are SSH aliases, not addresses or credentials. For example:
 
 ```sshconfig
@@ -89,6 +91,7 @@ Supported machine fields:
 - Confirmed one-click Codex updates across the fleet, with restart-safe resume, sequential progress, version verification, and individual update actions
 - Clear Codex update outcomes for not-yet-attempted, offline, failed, and verified machines, including shell-wrapper-aware updates
 - Configurable performance-warning thresholds
+- Runtime host detection for portable fleet configurations, with direct local monitoring and no SSH loopback on whichever configured Mac is running Fleetlight
 - Seven-day local metric history with 1-hour, 6-hour, 24-hour, and 7-day charts
 - Live fleet timing comparison and plain-language network diagnosis
 - Thirty-day incident history with restart-safe active issue reconstruction

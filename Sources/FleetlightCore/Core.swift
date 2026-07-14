@@ -146,6 +146,52 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
             supportsCodexDesktopApp: true
         ),
     ]
+
+    public static func resolvingLocalHost(in hosts: [FleetHost], hostname: String) -> [FleetHost] {
+        let normalizedHostname = normalizedHostIdentifier(hostname)
+        guard let localHostID = hosts.first(where: {
+            normalizedHostIdentifier($0.id) == normalizedHostname
+        })?.id else {
+            return hosts
+        }
+
+        return hosts.map { host in
+            let isLocal = host.id == localHostID
+            let remoteRoutes = host.routes.filter { $0.alias != "local" }
+            let displayName: String
+            if isLocal {
+                displayName = "This Mac"
+            } else if host.isLocal && host.displayName == "This Mac" {
+                displayName = friendlyHostName(host.id)
+            } else {
+                displayName = host.displayName
+            }
+            return FleetHost(
+                id: host.id,
+                displayName: displayName,
+                systemImage: host.systemImage,
+                isLocal: isLocal,
+                wakeMACAddress: host.wakeMACAddress,
+                wakeBroadcastAddress: host.wakeBroadcastAddress,
+                supportsCodexDesktopApp: host.supportsCodexDesktopApp,
+                services: host.services,
+                routes: isLocal ? [] : remoteRoutes
+            )
+        }
+    }
+
+    private static func normalizedHostIdentifier(_ value: String) -> String {
+        let shortName = value
+            .lowercased()
+            .split(separator: ".", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        return shortName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func friendlyHostName(_ identifier: String) -> String {
+        identifier.replacingOccurrences(of: "-", with: " ").capitalized
+    }
 }
 
 public struct FleetConfiguration: Codable, Equatable, Sendable {

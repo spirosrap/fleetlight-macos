@@ -14,10 +14,13 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.15", build: "19") == "v1.15 (19)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.15", build: nil) == "v1.15", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "19") == "Build 19", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.17", build: "21") == "v1.17 (21)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.17", build: nil) == "v1.17", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "21") == "Build 21", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
+test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
+test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
+test.require(FleetObserver.displayName(localizedName: " ", hostname: nil) == "This Mac", "observer identity should provide a safe fallback")
 let route = SSHRoute(alias: "example-via-relay", displayName: "Via Relay")
 let verified = CommandResult(
     exitCode: 0,
@@ -98,7 +101,13 @@ let host = FleetHost(
     systemImage: "desktopcomputer",
     services: [.tailscale, .plex]
 )
-let report = FleetReportBuilder.build(hosts: [host], snapshots: [host.id: verifiedSnapshot])
+let report = FleetReportBuilder.build(
+    hosts: [host],
+    snapshots: [host.id: verifiedSnapshot],
+    observerName: "studio",
+    appVersion: "v1.17 (21)"
+)
+test.require(report.contains("Observer: studio · Fleetlight v1.17 (21)"), "reports should identify their observer and Fleetlight build")
 test.require(report.contains("Example [example]: Online"), "report should identify the host")
 test.require(report.contains("Codex 0.144.2"), "report should include the current Codex CLI version")
 test.require(report.contains("Codex app 26.707.62119 (build 5211)"), "report should include the Codex desktop app version")

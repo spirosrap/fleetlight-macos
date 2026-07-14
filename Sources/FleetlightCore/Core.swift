@@ -32,6 +32,25 @@ public enum FleetlightVersion {
     }
 }
 
+public enum FleetObserver {
+    public static func displayName(localizedName: String?, hostname: String?) -> String {
+        for candidate in [localizedName, hostname] {
+            guard let candidate else { continue }
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            return trimmed.split(separator: ".", maxSplits: 1).first.map(String.init) ?? trimmed
+        }
+        return "This Mac"
+    }
+
+    public static var currentDisplayName: String {
+        displayName(
+            localizedName: Host.current().localizedName,
+            hostname: ProcessInfo.processInfo.hostName
+        )
+    }
+}
+
 public enum ServiceState: String, Codable, Sendable {
     case healthy
     case degraded
@@ -2688,9 +2707,14 @@ public enum FleetReportBuilder {
         hosts: [FleetHost],
         snapshots: [String: HostSnapshot],
         thresholds: PerformanceThresholds = .default,
-        generatedAt: Date = Date()
+        generatedAt: Date = Date(),
+        observerName: String = FleetObserver.currentDisplayName,
+        appVersion: String = FleetlightVersion.currentDisplayLabel
     ) -> String {
-        var lines = ["Fleetlight full diagnosis — \(generatedAt.formatted(date: .abbreviated, time: .standard))"]
+        var lines = [
+            "Fleetlight full diagnosis — \(generatedAt.formatted(date: .abbreviated, time: .standard))",
+            "Observer: \(observerName) · Fleetlight \(appVersion)",
+        ]
 
         for host in hosts {
             let snapshot = snapshots[host.id] ?? HostSnapshot()

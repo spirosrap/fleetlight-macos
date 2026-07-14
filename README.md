@@ -72,6 +72,7 @@ Supported machine fields:
 ## Features
 
 - Always-visible Fleetlight version and build badge sourced directly from the running app bundle
+- Observer provenance in the header, Settings, and copied diagnostics, including the monitoring Mac and last completed refresh time
 - Concurrent local and SSH health checks with verification markers and hard timeouts
 - Online, Offline, Access, Slow, Alerts, and All Issues drill-down filters; a ping-reachable machine with failed SSH monitoring is an Access issue instead of being mislabeled offline
 - One combined menu-bar label that preserves simultaneous states, such as `1 offline · 1 access issue · 2 slow · 1 alert`

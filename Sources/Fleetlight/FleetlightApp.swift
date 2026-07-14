@@ -161,6 +161,9 @@ private struct FleetMenuView: View {
                 Text(summaryText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text(observerContextText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             }
 
             Spacer()
@@ -186,6 +189,14 @@ private struct FleetMenuView: View {
             return "All clear · checked \(lastRefresh.formatted(date: .omitted, time: .shortened))"
         }
         return "Waiting for first check"
+    }
+
+    private var observerContextText: String {
+        let source = "From \(FleetObserver.currentDisplayName)"
+        guard let lastRefresh = model.lastRefresh else {
+            return "\(source) · no completed refresh"
+        }
+        return "\(source) · last check \(lastRefresh.formatted(date: .omitted, time: .standard))"
     }
 
     private var fleetContent: some View {
@@ -2229,6 +2240,8 @@ private struct FleetSettingsView: View {
             }
 
             Section("Monitoring") {
+                LabeledContent("Observer", value: FleetObserver.currentDisplayName)
+                LabeledContent("Fleetlight", value: FleetlightVersion.currentDisplayLabel)
                 Picker("Refresh interval", selection: Binding(
                     get: { model.refreshInterval },
                     set: { model.setRefreshInterval($0) }

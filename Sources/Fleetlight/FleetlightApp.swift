@@ -236,6 +236,7 @@ private struct FleetMenuView: View {
         case .all: "No visible machines"
         case .online: "No online machines"
         case .offline: "No offline machines"
+        case .access: "No monitoring access issues"
         case .slow: "No slow connections"
         case .alerts: "No service or resource alerts"
         case .attention: "No machines need attention"
@@ -246,7 +247,7 @@ private struct FleetMenuView: View {
         switch model.fleetStatusFilter {
         case .all: "eye.slash"
         case .online: "network.slash"
-        case .offline, .slow, .alerts, .attention: "checkmark.circle"
+        case .offline, .access, .slow, .alerts, .attention: "checkmark.circle"
         }
     }
 
@@ -254,7 +255,8 @@ private struct FleetMenuView: View {
         switch model.fleetStatusFilter {
         case .all: "Choose visible machines in Settings."
         case .online: "No visible machine has completed a successful check."
-        case .offline: "Every visible machine is currently reachable."
+        case .offline: "Every visible machine currently answers the network check."
+        case .access: "Every ping-reachable machine also accepts Fleetlight’s SSH monitoring check."
         case .slow: "Every connected machine is below the configured performance thresholds."
         case .alerts: "No connected machine has a service or resource warning."
         case .attention: "Your visible fleet is currently clear."
@@ -480,6 +482,11 @@ private struct FleetSummaryBar: View {
                 .offline,
                 value: model.unreachableCount,
                 color: model.unreachableCount > 0 ? .red : .secondary
+            )
+            statusButton(
+                .access,
+                value: model.accessIssueCount,
+                color: model.accessIssueCount > 0 ? .orange : .secondary
             )
             statusButton(
                 .slow,
@@ -2386,7 +2393,11 @@ private struct HostRow: View {
                     }
                     Text(primaryDetail)
                         .font(.caption)
-                        .foregroundStyle(snapshot.state == .unreachable ? .red : .secondary)
+                        .foregroundStyle(
+                            connectionStatus == .accessIssue
+                                ? Color.orange
+                                : snapshot.state == .unreachable ? Color.red : Color.secondary
+                        )
                         .lineLimit(2)
                     if codexUpdateIsAvailable, let latestCodexVersion, !isCodexUpdateBusy {
                         Label("Codex \(latestCodexVersion) available", systemImage: "arrow.up.circle.fill")
@@ -2410,13 +2421,13 @@ private struct HostRow: View {
                         .frame(width: 18, height: 18)
                 }
 
-                if host.canWake && snapshot.state == .unreachable {
+                if host.canWake && connectionStatus == .offline {
                     Button("Wake", action: onWake)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                 }
 
-                if snapshot.state == .online {
+                if canExpand {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
                     } label: {
@@ -2453,7 +2464,7 @@ private struct HostRow: View {
                 .fixedSize()
             }
 
-            if isExpanded, snapshot.state == .online {
+            if isExpanded, canExpand {
                 expandedDetails
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -2586,6 +2597,14 @@ private struct HostRow: View {
         }
     }
 
+    private var connectionStatus: FleetConnectionStatus {
+        FleetConnectionClassifier.status(for: snapshot)
+    }
+
+    private var canExpand: Bool {
+        connectionStatus == .online || connectionStatus == .accessIssue
+    }
+
     private var statusColor: Color {
         switch snapshot.state {
         case .online:
@@ -2593,7 +2612,7 @@ private struct HostRow: View {
         case .checking, .waking:
             return .orange
         case .unreachable:
-            return .red
+            return connectionStatus == .accessIssue ? .orange : .red
         }
     }
 

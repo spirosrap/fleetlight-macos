@@ -114,6 +114,10 @@ final class FleetModel: ObservableObject {
         attentionSummary.unreachableCount
     }
 
+    var accessIssueCount: Int {
+        attentionSummary.monitoringAccessIssueCount
+    }
+
     var slowConnectionCount: Int {
         attentionSummary.performanceWarningCount
     }
@@ -359,6 +363,9 @@ final class FleetModel: ObservableObject {
         var parts: [String] = []
         if unreachableCount > 0 {
             parts.append("\(unreachableCount) can’t connect")
+        }
+        if accessIssueCount > 0 {
+            parts.append("\(accessIssueCount) access issue\(accessIssueCount == 1 ? "" : "s")")
         }
         if slowConnectionCount > 0 {
             parts.append("\(slowConnectionCount) slow")
@@ -1460,17 +1467,21 @@ final class FleetModel: ObservableObject {
             let newFailureCount = oldFailureCount + 1
             failureCounts[host.id] = newFailureCount
             if !isInitialRefresh && newFailureCount == 2 {
+                let hasAccessIssue = FleetConnectionClassifier.status(for: current) == .accessIssue
+                let title = hasAccessIssue
+                    ? "\(host.displayName) monitoring access failed"
+                    : "\(host.displayName) is unreachable"
                 await recordIncident(
                     host: host,
                     kind: .hostDown,
-                    title: "\(host.displayName) is unreachable",
+                    title: title,
                     detail: current.detail
                 )
                 await postNotification(
-                    title: "\(host.displayName) is unreachable",
+                    title: title,
                     body: current.detail,
                     host: host.id,
-                    event: "host-unreachable"
+                    event: hasAccessIssue ? "monitoring-access-failed" : "host-unreachable"
                 )
             }
             return
@@ -1478,17 +1489,23 @@ final class FleetModel: ObservableObject {
 
         failureCounts[host.id] = 0
         if oldFailureCount >= 2 && current.state == .online {
+            let restoredAccess = previous.map {
+                FleetConnectionClassifier.status(for: $0) == .accessIssue
+            } ?? false
+            let title = restoredAccess
+                ? "\(host.displayName) monitoring access restored"
+                : "\(host.displayName) recovered"
             await recordIncident(
                 host: host,
                 kind: .hostRecovered,
-                title: "\(host.displayName) recovered",
+                title: title,
                 detail: "Online via \(current.routeName ?? "the configured route")"
             )
             await postNotification(
-                title: "\(host.displayName) recovered",
+                title: title,
                 body: "Online via \(current.routeName ?? "the configured route")",
                 host: host.id,
-                event: "host-recovered"
+                event: restoredAccess ? "monitoring-access-restored" : "host-recovered"
             )
         }
 

@@ -495,9 +495,34 @@ public enum PerformanceIncidentTracker {
     }
 }
 
+public enum FleetConnectionStatus: Equatable, Sendable {
+    case pending
+    case online
+    case accessIssue
+    case offline
+}
+
+public enum FleetConnectionClassifier {
+    public static func status(for snapshot: HostSnapshot) -> FleetConnectionStatus {
+        switch snapshot.state {
+        case .checking, .waking:
+            return .pending
+        case .online:
+            return .online
+        case .unreachable:
+            if snapshot.pingMilliseconds != nil,
+               (snapshot.packetLossPercent ?? 0) < 100 {
+                return .accessIssue
+            }
+            return .offline
+        }
+    }
+}
+
 public struct FleetAttentionSummary: Equatable, Sendable {
     public let onlineCount: Int
     public let unreachableCount: Int
+    public let monitoringAccessIssueCount: Int
     public let performanceWarningCount: Int
     public let serviceOrResourceAlertCount: Int
     public let uniqueAttentionCount: Int
@@ -505,12 +530,14 @@ public struct FleetAttentionSummary: Equatable, Sendable {
     public init(
         onlineCount: Int,
         unreachableCount: Int,
+        monitoringAccessIssueCount: Int,
         performanceWarningCount: Int,
         serviceOrResourceAlertCount: Int,
         uniqueAttentionCount: Int
     ) {
         self.onlineCount = onlineCount
         self.unreachableCount = unreachableCount
+        self.monitoringAccessIssueCount = monitoringAccessIssueCount
         self.performanceWarningCount = performanceWarningCount
         self.serviceOrResourceAlertCount = serviceOrResourceAlertCount
         self.uniqueAttentionCount = uniqueAttentionCount
@@ -519,6 +546,9 @@ public struct FleetAttentionSummary: Equatable, Sendable {
     public var compactDescription: String? {
         var parts: [String] = []
         if unreachableCount > 0 { parts.append("\(unreachableCount) offline") }
+        if monitoringAccessIssueCount > 0 {
+            parts.append("\(monitoringAccessIssueCount) access issue\(monitoringAccessIssueCount == 1 ? "" : "s")")
+        }
         if performanceWarningCount > 0 { parts.append("\(performanceWarningCount) slow") }
         if serviceOrResourceAlertCount > 0 {
             parts.append("\(serviceOrResourceAlertCount) alert\(serviceOrResourceAlertCount == 1 ? "" : "s")")
@@ -531,6 +561,7 @@ public enum FleetStatusFilter: String, CaseIterable, Codable, Identifiable, Send
     case all
     case online
     case offline
+    case access
     case slow
     case alerts
     case attention
@@ -542,6 +573,7 @@ public enum FleetStatusFilter: String, CaseIterable, Codable, Identifiable, Send
         case .all: "All machines"
         case .online: "Online"
         case .offline: "Offline"
+        case .access: "Access"
         case .slow: "Slow"
         case .alerts: "Alerts"
         case .attention: "All issues"
@@ -555,7 +587,9 @@ public enum FleetAttentionAnalyzer {
         thresholds: PerformanceThresholds,
         filter: FleetStatusFilter
     ) -> Bool {
-        let isOffline = snapshot.state == .unreachable
+        let connectionStatus = FleetConnectionClassifier.status(for: snapshot)
+        let isOffline = connectionStatus == .offline
+        let hasAccessIssue = connectionStatus == .accessIssue
         let isSlow = snapshot.state == .online
             && !PerformanceEvaluator.warnings(snapshot: snapshot, thresholds: thresholds).isEmpty
         let hasAlert = snapshot.state == .online
@@ -566,9 +600,10 @@ public enum FleetAttentionAnalyzer {
         case .all: true
         case .online: snapshot.state == .online
         case .offline: isOffline
+        case .access: hasAccessIssue
         case .slow: isSlow
         case .alerts: hasAlert
-        case .attention: isOffline || isSlow || hasAlert
+        case .attention: isOffline || hasAccessIssue || isSlow || hasAlert
         }
     }
 
@@ -579,6 +614,7 @@ public enum FleetAttentionAnalyzer {
     ) -> FleetAttentionSummary {
         var onlineCount = 0
         var unreachableCount = 0
+        var monitoringAccessIssueCount = 0
         var performanceWarningCount = 0
         var serviceOrResourceAlertCount = 0
         var attentionHostIDs: Set<String> = []
@@ -587,8 +623,14 @@ public enum FleetAttentionAnalyzer {
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             if snapshot.state == .online { onlineCount += 1 }
 
-            if snapshot.state == .unreachable {
+            let connectionStatus = FleetConnectionClassifier.status(for: snapshot)
+            if connectionStatus == .offline {
                 unreachableCount += 1
+                attentionHostIDs.insert(host.id)
+                continue
+            }
+            if connectionStatus == .accessIssue {
+                monitoringAccessIssueCount += 1
                 attentionHostIDs.insert(host.id)
                 continue
             }
@@ -609,6 +651,7 @@ public enum FleetAttentionAnalyzer {
         return FleetAttentionSummary(
             onlineCount: onlineCount,
             unreachableCount: unreachableCount,
+            monitoringAccessIssueCount: monitoringAccessIssueCount,
             performanceWarningCount: performanceWarningCount,
             serviceOrResourceAlertCount: serviceOrResourceAlertCount,
             uniqueAttentionCount: attentionHostIDs.count
@@ -690,18 +733,20 @@ public enum FleetHostSorter {
         of snapshot: HostSnapshot,
         thresholds: PerformanceThresholds
     ) -> Int {
-        if snapshot.state == .unreachable { return 0 }
+        let connectionStatus = FleetConnectionClassifier.status(for: snapshot)
+        if connectionStatus == .offline { return 0 }
+        if connectionStatus == .accessIssue { return 1 }
         if snapshot.state == .online,
            (snapshot.diskPercent ?? 0) >= 90
             || snapshot.services.contains(where: { $0.state.needsAttention }) {
-            return 1
+            return 2
         }
         if snapshot.state == .online,
            !PerformanceEvaluator.warnings(snapshot: snapshot, thresholds: thresholds).isEmpty {
-            return 2
+            return 3
         }
-        if snapshot.state == .checking || snapshot.state == .waking { return 3 }
-        return 4
+        if snapshot.state == .checking || snapshot.state == .waking { return 4 }
+        return 5
     }
 }
 
@@ -1497,6 +1542,7 @@ public enum HealthScorer {
         availability: Double?,
         thresholds: PerformanceThresholds = .default
     ) -> Int {
+        if FleetConnectionClassifier.status(for: snapshot) == .accessIssue { return 15 }
         guard snapshot.state == .online else { return 0 }
         var score = Int((availability ?? 100).rounded())
 
@@ -2648,7 +2694,13 @@ public enum FleetReportBuilder {
 
         for host in hosts {
             let snapshot = snapshots[host.id] ?? HostSnapshot()
-            var facts = [snapshot.state.rawValue.capitalized]
+            let connectionLabel = switch FleetConnectionClassifier.status(for: snapshot) {
+            case .pending: snapshot.state.rawValue.capitalized
+            case .online: "Online"
+            case .accessIssue: "Access issue"
+            case .offline: "Offline"
+            }
+            var facts = [connectionLabel]
             if let os = snapshot.operatingSystem { facts.append(os) }
             if let codexVersion = snapshot.codexVersion { facts.append("Codex \(codexVersion)") }
             if let appVersion = snapshot.codexDesktopAppVersion {

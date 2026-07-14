@@ -761,29 +761,38 @@ let warningReport = FleetReportBuilder.build(hosts: [host], snapshots: [host.id:
 test.require(warningReport.contains("Performance warning: High ping"), "diagnostic reports should include configured performance warnings")
 
 let attentionOffline = FleetHost(id: "attention-offline", displayName: "Offline", systemImage: "desktopcomputer")
+let attentionAccess = FleetHost(id: "attention-access", displayName: "Access", systemImage: "desktopcomputer")
 let attentionSlow = FleetHost(id: "attention-slow", displayName: "Slow", systemImage: "desktopcomputer")
 let attentionService = FleetHost(id: "attention-service", displayName: "Service", systemImage: "desktopcomputer")
 let attentionBoth = FleetHost(id: "attention-both", displayName: "Both", systemImage: "desktopcomputer")
 let stoppedDocker = ServiceSnapshot(kind: .docker, state: .stopped, detail: "Stopped")
 let attentionSnapshots = [
     attentionOffline.id: HostSnapshot(state: .unreachable),
+    attentionAccess.id: HostSnapshot(state: .unreachable, pingMilliseconds: 38, packetLossPercent: 0, detail: "Permission denied"),
     attentionSlow.id: HostSnapshot(state: .online, pingMilliseconds: 250),
     attentionService.id: HostSnapshot(state: .online, services: [stoppedDocker]),
     attentionBoth.id: HostSnapshot(state: .online, pingMilliseconds: 300, services: [stoppedDocker]),
 ]
 let attentionSummary = FleetAttentionAnalyzer.summarize(
-    hosts: [attentionOffline, attentionSlow, attentionService, attentionBoth],
+    hosts: [attentionOffline, attentionAccess, attentionSlow, attentionService, attentionBoth],
     snapshots: attentionSnapshots,
     thresholds: .default
 )
 test.require(attentionSummary.onlineCount == 3, "attention summary should distinguish connected machines")
-test.require(attentionSummary.unreachableCount == 1, "attention summary should count connection failures separately")
+test.require(attentionSummary.unreachableCount == 1, "attention summary should reserve offline for machines without a network reply")
+test.require(attentionSummary.monitoringAccessIssueCount == 1, "attention summary should separate ping-reachable SSH failures")
 test.require(attentionSummary.performanceWarningCount == 2, "attention summary should count slow connected machines")
 test.require(attentionSummary.serviceOrResourceAlertCount == 2, "attention summary should separate service and resource alerts")
-test.require(attentionSummary.uniqueAttentionCount == 4, "overlapping warning categories should not double-count machines")
-test.require(attentionSummary.compactDescription == "1 offline · 2 slow · 2 alerts", "menu status should retain every simultaneous attention category")
-test.require(FleetAttentionSummary(onlineCount: 1, unreachableCount: 0, performanceWarningCount: 0, serviceOrResourceAlertCount: 0, uniqueAttentionCount: 0).compactDescription == nil, "healthy fleets should not add menu status text")
+test.require(attentionSummary.uniqueAttentionCount == 5, "overlapping warning categories should not double-count machines")
+test.require(attentionSummary.compactDescription == "1 offline · 1 access issue · 2 slow · 2 alerts", "menu status should retain every simultaneous attention category")
+test.require(FleetAttentionSummary(onlineCount: 1, unreachableCount: 0, monitoringAccessIssueCount: 0, performanceWarningCount: 0, serviceOrResourceAlertCount: 0, uniqueAttentionCount: 0).compactDescription == nil, "healthy fleets should not add menu status text")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionOffline.id]!, thresholds: .default, filter: .offline), "offline filter should include unreachable machines")
+test.require(!FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionAccess.id]!, thresholds: .default, filter: .offline), "offline filter should exclude ping-reachable access failures")
+test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionAccess.id]!, thresholds: .default, filter: .access), "access filter should include ping-reachable SSH failures")
+test.require(FleetConnectionClassifier.status(for: attentionSnapshots[attentionAccess.id]!) == .accessIssue, "connection classification should recognize monitoring access failures")
+test.require(FleetConnectionClassifier.status(for: HostSnapshot(state: .unreachable, pingMilliseconds: 38, packetLossPercent: 100)) == .offline, "complete packet loss should remain offline")
+test.require(HealthScorer.score(snapshot: attentionSnapshots[attentionAccess.id]!, availability: 100) == 15, "access failures should score above fully offline machines")
+test.require(FleetReportBuilder.build(hosts: [attentionAccess], snapshots: attentionSnapshots).contains("Access issue"), "copied diagnostics should describe monitoring access failures accurately")
 test.require(!FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionOffline.id]!, thresholds: .default, filter: .online), "online filter should exclude unreachable machines")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionSlow.id]!, thresholds: .default, filter: .slow), "slow filter should include connected performance warnings")
 test.require(FleetAttentionAnalyzer.matches(snapshot: attentionSnapshots[attentionService.id]!, thresholds: .default, filter: .alerts), "alerts filter should include service and resource issues")

@@ -792,8 +792,9 @@ private struct LinuxUpdatesView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
+        ZStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Linux system updates")
                         .font(.headline)
@@ -829,10 +830,10 @@ private struct LinuxUpdatesView: View {
                     .controlSize(.small)
                     .disabled(isRestartBusy)
                 }
-            }
-            .padding(12)
+                }
+                .padding(12)
 
-            HStack(spacing: 6) {
+                HStack(spacing: 6) {
                 SummaryPill(label: "Current", value: "\(model.linuxUpdateSummary.currentCount)", color: .green, isSelected: false)
                 SummaryPill(
                     label: "Updates",
@@ -859,73 +860,46 @@ private struct LinuxUpdatesView: View {
                     isSelected: false
                 )
                 Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 10)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
 
-            Divider()
+                Divider()
 
-            if model.linuxUpdateHosts.isEmpty {
-                ContentUnavailableView(
-                    "No Linux machines",
-                    systemImage: "terminal",
-                    description: Text("Linux machines appear here after detection or when Linux updates are enabled in fleet configuration.")
-                )
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 8) {
-                        ForEach(model.linuxUpdateHosts) { host in
-                            LinuxMachineUpdateRow(
-                                host: host,
-                                snapshot: model.linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot(),
-                                progress: model.linuxUpdates[host.id],
-                                restartProgress: model.linuxRestarts[host.id],
-                                isBusy: isBusy,
-                                isRestartBusy: isRestartBusy,
-                                onUpdate: { pendingConfirmation = .updateHost(host) },
-                                onRestart: { pendingConfirmation = .restartHost(host) }
-                            )
+                if model.linuxUpdateHosts.isEmpty {
+                    ContentUnavailableView(
+                        "No Linux machines",
+                        systemImage: "terminal",
+                        description: Text("Linux machines appear here after detection or when Linux updates are enabled in fleet configuration.")
+                    )
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(model.linuxUpdateHosts) { host in
+                                LinuxMachineUpdateRow(
+                                    host: host,
+                                    snapshot: model.linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot(),
+                                    progress: model.linuxUpdates[host.id],
+                                    restartProgress: model.linuxRestarts[host.id],
+                                    isBusy: isBusy,
+                                    isRestartBusy: isRestartBusy,
+                                    onUpdate: { pendingConfirmation = .updateHost(host) },
+                                    onRestart: { pendingConfirmation = .restartHost(host) }
+                                )
+                            }
                         }
+                        .padding(12)
                     }
-                    .padding(12)
                 }
             }
-        }
-        .confirmationDialog(
-            confirmationTitle,
-            isPresented: Binding(
-                get: { pendingConfirmation != nil },
-                set: { if !$0 { pendingConfirmation = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            switch pendingConfirmation {
-            case let .updateHost(host):
-                Button("Update \(host.displayName)") {
-                    pendingConfirmation = nil
-                    Task { await model.updateLinux(on: host) }
-                }
-            case .updateAll:
-                Button("Update Sequentially") {
-                    pendingConfirmation = nil
-                    Task { await model.updateLinuxOnAvailableHosts() }
-                }
-            case let .restartHost(host):
-                Button("Restart \(host.displayName)", role: .destructive) {
-                    pendingConfirmation = nil
-                    Task { await model.restartLinux(on: host) }
-                }
-            case .restartAll:
-                Button("Restart Sequentially", role: .destructive) {
-                    pendingConfirmation = nil
-                    Task { await model.restartLinuxOnRequiredHosts() }
-                }
-            case nil:
-                EmptyView()
+            .allowsHitTesting(pendingConfirmation == nil)
+            .opacity(pendingConfirmation == nil ? 1 : 0.4)
+
+            if pendingConfirmation != nil {
+                Color.black.opacity(0.28)
+                    .ignoresSafeArea()
+                confirmationCard
             }
-            Button("Cancel", role: .cancel) { pendingConfirmation = nil }
-        } message: {
-            Text(confirmationMessage)
         }
     }
 
@@ -956,6 +930,84 @@ private struct LinuxUpdatesView: View {
             "Only machines currently reporting Restart Required will restart. Fleetlight handles them one at a time and verifies each machine returns before continuing."
         case nil:
             ""
+        }
+    }
+
+    private var confirmationCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 9) {
+                Image(systemName: isRestartConfirmation ? "arrow.clockwise.circle.fill" : "shippingbox.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(isRestartConfirmation ? .orange : .blue)
+                Text(confirmationTitle)
+                    .font(.headline)
+            }
+
+            Text(confirmationMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Button("Cancel") {
+                    pendingConfirmation = nil
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("linux-confirm-cancel")
+
+                Button(confirmationActionTitle) {
+                    performConfirmedOperation()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(isRestartConfirmation ? .red : .accentColor)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .accessibilityIdentifier("linux-confirm-action")
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: 460)
+        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .strokeBorder(Color.primary.opacity(0.14))
+        }
+        .shadow(color: .black.opacity(0.35), radius: 24, y: 10)
+        .padding(24)
+    }
+
+    private var confirmationActionTitle: String {
+        switch pendingConfirmation {
+        case let .updateHost(host): "Update \(host.displayName)"
+        case .updateAll: "Update Sequentially"
+        case let .restartHost(host): "Restart \(host.displayName)"
+        case .restartAll: "Restart Sequentially"
+        case nil: "Continue"
+        }
+    }
+
+    private var isRestartConfirmation: Bool {
+        switch pendingConfirmation {
+        case .restartHost, .restartAll: true
+        case .updateHost, .updateAll, nil: false
+        }
+    }
+
+    private func performConfirmedOperation() {
+        guard let confirmation = pendingConfirmation else { return }
+        pendingConfirmation = nil
+        switch confirmation {
+        case let .updateHost(host):
+            Task { await model.updateLinux(on: host) }
+        case .updateAll:
+            Task { await model.updateLinuxOnAvailableHosts() }
+        case let .restartHost(host):
+            Task { await model.restartLinux(on: host) }
+        case .restartAll:
+            Task { await model.restartLinuxOnRequiredHosts() }
         }
     }
 

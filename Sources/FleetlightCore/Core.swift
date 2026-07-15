@@ -619,6 +619,7 @@ public struct PerformanceWarning: Identifiable, Equatable, Sendable {
         self.kind = kind
         self.detail = detail
     }
+
 }
 
 public enum PerformanceEvaluator {
@@ -2493,6 +2494,23 @@ public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
         self.checkedAt = checkedAt
         self.detail = detail
     }
+
+    public func replacingRebootRequired(_ rebootRequired: Bool) -> LinuxUpdateSnapshot {
+        LinuxUpdateSnapshot(
+            state: state,
+            distribution: distribution,
+            kernelVersion: kernelVersion,
+            packageManager: packageManager,
+            packageUpdateCount: packageUpdateCount,
+            securityUpdateCount: securityUpdateCount,
+            snapUpdateCount: snapUpdateCount,
+            flatpakUpdateCount: flatpakUpdateCount,
+            availablePackages: availablePackages,
+            rebootRequired: rebootRequired,
+            checkedAt: checkedAt,
+            detail: detail
+        )
+    }
 }
 
 public struct LinuxUpdateSummary: Equatable, Sendable {
@@ -2900,6 +2918,81 @@ public enum LinuxUpdateParser {
             return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Package manager is not supported")
         }
         return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Linux update failed")
+    }
+}
+
+
+public enum LinuxRestartRequirementStatus: Equatable, Sendable {
+    case required
+    case notRequired
+    case offline
+    case unsupported
+    case failed
+}
+
+public struct LinuxRestartRequirementOutcome: Equatable, Sendable {
+    public let status: LinuxRestartRequirementStatus
+    public let detail: String
+
+    public init(status: LinuxRestartRequirementStatus, detail: String) {
+        self.status = status
+        self.detail = detail
+    }
+}
+
+public enum LinuxRestartRequirementCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_LINUX_RESTART_REQUIREMENT\n'
+        if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
+          printf 'RESTART_REQUIREMENT:not-linux\n'
+          exit 3
+        fi
+        if [ -f /var/run/reboot-required ]; then
+          printf 'RESTART_REQUIREMENT:required\n'
+        else
+          printf 'RESTART_REQUIREMENT:not-required\n'
+        fi
+        """
+    }
+}
+
+public enum LinuxRestartRequirementParser {
+    public static func outcome(from result: CommandResult) -> LinuxRestartRequirementOutcome {
+        let lines = result.stdout
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if result.timedOut {
+            return LinuxRestartRequirementOutcome(status: .failed, detail: "Restart requirement check timed out")
+        }
+        if result.exitCode == 255 || isOfflineMessage(result.stderr) {
+            return LinuxRestartRequirementOutcome(status: .offline, detail: "Machine is offline")
+        }
+        guard lines.first == "FLEETLIGHT_LINUX_RESTART_REQUIREMENT" else {
+            return LinuxRestartRequirementOutcome(status: .failed, detail: "Restart requirement marker was not returned")
+        }
+        if lines.contains("RESTART_REQUIREMENT:required") {
+            return LinuxRestartRequirementOutcome(status: .required, detail: "Restart required")
+        }
+        if lines.contains("RESTART_REQUIREMENT:not-required") {
+            return LinuxRestartRequirementOutcome(status: .notRequired, detail: "Restart not required")
+        }
+        if lines.contains("RESTART_REQUIREMENT:not-linux") {
+            return LinuxRestartRequirementOutcome(status: .unsupported, detail: "Machine is not running Linux")
+        }
+        return LinuxRestartRequirementOutcome(status: .failed, detail: "Restart requirement check failed")
+    }
+
+    private static func isOfflineMessage(_ message: String) -> Bool {
+        let message = message.lowercased()
+        return message.contains("connection refused")
+            || message.contains("connection timed out")
+            || message.contains("operation timed out")
+            || message.contains("no route to host")
+            || message.contains("could not resolve hostname")
+            || message.contains("network is unreachable")
     }
 }
 

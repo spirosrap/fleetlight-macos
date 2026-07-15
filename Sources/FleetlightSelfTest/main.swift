@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.24", build: "28") == "v1.24 (28)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.24", build: nil) == "v1.24", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "28") == "Build 28", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.25", build: "29") == "v1.25 (29)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.25", build: nil) == "v1.25", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "29") == "Build 29", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -461,6 +461,9 @@ test.require(availableLinuxSnapshot.securityUpdateCount == 1, "Linux checks shou
 test.require(availableLinuxSnapshot.availablePackages.first?.versionTransition == "8.5.0-2ubuntu10.6 → 8.5.0-2ubuntu10.7", "Linux checks should show installed and available package versions")
 test.require(availableLinuxSnapshot.rebootRequired, "Linux checks should surface reboot-required state")
 test.require(availableLinuxSnapshot.checkedAt == linuxCheckedAt, "Linux checks should retain freshness timestamps")
+let reconciledLinuxSnapshot = availableLinuxSnapshot.replacingRebootRequired(false)
+test.require(!reconciledLinuxSnapshot.rebootRequired, "live restart reconciliation should clear a stale restart flag")
+test.require(reconciledLinuxSnapshot.totalUpdateCount == availableLinuxSnapshot.totalUpdateCount && reconciledLinuxSnapshot.checkedAt == availableLinuxSnapshot.checkedAt, "restart reconciliation should preserve package details and check freshness")
 
 let currentLinuxCheck = CommandResult(
     exitCode: 0,
@@ -527,6 +530,38 @@ let failedLinuxUpdate = CommandResult(
     timedOut: false
 )
 test.require(LinuxUpdateParser.outcome(from: failedLinuxUpdate).detail == "Passwordless sudo is required", "Linux update failures should explain missing privileges")
+
+let linuxRestartRequirementCommand = LinuxRestartRequirementCommandBuilder.build()
+test.require(linuxRestartRequirementCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_RESTART_REQUIREMENT"), "restart requirement checks should emit a verification marker")
+test.require(linuxRestartRequirementCommand.contains("/var/run/reboot-required"), "restart requirement checks should inspect the live Linux reboot flag")
+test.require(!linuxRestartRequirementCommand.contains("sudo"), "restart requirement checks should not require elevated privileges")
+
+let liveRestartRequired = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_LINUX_RESTART_REQUIREMENT\nRESTART_REQUIREMENT:required\n",
+    stderr: "",
+    elapsedMilliseconds: 30,
+    timedOut: false
+)
+test.require(LinuxRestartRequirementParser.outcome(from: liveRestartRequired).status == .required, "live restart checks should retain a required flag")
+
+let liveRestartCleared = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_LINUX_RESTART_REQUIREMENT\nRESTART_REQUIREMENT:not-required\n",
+    stderr: "",
+    elapsedMilliseconds: 30,
+    timedOut: false
+)
+test.require(LinuxRestartRequirementParser.outcome(from: liveRestartCleared).status == .notRequired, "live restart checks should detect that a reboot flag cleared")
+
+let offlineRestartRequirement = CommandResult(
+    exitCode: 255,
+    stdout: "",
+    stderr: "ssh: connect to host example port 22: Connection timed out",
+    elapsedMilliseconds: 8_000,
+    timedOut: false
+)
+test.require(LinuxRestartRequirementParser.outcome(from: offlineRestartRequirement).status == .offline, "offline restart checks should not clear cached state")
 
 let linuxRestartCommand = LinuxRestartCommandBuilder.build()
 test.require(linuxRestartCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_RESTART"), "Linux restarts should emit a verification marker")
@@ -973,9 +1008,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.24 (28)"
+    appVersion: "v1.25 (29)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.24 (28)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.25 (29)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

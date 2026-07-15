@@ -539,6 +539,8 @@ final class FleetModel: ObservableObject {
             }
         }
 
+        await reconcileLinuxRestartRequirements()
+
         if let codexReleaseTask {
             applyCodexReleaseResult(await codexReleaseTask.value)
         }
@@ -549,6 +551,47 @@ final class FleetModel: ObservableObject {
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
         isRefreshing = false
+    }
+
+    private func reconcileLinuxRestartRequirements() async {
+        let targets = linuxRestartRequiredHosts.filter {
+            snapshots[$0.id]?.state == .online
+        }
+        guard !targets.isEmpty else { return }
+
+        let results = await withTaskGroup(
+            of: (String, LinuxRestartRequirementOutcome).self,
+            returning: [(String, LinuxRestartRequirementOutcome)].self
+        ) { group in
+            for host in targets {
+                let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+                group.addTask {
+                    let result = await Self.runLinuxRestartRequirementCheck(host: host, routeAlias: routeAlias)
+                    return (host.id, LinuxRestartRequirementParser.outcome(from: result))
+                }
+            }
+
+            var values: [(String, LinuxRestartRequirementOutcome)] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+
+        var changedHostIDs: [String] = []
+        for (hostID, outcome) in results where outcome.status == .notRequired {
+            guard let cached = linuxUpdateSnapshots[hostID], cached.rebootRequired else { continue }
+            linuxUpdateSnapshots[hostID] = cached.replacingRebootRequired(false)
+            changedHostIDs.append(hostID)
+            await ActivityLogger.shared.append(
+                event: "linux-restart-requirement-cleared",
+                host: hostID,
+                detail: "Live reboot flag is no longer present"
+            )
+        }
+        if !changedHostIDs.isEmpty {
+            LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+        }
     }
 
     private func applyCodexReleaseResult(_ registryJSON: String?) {
@@ -2166,6 +2209,18 @@ final class FleetModel: ObservableObject {
             host: host,
             routeAlias: routeAlias,
             timeout: 30
+        )
+    }
+
+    nonisolated private static func runLinuxRestartRequirementCheck(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        await runLinuxCommand(
+            LinuxRestartRequirementCommandBuilder.build(),
+            host: host,
+            routeAlias: routeAlias,
+            timeout: 20
         )
     }
 

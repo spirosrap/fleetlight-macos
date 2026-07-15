@@ -26,6 +26,10 @@ final class FleetModel: ObservableObject {
     @Published private(set) var isUpdatingLinux = false
     @Published private(set) var linuxUpdateCompletedCount = 0
     @Published private(set) var linuxUpdateTotalCount = 0
+    @Published private(set) var linuxRestarts: [String: HostLinuxRestartProgress] = [:]
+    @Published private(set) var isRestartingLinux = false
+    @Published private(set) var linuxRestartCompletedCount = 0
+    @Published private(set) var linuxRestartTotalCount = 0
     @Published private(set) var latestCodexVersion: String?
     @Published private(set) var isCheckingCodexRelease = false
     @Published private(set) var codexReleaseCheckFailed = false
@@ -210,8 +214,12 @@ final class FleetModel: ObservableObject {
         LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: linuxUpdateSnapshots)
     }
 
+    var linuxRestartRequiredHosts: [FleetHost] {
+        LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: linuxUpdateSnapshots)
+    }
+
     var isAnyUpdateOperationRunning: Bool {
-        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isUpdatingLinux
+        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isUpdatingLinux || isRestartingLinux
     }
 
     var codexUpdateCenterStatusText: String {
@@ -469,7 +477,7 @@ final class FleetModel: ObservableObject {
     }
 
     func refreshAll() async {
-        guard !isRefreshing, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
+        guard !isRefreshing, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         isRefreshing = true
         notice = nil
 
@@ -563,7 +571,7 @@ final class FleetModel: ObservableObject {
 
     func checkCodexReleaseNow() async {
         guard !isCheckingCodexRelease else { return }
-        guard !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -600,7 +608,7 @@ final class FleetModel: ObservableObject {
 
     func checkCodexDesktopAppReleaseNow() async {
         guard !isCheckingCodexDesktopAppRelease else { return }
-        guard !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         isCheckingCodexDesktopAppRelease = true
         notice = nil
         applyCodexDesktopAppReleaseResult(await Self.fetchLatestCodexDesktopAppRelease())
@@ -688,7 +696,7 @@ final class FleetModel: ObservableObject {
     }
 
     func checkLinuxUpdates() async {
-        guard !isCheckingLinuxUpdates, !isUpdatingLinux, !isAnyCodexUpdateRunning else { return }
+        guard !isCheckingLinuxUpdates, !isUpdatingLinux, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -779,7 +787,7 @@ final class FleetModel: ObservableObject {
     }
 
     private func performLinuxUpdates(on targets: [FleetHost], resuming: Bool = false) async {
-        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isAnyCodexUpdateRunning else { return }
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -930,6 +938,153 @@ final class FleetModel: ObservableObject {
         LinuxUpdateStore.saveBatch(batch)
     }
 
+    func restartLinux(on host: FleetHost) async {
+        guard linuxUpdateSnapshots[host.id]?.rebootRequired == true else {
+            notice = "Linux does not currently report a required restart for \(host.displayName)"
+            return
+        }
+        await performLinuxRestarts(on: [host])
+    }
+
+    func restartLinuxOnRequiredHosts() async {
+        let targets = linuxRestartRequiredHosts
+        guard !targets.isEmpty else {
+            notice = "No Linux machines currently require a restart"
+            return
+        }
+        await performLinuxRestarts(on: targets)
+    }
+
+    private func performLinuxRestarts(on targets: [FleetHost]) async {
+        guard !isAnyUpdateOperationRunning, !targets.isEmpty else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+
+        pollTask?.cancel()
+        isRestartingLinux = true
+        linuxRestartTotalCount = targets.count
+        linuxRestartCompletedCount = 0
+        linuxRestarts = Dictionary(uniqueKeysWithValues: targets.map {
+            ($0.id, HostLinuxRestartProgress(phase: .waiting, detail: "Waiting"))
+        })
+        notice = targets.count == 1
+            ? "Restarting \(targets[0].displayName)"
+            : "Restarting Linux sequentially on \(targets.count) machines"
+        await ActivityLogger.shared.append(
+            event: "linux-restart-started",
+            detail: "targets=\(targets.count)"
+        )
+
+        for host in targets {
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .issuing,
+                detail: "Issuing confirmed restart…"
+            )
+            let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+            let commandResult = await Self.runLinuxRestart(host: host, routeAlias: routeAlias)
+            let outcome = LinuxRestartParser.outcome(from: commandResult)
+            var finalPhase: HostLinuxRestartPhase
+            var finalDetail: String
+            var event: String
+
+            switch outcome.status {
+            case .scheduled:
+                linuxRestarts[host.id] = HostLinuxRestartProgress(
+                    phase: .waitingForOffline,
+                    detail: "Restart issued · waiting for shutdown…"
+                )
+                await ActivityLogger.shared.append(
+                    event: "linux-restart-issued",
+                    host: host.id,
+                    detail: outcome.bootDescriptionBeforeRestart.map { "boot-before=\($0)" } ?? "boot-before=unknown"
+                )
+
+                let previousBoot = outcome.bootDescriptionBeforeRestart ?? snapshots[host.id]?.bootDescription
+                var sawOffline = false
+                var restartedSnapshot: HostSnapshot?
+
+                let restartDeadline = Date().addingTimeInterval(5 * 60)
+                while Date() < restartDeadline {
+                    try? await Task.sleep(for: .seconds(4))
+                    let candidate = await Self.probe(host: host)
+                    if candidate.state == .online {
+                        let bootChanged = previousBoot != nil
+                            && candidate.bootDescription != nil
+                            && candidate.bootDescription != previousBoot
+                        if sawOffline || bootChanged {
+                            restartedSnapshot = candidate
+                            break
+                        }
+                    } else {
+                        sawOffline = true
+                        linuxRestarts[host.id] = HostLinuxRestartProgress(
+                            phase: .waitingForOnline,
+                            detail: "Shutdown observed · waiting for SSH to return…"
+                        )
+                    }
+                }
+
+                if let restartedSnapshot {
+                    snapshots[host.id] = restartedSnapshot
+                    linuxRestarts[host.id] = HostLinuxRestartProgress(
+                        phase: .verifying,
+                        detail: "Restart verified · rechecking Linux status…"
+                    )
+                    let verificationResult = await Self.runLinuxUpdateCheck(host: host, routeAlias: restartedSnapshot.routeAlias ?? routeAlias)
+                    let verified = LinuxUpdateCheckParser.snapshot(from: verificationResult)
+                    if verified.state == .current || verified.state == .updateAvailable {
+                        linuxUpdateSnapshots[host.id] = verified
+                        LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+                        finalDetail = verified.rebootRequired
+                            ? "Restart verified · Linux still requests another restart"
+                            : "Restart verified · machine is back online"
+                    } else {
+                        finalDetail = "Restart verified · update status recheck failed"
+                    }
+                    finalPhase = .succeeded
+                    event = verified.rebootRequired
+                        ? "linux-restart-still-required"
+                        : "linux-restart-verified"
+                } else if sawOffline {
+                    finalPhase = .offline
+                    finalDetail = "Restart issued, but the machine did not return within 5 minutes"
+                    event = "linux-restart-return-timeout"
+                } else {
+                    finalPhase = .failed
+                    finalDetail = "Restart issued, but shutdown could not be verified within 5 minutes"
+                    event = "linux-restart-unverified"
+                }
+            case .offline:
+                finalPhase = .offline
+                finalDetail = outcome.detail
+                event = "linux-restart-offline"
+            case .failed:
+                finalPhase = .failed
+                finalDetail = outcome.detail
+                event = "linux-restart-failed"
+            }
+
+            linuxRestarts[host.id] = HostLinuxRestartProgress(phase: finalPhase, detail: finalDetail)
+            linuxRestartCompletedCount += 1
+            await ActivityLogger.shared.append(event: event, host: host.id, detail: finalDetail)
+        }
+
+        let succeeded = linuxRestarts.values.filter { $0.phase == .succeeded }.count
+        let offline = linuxRestarts.values.filter { $0.phase == .offline }.count
+        let failed = linuxRestarts.values.filter { $0.phase == .failed }.count
+        await ActivityLogger.shared.append(
+            event: "linux-restart-finished",
+            detail: "verified=\(succeeded); offline=\(offline); failed=\(failed)"
+        )
+        isRestartingLinux = false
+        if started { schedulePolling() }
+        notice = offline == 0 && failed == 0
+            ? "Linux restart verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
+            : "Linux restart: \(succeeded) verified · \(offline) offline · \(failed) failed"
+    }
+
 
     func updateCodexOnAvailableHosts() async {
         let targets = codexUpdateAvailableHosts
@@ -981,7 +1136,7 @@ final class FleetModel: ObservableObject {
     }
 
     private func performCodexDesktopAppUpdates(on targets: [FleetHost]) async {
-        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
+        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         guard !targets.isEmpty else {
             notice = "No macOS Codex desktop app machines are configured"
             return
@@ -1062,7 +1217,7 @@ final class FleetModel: ObservableObject {
         resuming: Bool = false,
         preservingProgress: Bool = false
     ) async {
-        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
+        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -1991,6 +2146,18 @@ final class FleetModel: ObservableObject {
             host: host,
             routeAlias: routeAlias,
             timeout: 3_600
+        )
+    }
+
+    nonisolated private static func runLinuxRestart(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        await runLinuxCommand(
+            LinuxRestartCommandBuilder.build(),
+            host: host,
+            routeAlias: routeAlias,
+            timeout: 30
         )
     }
 

@@ -2542,6 +2542,10 @@ public enum LinuxUpdateAnalyzer {
     public static func availableHosts(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> [FleetHost] {
         hosts.filter { snapshots[$0.id]?.state == .updateAvailable }
     }
+
+    public static func restartRequiredHosts(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> [FleetHost] {
+        hosts.filter { snapshots[$0.id]?.rebootRequired == true }
+    }
 }
 
 
@@ -2896,6 +2900,106 @@ public enum LinuxUpdateParser {
             return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Package manager is not supported")
         }
         return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Linux update failed")
+    }
+}
+
+
+public enum LinuxRestartStatus: Equatable, Sendable {
+    case scheduled
+    case offline
+    case failed
+}
+
+public struct LinuxRestartOutcome: Equatable, Sendable {
+    public let status: LinuxRestartStatus
+    public let bootDescriptionBeforeRestart: String?
+    public let detail: String
+
+    public init(status: LinuxRestartStatus, bootDescriptionBeforeRestart: String? = nil, detail: String) {
+        self.status = status
+        self.bootDescriptionBeforeRestart = bootDescriptionBeforeRestart
+        self.detail = detail
+    }
+}
+
+public enum LinuxRestartCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_LINUX_RESTART\n'
+        if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
+          printf 'RESTART:not-linux\n'
+          exit 3
+        fi
+
+        if [ "$(id -u)" -eq 0 ]; then
+          run_privileged() { "$@"; }
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+          run_privileged() { sudo -n "$@"; }
+        else
+          printf 'RESTART:privilege-required\n'
+          exit 4
+        fi
+
+        boot_before=$(uptime -s 2>/dev/null || true)
+        [ -n "$boot_before" ] || boot_before=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+        printf 'BOOT_BEFORE:%s\n' "$boot_before"
+
+        restart_command="sleep 2; if command -v systemctl >/dev/null 2>&1 && systemctl reboot; then exit 0; fi; if command -v shutdown >/dev/null 2>&1; then shutdown -r now; else reboot; fi"
+        if run_privileged /bin/sh -c "nohup /bin/sh -c '$restart_command' >/dev/null 2>&1 </dev/null &"; then
+          printf 'RESTART:scheduled\n'
+          exit 0
+        fi
+
+        printf 'RESTART:failed\n'
+        exit 1
+        """
+    }
+}
+
+public enum LinuxRestartParser {
+    public static func outcome(from result: CommandResult) -> LinuxRestartOutcome {
+        let lines = result.stdout
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let bootBefore = value(after: "BOOT_BEFORE:", in: lines)
+
+        if lines.first == "FLEETLIGHT_LINUX_RESTART", lines.contains("RESTART:scheduled") {
+            return LinuxRestartOutcome(
+                status: .scheduled,
+                bootDescriptionBeforeRestart: bootBefore,
+                detail: "Restart issued · waiting for the machine to return"
+            )
+        }
+        if result.timedOut {
+            return LinuxRestartOutcome(status: .failed, bootDescriptionBeforeRestart: bootBefore, detail: "Restart command timed out")
+        }
+        if result.exitCode == 255 || isOfflineMessage(result.stderr) {
+            return LinuxRestartOutcome(status: .offline, bootDescriptionBeforeRestart: bootBefore, detail: "Machine is offline")
+        }
+        if lines.contains("RESTART:privilege-required") {
+            return LinuxRestartOutcome(status: .failed, bootDescriptionBeforeRestart: bootBefore, detail: "Passwordless sudo is required")
+        }
+        if lines.contains("RESTART:not-linux") {
+            return LinuxRestartOutcome(status: .failed, bootDescriptionBeforeRestart: bootBefore, detail: "Machine is not running Linux")
+        }
+        return LinuxRestartOutcome(status: .failed, bootDescriptionBeforeRestart: bootBefore, detail: "Restart command failed")
+    }
+
+    private static func value(after prefix: String, in lines: [String]) -> String? {
+        guard let line = lines.last(where: { $0.hasPrefix(prefix) }) else { return nil }
+        let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func isOfflineMessage(_ message: String) -> Bool {
+        let message = message.lowercased()
+        return message.contains("connection refused")
+            || message.contains("connection timed out")
+            || message.contains("operation timed out")
+            || message.contains("no route to host")
+            || message.contains("could not resolve hostname")
+            || message.contains("network is unreachable")
     }
 }
 

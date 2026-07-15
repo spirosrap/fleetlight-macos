@@ -775,7 +775,9 @@ private struct ServiceDashboardRow: View {
 private struct LinuxUpdatesView: View {
     @ObservedObject var model: FleetModel
     @State private var pendingHost: FleetHost?
+    @State private var pendingRestartHost: FleetHost?
     @State private var isConfirmingAll = false
+    @State private var isConfirmingAllRestarts = false
 
     private var isBusy: Bool {
         model.isAnyUpdateOperationRunning || model.isRefreshing
@@ -809,6 +811,16 @@ private struct LinuxUpdatesView: View {
                     .controlSize(.small)
                     .disabled(isBusy)
                 }
+
+                if !model.linuxRestartRequiredHosts.isEmpty {
+                    Button("Restart \(model.linuxRestartRequiredHosts.count)") {
+                        isConfirmingAllRestarts = true
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .controlSize(.small)
+                    .disabled(isBusy)
+                }
             }
             .padding(12)
 
@@ -832,6 +844,12 @@ private struct LinuxUpdatesView: View {
                     color: model.linuxUpdateSummary.unavailableCount > 0 ? .orange : .secondary,
                     isSelected: false
                 )
+                SummaryPill(
+                    label: "Restart",
+                    value: "\(model.linuxRestartRequiredHosts.count)",
+                    color: model.linuxRestartRequiredHosts.isEmpty ? .secondary : .orange,
+                    isSelected: false
+                )
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 12)
@@ -853,8 +871,10 @@ private struct LinuxUpdatesView: View {
                                 host: host,
                                 snapshot: model.linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot(),
                                 progress: model.linuxUpdates[host.id],
+                                restartProgress: model.linuxRestarts[host.id],
                                 isBusy: isBusy,
-                                onUpdate: { pendingHost = host }
+                                onUpdate: { pendingHost = host },
+                                onRestart: { pendingRestartHost = host }
                             )
                         }
                     }
@@ -892,9 +912,42 @@ private struct LinuxUpdatesView: View {
         } message: {
             Text("Only machines with known available updates will run. Fleetlight processes them one at a time, verifies each result, and does not reboot them.")
         }
+        .confirmationDialog(
+            "Restart Linux on \(pendingRestartHost?.displayName ?? "this machine")?",
+            isPresented: Binding(
+                get: { pendingRestartHost != nil },
+                set: { if !$0 { pendingRestartHost = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let host = pendingRestartHost {
+                Button("Restart \(host.displayName)", role: .destructive) {
+                    pendingRestartHost = nil
+                    Task { await model.restartLinux(on: host) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingRestartHost = nil }
+        } message: {
+            Text("Active work and services on this machine will be interrupted. Fleetlight will issue the restart, wait for SSH to go offline and return, then recheck whether Linux still requests another restart.")
+        }
+        .confirmationDialog(
+            "Restart \(model.linuxRestartRequiredHosts.count) Linux machine\(model.linuxRestartRequiredHosts.count == 1 ? "" : "s")?",
+            isPresented: $isConfirmingAllRestarts,
+            titleVisibility: .visible
+        ) {
+            Button("Restart Sequentially", role: .destructive) {
+                Task { await model.restartLinuxOnRequiredHosts() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only machines currently reporting Restart Required will restart. Fleetlight handles them one at a time and verifies each machine returns before continuing.")
+        }
     }
 
     private var statusText: String {
+        if model.isRestartingLinux {
+            return "Restarting \(model.linuxRestartCompletedCount) of \(model.linuxRestartTotalCount) completed"
+        }
         if model.isUpdatingLinux {
             return "Updating \(model.linuxUpdateCompletedCount) of \(model.linuxUpdateTotalCount) completed"
         }
@@ -915,8 +968,10 @@ private struct LinuxMachineUpdateRow: View {
     let host: FleetHost
     let snapshot: LinuxUpdateSnapshot
     let progress: HostLinuxUpdateProgress?
+    let restartProgress: HostLinuxRestartProgress?
     let isBusy: Bool
     let onUpdate: () -> Void
+    let onRestart: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -962,6 +1017,13 @@ private struct LinuxMachineUpdateRow: View {
                             .controlSize(.small)
                             .disabled(isBusy)
                     }
+                    if snapshot.rebootRequired {
+                        Button("Restart", action: onRestart)
+                            .buttonStyle(.bordered)
+                            .tint(.orange)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                    }
                 }
             }
 
@@ -969,6 +1031,13 @@ private struct LinuxMachineUpdateRow: View {
                 Label(progress.detail, systemImage: progressImage)
                     .font(.caption2)
                     .foregroundStyle(progressColor)
+                    .lineLimit(2)
+            }
+
+            if let restartProgress {
+                Label(restartProgress.detail, systemImage: restartProgressImage)
+                    .font(.caption2)
+                    .foregroundStyle(restartProgressColor)
                     .lineLimit(2)
             }
 
@@ -1021,6 +1090,7 @@ private struct LinuxMachineUpdateRow: View {
     }
 
     private var statusTitle: String {
+        if let restartProgress, !restartProgress.phase.isTerminal { return restartStatusTitle }
         if progress?.phase == .updating { return "Updating" }
         return switch snapshot.state {
         case .notChecked: "Not checked"
@@ -1034,6 +1104,7 @@ private struct LinuxMachineUpdateRow: View {
     }
 
     private var statusImage: String {
+        if let restartProgress, !restartProgress.phase.isTerminal { return "arrow.clockwise.circle" }
         if progress?.phase == .updating { return "arrow.triangle.2.circlepath" }
         return switch snapshot.state {
         case .notChecked: "questionmark.circle"
@@ -1047,6 +1118,7 @@ private struct LinuxMachineUpdateRow: View {
     }
 
     private var statusColor: Color {
+        if let restartProgress, !restartProgress.phase.isTerminal { return .orange }
         if progress?.phase == .updating { return .blue }
         return switch snapshot.state {
         case .notChecked: .secondary
@@ -1074,6 +1146,42 @@ private struct LinuxMachineUpdateRow: View {
         switch progress?.phase {
         case .notAttempted: .secondary
         case .updating: .blue
+        case .succeeded: .green
+        case .offline: .orange
+        case .failed: .red
+        case nil: .secondary
+        }
+    }
+
+    private var restartStatusTitle: String {
+        switch restartProgress?.phase {
+        case .waiting: "Waiting"
+        case .issuing: "Restarting"
+        case .waitingForOffline: "Shutting down"
+        case .waitingForOnline: "Starting up"
+        case .verifying: "Verifying"
+        case .succeeded: "Restarted"
+        case .offline: "Still offline"
+        case .failed: "Restart failed"
+        case nil: "Restart"
+        }
+    }
+
+    private var restartProgressImage: String {
+        switch restartProgress?.phase {
+        case .waiting: "circle"
+        case .issuing, .waitingForOffline, .waitingForOnline, .verifying: "arrow.clockwise.circle"
+        case .succeeded: "checkmark.circle.fill"
+        case .offline: "wifi.slash"
+        case .failed: "xmark.octagon.fill"
+        case nil: "circle"
+        }
+    }
+
+    private var restartProgressColor: Color {
+        switch restartProgress?.phase {
+        case .waiting: .secondary
+        case .issuing, .waitingForOffline, .waitingForOnline, .verifying: .orange
         case .succeeded: .green
         case .offline: .orange
         case .failed: .red

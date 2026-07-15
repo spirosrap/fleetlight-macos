@@ -90,7 +90,8 @@ Supported machine fields:
 - Unified Codex Update Center with concurrent release checks, a combined CLI/Mac app update count, and one confirmed action that runs outdated CLI machines first and Mac app updates second
 - Linux System Update Center with distro and kernel versions, pending system/Snap/Flatpak counts, and installed-to-available package versions
 - Confirmed per-machine updates or restart-safe sequential fleet updates through apt, dnf, yum, pacman, zypper, or apk, followed by availability verification
-- Explicit restart-required results without automatic reboots; Linux checks and updates require non-interactive passwordless sudo on remote hosts
+- Explicit restart-required results without automatic reboots; Linux checks, updates, and user-confirmed restarts require non-interactive passwordless sudo on remote hosts
+- Confirmed per-machine and sequential Restart Required actions that wait for shutdown, verify SSH recovery or a changed boot time, and recheck the Linux restart flag
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

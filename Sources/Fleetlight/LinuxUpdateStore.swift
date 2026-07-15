@@ -21,6 +21,29 @@ struct HostLinuxUpdateProgress: Codable, Equatable {
     let detail: String
 }
 
+enum HostLinuxRestartPhase: String, Equatable {
+    case waiting
+    case issuing
+    case waitingForOffline
+    case waitingForOnline
+    case verifying
+    case succeeded
+    case offline
+    case failed
+
+    var isTerminal: Bool {
+        switch self {
+        case .succeeded, .offline, .failed: true
+        case .waiting, .issuing, .waitingForOffline, .waitingForOnline, .verifying: false
+        }
+    }
+}
+
+struct HostLinuxRestartProgress: Equatable {
+    let phase: HostLinuxRestartPhase
+    let detail: String
+}
+
 struct PersistedLinuxUpdateBatch: Codable, Equatable {
     let schemaVersion: Int
     let id: UUID
@@ -94,4 +117,3 @@ enum LinuxUpdateStore {
         try? data.write(to: url, options: .atomic)
     }
 }
-

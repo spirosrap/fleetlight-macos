@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.21", build: "25") == "v1.21 (25)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.21", build: nil) == "v1.21", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "25") == "Build 25", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.22", build: "26") == "v1.22 (26)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.22", build: nil) == "v1.22", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "26") == "Build 26", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -506,6 +506,7 @@ let linuxSummary = LinuxUpdateAnalyzer.summarize(
 )
 test.require(linuxSummary == LinuxUpdateSummary(currentCount: 1, updateAvailableCount: 1, offlineCount: 1, unavailableCount: 0, totalPendingUpdates: 4), "Linux update summaries should count each machine and pending package exactly once")
 test.require(LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot]).map(\.id) == ["updates"], "sequential Linux updates should target only machines with known updates")
+test.require(LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot, "current-linux": currentLinuxSnapshot]).map(\.id) == ["updates"], "Linux restarts should target only machines reporting restart required")
 
 let successfulLinuxUpdate = CommandResult(
     exitCode: 0,
@@ -526,6 +527,42 @@ let failedLinuxUpdate = CommandResult(
     timedOut: false
 )
 test.require(LinuxUpdateParser.outcome(from: failedLinuxUpdate).detail == "Passwordless sudo is required", "Linux update failures should explain missing privileges")
+
+let linuxRestartCommand = LinuxRestartCommandBuilder.build()
+test.require(linuxRestartCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_RESTART"), "Linux restarts should emit a verification marker")
+test.require(linuxRestartCommand.contains("sudo -n"), "Linux restarts should require non-interactive privilege escalation")
+test.require(linuxRestartCommand.contains("sleep 2"), "Linux restarts should acknowledge the request before disconnecting SSH")
+test.require(linuxRestartCommand.contains("systemctl reboot"), "Linux restarts should prefer systemd where available")
+test.require(linuxRestartCommand.contains("shutdown -r now"), "Linux restarts should include a portable shutdown fallback")
+
+let scheduledLinuxRestart = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_LINUX_RESTART\nBOOT_BEFORE:2026-07-15 07:00:00\nRESTART:scheduled\n",
+    stderr: "",
+    elapsedMilliseconds: 80,
+    timedOut: false
+)
+let scheduledLinuxRestartOutcome = LinuxRestartParser.outcome(from: scheduledLinuxRestart)
+test.require(scheduledLinuxRestartOutcome.status == .scheduled, "acknowledged Linux restarts should be treated as scheduled")
+test.require(scheduledLinuxRestartOutcome.bootDescriptionBeforeRestart == "2026-07-15 07:00:00", "Linux restart verification should retain the pre-restart boot time")
+
+let disconnectedAfterSchedulingRestart = CommandResult(
+    exitCode: 255,
+    stdout: "FLEETLIGHT_LINUX_RESTART\nBOOT_BEFORE:2026-07-15 07:00:00\nRESTART:scheduled\n",
+    stderr: "Connection to example closed by remote host.",
+    elapsedMilliseconds: 2_100,
+    timedOut: false
+)
+test.require(LinuxRestartParser.outcome(from: disconnectedAfterSchedulingRestart).status == .scheduled, "SSH closing after restart acknowledgement should not turn a scheduled restart into a failure")
+
+let unauthorizedLinuxRestart = CommandResult(
+    exitCode: 4,
+    stdout: "FLEETLIGHT_LINUX_RESTART\nRESTART:privilege-required\n",
+    stderr: "",
+    elapsedMilliseconds: 50,
+    timedOut: false
+)
+test.require(LinuxRestartParser.outcome(from: unauthorizedLinuxRestart).detail == "Passwordless sudo is required", "Linux restart failures should explain missing privileges")
 
 
 let codexDesktopAppCommand = CodexDesktopAppUpdateCommandBuilder.build()
@@ -936,9 +973,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.21 (25)"
+    appVersion: "v1.22 (26)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.21 (25)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.22 (26)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

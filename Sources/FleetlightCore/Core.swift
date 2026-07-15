@@ -2529,6 +2529,21 @@ public struct LinuxUpdateSummary: Equatable, Sendable {
     }
 }
 
+public enum LinuxRestartDetailReconciler {
+    public static func clearingRestartRequirement(from detail: String) -> String {
+        let repeatedRestartMessage = "Restart verified · Linux still requests another restart"
+        if detail.compare(repeatedRestartMessage, options: .caseInsensitive) == .orderedSame {
+            return "Restart verified · machine is back online"
+        }
+
+        let restartSuffix = " · restart required"
+        if detail.lowercased().hasSuffix(restartSuffix) {
+            return String(detail.dropLast(restartSuffix.count))
+        }
+        return detail
+    }
+}
+
 public enum LinuxUpdateAnalyzer {
     public static func summarize(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> LinuxUpdateSummary {
         var currentCount = 0

@@ -554,6 +554,7 @@ final class FleetModel: ObservableObject {
     }
 
     private func reconcileLinuxRestartRequirements() async {
+        reconcileClearedRestartDetails()
         let targets = linuxRestartRequiredHosts.filter {
             snapshots[$0.id]?.state == .online
         }
@@ -595,6 +596,48 @@ final class FleetModel: ObservableObject {
             // retain a row rendered from the previous dictionary value.
             linuxUpdateSnapshots = reconciledSnapshots
             LinuxUpdateStore.saveSnapshots(reconciledSnapshots)
+            reconcileClearedRestartDetails(for: Set(changedHostIDs))
+        }
+    }
+
+    private func reconcileClearedRestartDetails(for scopedHostIDs: Set<String>? = nil) {
+        var clearedHostIDs = Set(linuxUpdateSnapshots.compactMap { hostID, snapshot in
+            snapshot.rebootRequired ? nil : hostID
+        })
+        if let scopedHostIDs {
+            clearedHostIDs.formIntersection(scopedHostIDs)
+        }
+        guard !clearedHostIDs.isEmpty else { return }
+
+        var reconciledUpdates = linuxUpdates
+        var updatesChanged = false
+        for hostID in clearedHostIDs {
+            guard let progress = reconciledUpdates[hostID], progress.phase == .succeeded else { continue }
+            let detail = LinuxRestartDetailReconciler.clearingRestartRequirement(from: progress.detail)
+            guard detail != progress.detail else { continue }
+            reconciledUpdates[hostID] = HostLinuxUpdateProgress(phase: progress.phase, detail: detail)
+            updatesChanged = true
+        }
+        if updatesChanged {
+            linuxUpdates = reconciledUpdates
+            if var batch = linuxUpdateBatch {
+                batch.progress = reconciledUpdates
+                linuxUpdateBatch = batch
+                LinuxUpdateStore.saveBatch(batch)
+            }
+        }
+
+        var reconciledRestarts = linuxRestarts
+        var restartsChanged = false
+        for hostID in clearedHostIDs {
+            guard let progress = reconciledRestarts[hostID], progress.phase == .succeeded else { continue }
+            let detail = LinuxRestartDetailReconciler.clearingRestartRequirement(from: progress.detail)
+            guard detail != progress.detail else { continue }
+            reconciledRestarts[hostID] = HostLinuxRestartProgress(phase: progress.phase, detail: detail)
+            restartsChanged = true
+        }
+        if restartsChanged {
+            linuxRestarts = reconciledRestarts
         }
     }
 
@@ -794,6 +837,7 @@ final class FleetModel: ObservableObject {
         }
 
         LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+        reconcileClearedRestartDetails()
         isCheckingLinuxUpdates = false
         if started { schedulePolling() }
         let summary = linuxUpdateSummary
@@ -975,7 +1019,10 @@ final class FleetModel: ObservableObject {
         linuxUpdates = batch.progress
         linuxUpdateTotalCount = batch.targetHostIDs.count
         linuxUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
-        LinuxUpdateStore.saveBatch(batch)
+        reconcileClearedRestartDetails()
+        if let reconciledBatch = linuxUpdateBatch {
+            LinuxUpdateStore.saveBatch(reconciledBatch)
+        }
     }
 
     private func persistLinuxUpdateBatch() {

@@ -578,10 +578,11 @@ final class FleetModel: ObservableObject {
             return values
         }
 
+        var reconciledSnapshots = linuxUpdateSnapshots
         var changedHostIDs: [String] = []
         for (hostID, outcome) in results where outcome.status == .notRequired {
-            guard let cached = linuxUpdateSnapshots[hostID], cached.rebootRequired else { continue }
-            linuxUpdateSnapshots[hostID] = cached.replacingRebootRequired(false)
+            guard let cached = reconciledSnapshots[hostID], cached.rebootRequired else { continue }
+            reconciledSnapshots[hostID] = cached.replacingRebootRequired(false)
             changedHostIDs.append(hostID)
             await ActivityLogger.shared.append(
                 event: "linux-restart-requirement-cleared",
@@ -590,7 +591,10 @@ final class FleetModel: ObservableObject {
             )
         }
         if !changedHostIDs.isEmpty {
-            LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+            // Publish one complete replacement so an open menu popover cannot
+            // retain a row rendered from the previous dictionary value.
+            linuxUpdateSnapshots = reconciledSnapshots
+            LinuxUpdateStore.saveSnapshots(reconciledSnapshots)
         }
     }
 

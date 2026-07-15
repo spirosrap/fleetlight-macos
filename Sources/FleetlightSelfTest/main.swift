@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.20", build: "24") == "v1.20 (24)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.20", build: nil) == "v1.20", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "24") == "Build 24", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.21", build: "25") == "v1.21 (25)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.21", build: nil) == "v1.21", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "25") == "Build 25", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -415,6 +415,119 @@ let offlineCodexOutcome = CodexUpdateParser.outcome(from: offlineCodexUpdate)
 test.require(offlineCodexOutcome.status == .offline, "SSH connection failures should be separate from updater failures")
 test.require(offlineCodexOutcome.detail == "Offline — SSH timed out", "offline Codex updates should explain the connection problem")
 
+let linuxCheckCommand = LinuxUpdateCheckCommandBuilder.build()
+test.require(linuxCheckCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE_CHECK"), "Linux checks should emit a verification marker")
+test.require(linuxCheckCommand.contains("apt-get update"), "Linux checks should refresh apt metadata before reporting availability")
+test.require(linuxCheckCommand.contains("snap refresh --list"), "Linux checks should include available Snap versions")
+test.require(linuxCheckCommand.contains("flatpak remote-ls --updates"), "Linux checks should include available Flatpak versions")
+
+let linuxUpdateCommand = LinuxUpdateCommandBuilder.build()
+test.require(linuxUpdateCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE"), "Linux updates should emit a verification marker")
+test.require(linuxUpdateCommand.contains("full-upgrade"), "apt updates should preserve the trusted fleet full-upgrade behavior")
+test.require(linuxUpdateCommand.contains("dnf -y upgrade --refresh"), "Linux updates should support dnf")
+test.require(linuxUpdateCommand.contains("pacman -Syu --noconfirm"), "Linux updates should support pacman")
+test.require(linuxUpdateCommand.contains("snap refresh"), "Linux updates should refresh Snap packages")
+test.require(linuxUpdateCommand.contains("flatpak update -y --noninteractive"), "Linux updates should refresh Flatpak packages")
+test.require(!linuxUpdateCommand.contains("\nreboot") && !linuxUpdateCommand.contains("\nshutdown"), "Linux updates should never restart a machine automatically")
+
+let linuxCheckedAt = Date(timeIntervalSince1970: 1_720_000_000)
+let availableLinuxCheck = CommandResult(
+    exitCode: 0,
+    stdout: """
+    FLEETLIGHT_LINUX_UPDATE_CHECK
+    DISTRIBUTION:Ubuntu 24.04.2 LTS
+    KERNEL:6.8.0-64-generic
+    PACKAGE:curl|8.5.0-2ubuntu10.6|8.5.0-2ubuntu10.7
+    PACKAGE:openssl|3.0.13-0ubuntu3.4|3.0.13-0ubuntu3.5
+    PKG_MGR:apt
+    PACKAGE_COUNT:2
+    SECURITY_COUNT:1
+    SNAP_COUNT:1
+    FLATPAK_COUNT:1
+    REBOOT:required
+    STATUS:ok
+    """,
+    stderr: "",
+    elapsedMilliseconds: 4_000,
+    timedOut: false
+)
+let availableLinuxSnapshot = LinuxUpdateCheckParser.snapshot(from: availableLinuxCheck, checkedAt: linuxCheckedAt)
+test.require(availableLinuxSnapshot.state == .updateAvailable, "pending Linux packages should be reported as updates available")
+test.require(availableLinuxSnapshot.distribution == "Ubuntu 24.04.2 LTS", "Linux checks should retain the distribution version")
+test.require(availableLinuxSnapshot.kernelVersion == "6.8.0-64-generic", "Linux checks should retain the current kernel version")
+test.require(availableLinuxSnapshot.packageManager == "apt", "Linux checks should retain the detected package manager")
+test.require(availableLinuxSnapshot.totalUpdateCount == 4, "Linux totals should include system, Snap, and Flatpak updates")
+test.require(availableLinuxSnapshot.securityUpdateCount == 1, "Linux checks should retain security update counts where available")
+test.require(availableLinuxSnapshot.availablePackages.first?.versionTransition == "8.5.0-2ubuntu10.6 → 8.5.0-2ubuntu10.7", "Linux checks should show installed and available package versions")
+test.require(availableLinuxSnapshot.rebootRequired, "Linux checks should surface reboot-required state")
+test.require(availableLinuxSnapshot.checkedAt == linuxCheckedAt, "Linux checks should retain freshness timestamps")
+
+let currentLinuxCheck = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Fedora Linux 42\nKERNEL:6.15.4\nPKG_MGR:dnf\nPACKAGE_COUNT:0\nSECURITY_COUNT:0\nSNAP_COUNT:0\nFLATPAK_COUNT:0\nREBOOT:not-required\nSTATUS:ok\n",
+    stderr: "",
+    elapsedMilliseconds: 2_000,
+    timedOut: false
+)
+let currentLinuxSnapshot = LinuxUpdateCheckParser.snapshot(from: currentLinuxCheck)
+test.require(currentLinuxSnapshot.state == .current, "zero pending packages should report a current Linux machine")
+
+let offlineLinuxCheck = CommandResult(
+    exitCode: 255,
+    stdout: "",
+    stderr: "ssh: connect to host example port 22: Connection timed out",
+    elapsedMilliseconds: 12_000,
+    timedOut: false
+)
+let offlineLinuxSnapshot = LinuxUpdateCheckParser.snapshot(from: offlineLinuxCheck)
+test.require(offlineLinuxSnapshot.state == .offline, "SSH failures should remain distinct from Linux package failures")
+
+let privilegeLinuxCheck = CommandResult(
+    exitCode: 4,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Debian GNU/Linux 12\nKERNEL:6.1.0\nSTATUS:privilege-required\n",
+    stderr: "",
+    elapsedMilliseconds: 100,
+    timedOut: false
+)
+test.require(LinuxUpdateCheckParser.snapshot(from: privilegeLinuxCheck).detail == "Passwordless sudo is required", "Linux checks should explain missing update privileges")
+
+let linuxUpdateHosts = [
+    FleetHost(id: "updates", displayName: "Updates", systemImage: "server.rack", supportsLinuxUpdates: true),
+    FleetHost(id: "current-linux", displayName: "Current", systemImage: "server.rack", supportsLinuxUpdates: true),
+    FleetHost(id: "offline-linux", displayName: "Offline", systemImage: "server.rack", supportsLinuxUpdates: true),
+]
+let linuxSummary = LinuxUpdateAnalyzer.summarize(
+    hosts: linuxUpdateHosts,
+    snapshots: [
+        "updates": availableLinuxSnapshot,
+        "current-linux": currentLinuxSnapshot,
+        "offline-linux": offlineLinuxSnapshot,
+    ]
+)
+test.require(linuxSummary == LinuxUpdateSummary(currentCount: 1, updateAvailableCount: 1, offlineCount: 1, unavailableCount: 0, totalPendingUpdates: 4), "Linux update summaries should count each machine and pending package exactly once")
+test.require(LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot]).map(\.id) == ["updates"], "sequential Linux updates should target only machines with known updates")
+
+let successfulLinuxUpdate = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_LINUX_UPDATE\nPKG_MGR:apt\nREBOOT:required\nUPDATE:ok\n",
+    stderr: "",
+    elapsedMilliseconds: 30_000,
+    timedOut: false
+)
+let successfulLinuxOutcome = LinuxUpdateParser.outcome(from: successfulLinuxUpdate)
+test.require(successfulLinuxOutcome.status == .succeeded && successfulLinuxOutcome.rebootRequired, "verified Linux update commands should retain reboot state")
+test.require(successfulLinuxOutcome.detail.contains("restart required"), "successful Linux updates should explain when a restart remains")
+
+let failedLinuxUpdate = CommandResult(
+    exitCode: 4,
+    stdout: "FLEETLIGHT_LINUX_UPDATE\nUPDATE:privilege-required\n",
+    stderr: "",
+    elapsedMilliseconds: 100,
+    timedOut: false
+)
+test.require(LinuxUpdateParser.outcome(from: failedLinuxUpdate).detail == "Passwordless sudo is required", "Linux update failures should explain missing privileges")
+
+
 let codexDesktopAppCommand = CodexDesktopAppUpdateCommandBuilder.build()
 test.require(codexDesktopAppCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_APP_UPDATE"), "Codex app updater should emit a verification marker")
 test.require(codexDesktopAppCommand.contains("com.openai.codex"), "Codex app updater should verify the OpenAI bundle identifier")
@@ -627,6 +740,7 @@ let configuredServer = FleetHost(
     displayName: "Example Server",
     systemImage: "server.rack",
     wakeMACAddress: "00:11:22:33:44:55",
+    supportsLinuxUpdates: true,
     services: [.tailscale, .docker],
     routes: [SSHRoute(alias: "example-server", displayName: "Direct")]
 )
@@ -634,8 +748,14 @@ let publicConfiguration = FleetConfiguration(hosts: [thisMac, configuredServer])
 test.require(publicConfiguration.validationErrors.isEmpty, "a generic public fleet configuration should validate")
 test.require(configuredServer.canWake, "a configured MAC address should enable Wake-on-LAN")
 test.require(!configuredServer.supportsCodexDesktopApp, "remote hosts should opt in to Codex desktop app updates")
+test.require(configuredServer.supportsLinuxUpdates, "configured Linux hosts should opt in to system updates")
 let configurationRoundTrip = try decoder.decode(FleetConfiguration.self, from: encoder.encode(publicConfiguration))
 test.require(configurationRoundTrip == publicConfiguration, "fleet configuration should round-trip through JSON")
+let legacyLinuxHost = try decoder.decode(
+    FleetHost.self,
+    from: Data(#"{"id":"legacy","displayName":"Legacy","systemImage":"server.rack"}"#.utf8)
+)
+test.require(!legacyLinuxHost.supportsLinuxUpdates, "older fleet configurations should remain compatible without the Linux update flag")
 let duplicateConfiguration = FleetConfiguration(hosts: [thisMac, thisMac])
 test.require(duplicateConfiguration.validationErrors.contains("Machine IDs must be unique"), "duplicate machine IDs should be rejected")
 
@@ -816,9 +936,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.20 (24)"
+    appVersion: "v1.21 (25)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.20 (24)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.21 (25)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

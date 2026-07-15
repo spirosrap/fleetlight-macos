@@ -121,6 +121,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
     public let wakeMACAddress: String?
     public let wakeBroadcastAddress: String?
     public let supportsCodexDesktopApp: Bool
+    public let supportsLinuxUpdates: Bool
     public let services: [ServiceKind]
     public let routes: [SSHRoute]
 
@@ -132,6 +133,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         wakeMACAddress: String? = nil,
         wakeBroadcastAddress: String? = nil,
         supportsCodexDesktopApp: Bool = false,
+        supportsLinuxUpdates: Bool = false,
         services: [ServiceKind] = [],
         routes: [SSHRoute] = []
     ) {
@@ -142,6 +144,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         self.wakeMACAddress = wakeMACAddress
         self.wakeBroadcastAddress = wakeBroadcastAddress
         self.supportsCodexDesktopApp = supportsCodexDesktopApp
+        self.supportsLinuxUpdates = supportsLinuxUpdates
         self.services = services
         self.routes = routes.isEmpty
             ? [SSHRoute(alias: isLocal ? "local" : id, displayName: isLocal ? "Local process" : "Direct")]
@@ -158,6 +161,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
         case wakeMACAddress
         case wakeBroadcastAddress
         case supportsCodexDesktopApp = "codexDesktopApp"
+        case supportsLinuxUpdates = "linuxUpdates"
         case services
         case routes
     }
@@ -176,6 +180,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
             wakeMACAddress: try container.decodeIfPresent(String.self, forKey: .wakeMACAddress),
             wakeBroadcastAddress: try container.decodeIfPresent(String.self, forKey: .wakeBroadcastAddress),
             supportsCodexDesktopApp: try container.decodeIfPresent(Bool.self, forKey: .supportsCodexDesktopApp) ?? false,
+            supportsLinuxUpdates: try container.decodeIfPresent(Bool.self, forKey: .supportsLinuxUpdates) ?? false,
             services: try container.decodeIfPresent([ServiceKind].self, forKey: .services) ?? [],
             routes: try container.decodeIfPresent([SSHRoute].self, forKey: .routes) ?? []
         )
@@ -233,6 +238,7 @@ public struct FleetHost: Identifiable, Hashable, Codable, Sendable {
                 wakeMACAddress: host.wakeMACAddress,
                 wakeBroadcastAddress: host.wakeBroadcastAddress,
                 supportsCodexDesktopApp: host.supportsCodexDesktopApp,
+                supportsLinuxUpdates: host.supportsLinuxUpdates,
                 services: host.services,
                 routes: isLocal ? [] : remoteRoutes
             )
@@ -2410,6 +2416,489 @@ public enum CodexReleaseChecker {
         }
     }
 }
+
+public struct LinuxPackageUpdate: Codable, Equatable, Sendable {
+    public let name: String
+    public let installedVersion: String?
+    public let availableVersion: String?
+
+    public init(name: String, installedVersion: String? = nil, availableVersion: String? = nil) {
+        self.name = name
+        self.installedVersion = installedVersion
+        self.availableVersion = availableVersion
+    }
+
+    public var versionTransition: String {
+        switch (installedVersion, availableVersion) {
+        case let (installed?, available?): "\(installed) → \(available)"
+        case let (nil, available?): "available \(available)"
+        case let (installed?, nil): "installed \(installed)"
+        case (nil, nil): "version unavailable"
+        }
+    }
+}
+
+public enum LinuxUpdateState: String, Codable, Sendable {
+    case notChecked
+    case checking
+    case current
+    case updateAvailable
+    case offline
+    case unsupported
+    case failed
+}
+
+public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
+    public let state: LinuxUpdateState
+    public let distribution: String?
+    public let kernelVersion: String?
+    public let packageManager: String?
+    public let packageUpdateCount: Int
+    public let securityUpdateCount: Int
+    public let snapUpdateCount: Int
+    public let flatpakUpdateCount: Int
+    public let availablePackages: [LinuxPackageUpdate]
+    public let rebootRequired: Bool
+    public let checkedAt: Date?
+    public let detail: String
+
+    public var totalUpdateCount: Int {
+        packageUpdateCount + snapUpdateCount + flatpakUpdateCount
+    }
+
+    public init(
+        state: LinuxUpdateState = .notChecked,
+        distribution: String? = nil,
+        kernelVersion: String? = nil,
+        packageManager: String? = nil,
+        packageUpdateCount: Int = 0,
+        securityUpdateCount: Int = 0,
+        snapUpdateCount: Int = 0,
+        flatpakUpdateCount: Int = 0,
+        availablePackages: [LinuxPackageUpdate] = [],
+        rebootRequired: Bool = false,
+        checkedAt: Date? = nil,
+        detail: String = "Updates have not been checked"
+    ) {
+        self.state = state
+        self.distribution = distribution
+        self.kernelVersion = kernelVersion
+        self.packageManager = packageManager
+        self.packageUpdateCount = packageUpdateCount
+        self.securityUpdateCount = securityUpdateCount
+        self.snapUpdateCount = snapUpdateCount
+        self.flatpakUpdateCount = flatpakUpdateCount
+        self.availablePackages = availablePackages
+        self.rebootRequired = rebootRequired
+        self.checkedAt = checkedAt
+        self.detail = detail
+    }
+}
+
+public struct LinuxUpdateSummary: Equatable, Sendable {
+    public let currentCount: Int
+    public let updateAvailableCount: Int
+    public let offlineCount: Int
+    public let unavailableCount: Int
+    public let totalPendingUpdates: Int
+
+    public init(currentCount: Int, updateAvailableCount: Int, offlineCount: Int, unavailableCount: Int, totalPendingUpdates: Int) {
+        self.currentCount = currentCount
+        self.updateAvailableCount = updateAvailableCount
+        self.offlineCount = offlineCount
+        self.unavailableCount = unavailableCount
+        self.totalPendingUpdates = totalPendingUpdates
+    }
+}
+
+public enum LinuxUpdateAnalyzer {
+    public static func summarize(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> LinuxUpdateSummary {
+        var currentCount = 0
+        var updateAvailableCount = 0
+        var offlineCount = 0
+        var unavailableCount = 0
+        var totalPendingUpdates = 0
+
+        for host in hosts {
+            let snapshot = snapshots[host.id] ?? LinuxUpdateSnapshot()
+            totalPendingUpdates += snapshot.totalUpdateCount
+            switch snapshot.state {
+            case .current: currentCount += 1
+            case .updateAvailable: updateAvailableCount += 1
+            case .offline: offlineCount += 1
+            case .notChecked, .checking, .unsupported, .failed: unavailableCount += 1
+            }
+        }
+
+        return LinuxUpdateSummary(
+            currentCount: currentCount,
+            updateAvailableCount: updateAvailableCount,
+            offlineCount: offlineCount,
+            unavailableCount: unavailableCount,
+            totalPendingUpdates: totalPendingUpdates
+        )
+    }
+
+    public static func availableHosts(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> [FleetHost] {
+        hosts.filter { snapshots[$0.id]?.state == .updateAvailable }
+    }
+}
+
+
+public enum LinuxUpdateCheckCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_LINUX_UPDATE_CHECK\n'
+        if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
+          printf 'STATUS:not-linux\n'
+          exit 3
+        fi
+
+        distribution=$(awk -F= '/^PRETTY_NAME=/{value=$2; gsub(/^"|"$/,"",value); print value; exit}' /etc/os-release 2>/dev/null)
+        [ -n "$distribution" ] || distribution=$(uname -s)
+        printf 'DISTRIBUTION:%s\nKERNEL:%s\n' "$distribution" "$(uname -r 2>/dev/null)"
+
+        if [ "$(id -u)" -eq 0 ]; then
+          run_privileged() { "$@"; }
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+          run_privileged() { sudo -n "$@"; }
+        else
+          printf 'STATUS:privilege-required\n'
+          exit 4
+        fi
+
+        package_file=$(mktemp /tmp/fleetlight-linux-packages.XXXXXX)
+        metadata_log=$(mktemp /tmp/fleetlight-linux-metadata.XXXXXX)
+        cleanup_linux_check() { rm -f "$package_file" "$package_file.clean" "$metadata_log"; }
+        trap cleanup_linux_check EXIT
+        package_manager=
+        package_count=0
+        security_count=0
+
+        if command -v apt-get >/dev/null 2>&1; then
+          package_manager=apt
+          if ! run_privileged apt-get update >"$metadata_log" 2>&1; then
+            printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
+            exit 5
+          fi
+          apt list --upgradable 2>/dev/null | tail -n +2 >"$package_file"
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          security_count=$(grep -c -- '-security' "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            name=$(printf '%s\n' "$line" | cut -d/ -f1)
+            available=$(printf '%s\n' "$line" | awk '{print $2}')
+            installed=$(printf '%s\n' "$line" | sed -n 's/.*upgradable from: \\([^]]*\\).*/\\1/p')
+            printf 'PACKAGE:%s|%s|%s\n' "$name" "$installed" "$available"
+          done
+        elif command -v dnf >/dev/null 2>&1; then
+          package_manager=dnf
+          if ! run_privileged dnf -q makecache --refresh >"$metadata_log" 2>&1; then
+            printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
+            exit 5
+          fi
+          dnf -q check-update >"$package_file" 2>/dev/null
+          check_status=$?
+          if [ "$check_status" -ne 0 ] && [ "$check_status" -ne 100 ]; then
+            printf 'PKG_MGR:%s\nSTATUS:check-failed\n' "$package_manager"
+            exit 5
+          fi
+          awk 'NF >= 3 && $1 !~ /^(Last|Obsoleting)/ {print}' "$package_file" >"$package_file.clean"
+          mv "$package_file.clean" "$package_file"
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file" | awk '{printf "PACKAGE:%s||%s\n",$1,$3}'
+        elif command -v yum >/dev/null 2>&1; then
+          package_manager=yum
+          run_privileged yum -q makecache >"$metadata_log" 2>&1 || true
+          yum -q check-update >"$package_file" 2>/dev/null
+          check_status=$?
+          if [ "$check_status" -ne 0 ] && [ "$check_status" -ne 100 ]; then
+            printf 'PKG_MGR:%s\nSTATUS:check-failed\n' "$package_manager"
+            exit 5
+          fi
+          awk 'NF >= 3 && $1 !~ /^(Loaded|Loading|Last|Obsoleting)/ {print}' "$package_file" >"$package_file.clean"
+          mv "$package_file.clean" "$package_file"
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file" | awk '{printf "PACKAGE:%s||%s\n",$1,$2}'
+        elif command -v pacman >/dev/null 2>&1; then
+          package_manager=pacman
+          if command -v checkupdates >/dev/null 2>&1; then
+            checkupdates >"$package_file" 2>/dev/null || true
+          else
+            pacman -Qu >"$package_file" 2>/dev/null || true
+          fi
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file" | awk '{printf "PACKAGE:%s|%s|%s\n",$1,$2,$4}'
+        elif command -v zypper >/dev/null 2>&1; then
+          package_manager=zypper
+          if ! run_privileged zypper --non-interactive refresh >"$metadata_log" 2>&1; then
+            printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
+            exit 5
+          fi
+          zypper --non-interactive --no-refresh list-updates >"$package_file" 2>/dev/null || true
+          awk -F'|' '$1 ~ /v/ {for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i)}; printf "PACKAGE:%s|%s|%s\n",$3,$4,$5}' "$package_file" >"$package_file.clean"
+          mv "$package_file.clean" "$package_file"
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file"
+        elif command -v apk >/dev/null 2>&1; then
+          package_manager=apk
+          if ! run_privileged apk update >"$metadata_log" 2>&1; then
+            printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
+            exit 5
+          fi
+          apk version -l '<' >"$package_file" 2>/dev/null || true
+          package_count=$(grep -c . "$package_file" 2>/dev/null || true)
+          head -n 12 "$package_file" | awk '{printf "PACKAGE:%s||%s\n",$1,$3}'
+        else
+          printf 'STATUS:unsupported-package-manager\n'
+          exit 6
+        fi
+
+        printf 'PKG_MGR:%s\nPACKAGE_COUNT:%s\nSECURITY_COUNT:%s\n' "$package_manager" "$package_count" "$security_count"
+
+        snap_count=0
+        if command -v snap >/dev/null 2>&1; then
+          snap refresh --list >"$package_file" 2>/dev/null || true
+          if ! grep -qi 'All snaps up to date' "$package_file"; then
+            snap_count=$(tail -n +2 "$package_file" | grep -c . 2>/dev/null || true)
+          fi
+        fi
+        printf 'SNAP_COUNT:%s\n' "$snap_count"
+
+        flatpak_count=0
+        if command -v flatpak >/dev/null 2>&1; then
+          flatpak_user_count=$(flatpak remote-ls --updates --user --columns=application 2>/dev/null | grep -c . || true)
+          flatpak_system_count=$(flatpak remote-ls --updates --system --columns=application 2>/dev/null | grep -c . || true)
+          flatpak_count=$((flatpak_user_count + flatpak_system_count))
+        fi
+        printf 'FLATPAK_COUNT:%s\n' "$flatpak_count"
+        if [ -f /var/run/reboot-required ]; then printf 'REBOOT:required\n'; else printf 'REBOOT:not-required\n'; fi
+        printf 'STATUS:ok\n'
+        """
+    }
+}
+
+public enum LinuxUpdateCheckParser {
+    public static func snapshot(from result: CommandResult, checkedAt: Date = Date()) -> LinuxUpdateSnapshot {
+        let lines = normalizedLines(result.stdout)
+        let distribution = value(after: "DISTRIBUTION:", in: lines)
+        let kernel = value(after: "KERNEL:", in: lines)
+        let packageManager = value(after: "PKG_MGR:", in: lines)
+
+        if result.timedOut {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Update check timed out")
+        }
+        if isOfflineFailure(result) {
+            return LinuxUpdateSnapshot(state: .offline, checkedAt: checkedAt, detail: offlineDetail(result))
+        }
+        if lines.contains("STATUS:not-linux") {
+            return LinuxUpdateSnapshot(state: .unsupported, distribution: distribution, kernelVersion: kernel, checkedAt: checkedAt, detail: "Machine is not running Linux")
+        }
+        if lines.contains("STATUS:privilege-required") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Passwordless sudo is required")
+        }
+        guard result.exitCode == 0, lines.first == "FLEETLIGHT_LINUX_UPDATE_CHECK", lines.contains("STATUS:ok") else {
+            let error = value(after: "ERROR:", in: lines) ?? value(after: "STATUS:", in: lines) ?? "Update check failed"
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: error.replacingOccurrences(of: "-", with: " ").capitalized)
+        }
+
+        let packageCount = value(after: "PACKAGE_COUNT:", in: lines).flatMap(Int.init) ?? 0
+        let securityCount = value(after: "SECURITY_COUNT:", in: lines).flatMap(Int.init) ?? 0
+        let snapCount = value(after: "SNAP_COUNT:", in: lines).flatMap(Int.init) ?? 0
+        let flatpakCount = value(after: "FLATPAK_COUNT:", in: lines).flatMap(Int.init) ?? 0
+        let packages = lines.compactMap(parsePackage)
+        let rebootRequired = lines.contains("REBOOT:required")
+        let total = packageCount + snapCount + flatpakCount
+        let detail = total == 0 ? "System packages are current" : "\(total) update\(total == 1 ? "" : "s") available"
+
+        return LinuxUpdateSnapshot(
+            state: total > 0 ? .updateAvailable : .current,
+            distribution: distribution,
+            kernelVersion: kernel,
+            packageManager: packageManager,
+            packageUpdateCount: packageCount,
+            securityUpdateCount: securityCount,
+            snapUpdateCount: snapCount,
+            flatpakUpdateCount: flatpakCount,
+            availablePackages: packages,
+            rebootRequired: rebootRequired,
+            checkedAt: checkedAt,
+            detail: detail
+        )
+    }
+
+    private static func parsePackage(_ line: String) -> LinuxPackageUpdate? {
+        guard line.hasPrefix("PACKAGE:") else { return nil }
+        let fields = line.dropFirst("PACKAGE:".count).split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        guard fields.count == 3, !fields[0].isEmpty else { return nil }
+        return LinuxPackageUpdate(name: fields[0], installedVersion: fields[1].isEmpty ? nil : fields[1], availableVersion: fields[2].isEmpty ? nil : fields[2])
+    }
+
+    private static func normalizedLines(_ output: String) -> [String] {
+        output.split(whereSeparator: \Character.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+
+    private static func value(after prefix: String, in lines: [String]) -> String? {
+        guard let line = lines.last(where: { $0.hasPrefix(prefix) }) else { return nil }
+        let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func isOfflineFailure(_ result: CommandResult) -> Bool {
+        if result.exitCode == 255 { return true }
+        let message = (result.stderr + "\n" + result.stdout).lowercased()
+        return message.contains("no ssh route configured")
+            || message.contains("connection refused")
+            || message.contains("connection timed out")
+            || message.contains("operation timed out")
+            || message.contains("no route to host")
+            || message.contains("could not resolve hostname")
+            || message.contains("network is unreachable")
+    }
+
+    private static func offlineDetail(_ result: CommandResult) -> String {
+        let detail = result.stderr.split(whereSeparator: \Character.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.last(where: { !$0.isEmpty })
+        return detail.map { String($0.prefix(120)) } ?? "Machine is offline"
+    }
+}
+
+
+public enum LinuxUpdateStatus: Equatable, Sendable {
+    case succeeded
+    case offline
+    case failed
+}
+
+public struct LinuxUpdateOutcome: Equatable, Sendable {
+    public let status: LinuxUpdateStatus
+    public let rebootRequired: Bool
+    public let detail: String
+
+    public init(status: LinuxUpdateStatus, rebootRequired: Bool, detail: String) {
+        self.status = status
+        self.rebootRequired = rebootRequired
+        self.detail = detail
+    }
+}
+
+public enum LinuxUpdateCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_LINUX_UPDATE\n'
+        if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
+          printf 'UPDATE:not-linux\n'
+          exit 3
+        fi
+
+        if [ "$(id -u)" -eq 0 ]; then
+          run_privileged() { "$@"; }
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+          run_privileged() { sudo -n "$@"; }
+        else
+          printf 'UPDATE:privilege-required\n'
+          exit 4
+        fi
+
+        update_log=$(mktemp /tmp/fleetlight-linux-update.XXXXXX)
+        cleanup_linux_update() { rm -f "$update_log"; }
+        trap cleanup_linux_update EXIT
+        status=0
+
+        if command -v apt-get >/dev/null 2>&1; then
+          package_manager=apt
+          run_privileged apt-get update >"$update_log" 2>&1 \
+            && run_privileged env DEBIAN_FRONTEND=noninteractive apt-get -y -o APT::Get::Always-Include-Phased-Updates=true full-upgrade >>"$update_log" 2>&1 \
+            && run_privileged apt-get -y autoremove >>"$update_log" 2>&1 || status=1
+        elif command -v dnf >/dev/null 2>&1; then
+          package_manager=dnf
+          run_privileged dnf -y upgrade --refresh >"$update_log" 2>&1 || status=1
+        elif command -v yum >/dev/null 2>&1; then
+          package_manager=yum
+          run_privileged yum -y update >"$update_log" 2>&1 || status=1
+        elif command -v pacman >/dev/null 2>&1; then
+          package_manager=pacman
+          run_privileged pacman -Syu --noconfirm >"$update_log" 2>&1 || status=1
+        elif command -v zypper >/dev/null 2>&1; then
+          package_manager=zypper
+          run_privileged zypper --non-interactive refresh >"$update_log" 2>&1 \
+            && run_privileged zypper --non-interactive update >>"$update_log" 2>&1 || status=1
+        elif command -v apk >/dev/null 2>&1; then
+          package_manager=apk
+          run_privileged apk update >"$update_log" 2>&1 \
+            && run_privileged apk upgrade >>"$update_log" 2>&1 || status=1
+        else
+          printf 'UPDATE:unsupported-package-manager\n'
+          exit 5
+        fi
+        printf 'PKG_MGR:%s\n' "$package_manager"
+
+        if command -v snap >/dev/null 2>&1; then
+          snap_ok=0
+          snap_attempt=1
+          while [ "$snap_attempt" -le 3 ]; do
+            if run_privileged snap refresh >>"$update_log" 2>&1; then snap_ok=1; break; fi
+            [ "$snap_attempt" -ge 3 ] || sleep $((snap_attempt * 5))
+            snap_attempt=$((snap_attempt + 1))
+          done
+          [ "$snap_ok" -eq 1 ] || status=1
+        fi
+
+        if command -v flatpak >/dev/null 2>&1; then
+          flatpak_user_ok=0
+          flatpak_attempt=1
+          while [ "$flatpak_attempt" -le 3 ]; do
+            if flatpak update -y --noninteractive --user >>"$update_log" 2>&1; then flatpak_user_ok=1; break; fi
+            [ "$flatpak_attempt" -ge 3 ] || sleep $((flatpak_attempt * 5))
+            flatpak_attempt=$((flatpak_attempt + 1))
+          done
+          [ "$flatpak_user_ok" -eq 1 ] || status=1
+
+          flatpak_system_ok=0
+          flatpak_attempt=1
+          while [ "$flatpak_attempt" -le 3 ]; do
+            if run_privileged flatpak update -y --noninteractive --system >>"$update_log" 2>&1; then flatpak_system_ok=1; break; fi
+            [ "$flatpak_attempt" -ge 3 ] || sleep $((flatpak_attempt * 5))
+            flatpak_attempt=$((flatpak_attempt + 1))
+          done
+          [ "$flatpak_system_ok" -eq 1 ] || status=1
+        fi
+
+        if [ -f /var/run/reboot-required ]; then printf 'REBOOT:required\n'; else printf 'REBOOT:not-required\n'; fi
+        if [ "$status" -eq 0 ]; then printf 'UPDATE:ok\n'; exit 0; fi
+        tail -n 20 "$update_log" 2>/dev/null || true
+        printf 'UPDATE:failed\n'
+        exit 1
+        """
+    }
+}
+
+public enum LinuxUpdateParser {
+    public static func outcome(from result: CommandResult) -> LinuxUpdateOutcome {
+        let lines = result.stdout.split(whereSeparator: \Character.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let rebootRequired = lines.contains("REBOOT:required")
+
+        if result.timedOut {
+            return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Linux update timed out")
+        }
+        if result.exitCode == 255 || result.stderr.lowercased().contains("no route to host") {
+            return LinuxUpdateOutcome(status: .offline, rebootRequired: rebootRequired, detail: "Machine went offline")
+        }
+        if lines.contains("UPDATE:privilege-required") {
+            return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Passwordless sudo is required")
+        }
+        if result.exitCode == 0, lines.contains("UPDATE:ok") {
+            return LinuxUpdateOutcome(status: .succeeded, rebootRequired: rebootRequired, detail: rebootRequired ? "Update completed · restart required" : "Update completed")
+        }
+        if lines.contains("UPDATE:not-linux") {
+            return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Machine is not running Linux")
+        }
+        if lines.contains("UPDATE:unsupported-package-manager") {
+            return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Package manager is not supported")
+        }
+        return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Linux update failed")
+    }
+}
+
 
 public enum CodexUpdatePlanner {
     public static func availableHosts(

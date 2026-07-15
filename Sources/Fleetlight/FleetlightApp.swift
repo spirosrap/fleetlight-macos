@@ -32,7 +32,7 @@ struct FleetlightApp: App {
 private enum PanelSection: String, CaseIterable, Identifiable {
     case fleet = "Fleet"
     case services = "Services"
-    case codex = "Codex"
+    case codex = "Updates"
     case compare = "Compare"
     case trends = "Trends"
     case events = "Events"
@@ -85,6 +85,7 @@ private enum CodexFleetUpdateScope {
 private enum CodexSubview: String, CaseIterable, Identifiable {
     case desktopApp = "Mac App"
     case cli = "CLI"
+    case linux = "Linux"
 
     var id: String { rawValue }
 }
@@ -771,6 +772,317 @@ private struct ServiceDashboardRow: View {
     }
 }
 
+private struct LinuxUpdatesView: View {
+    @ObservedObject var model: FleetModel
+    @State private var pendingHost: FleetHost?
+    @State private var isConfirmingAll = false
+
+    private var isBusy: Bool {
+        model.isAnyUpdateOperationRunning || model.isRefreshing
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Linux system updates")
+                        .font(.headline)
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await model.checkLinuxUpdates() }
+                } label: {
+                    Label(model.isCheckingLinuxUpdates ? "Checking…" : "Check Updates", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isBusy)
+
+                if !model.linuxUpdateAvailableHosts.isEmpty {
+                    Button("Update \(model.linuxUpdateAvailableHosts.count)") {
+                        isConfirmingAll = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isBusy)
+                }
+            }
+            .padding(12)
+
+            HStack(spacing: 6) {
+                SummaryPill(label: "Current", value: "\(model.linuxUpdateSummary.currentCount)", color: .green, isSelected: false)
+                SummaryPill(
+                    label: "Updates",
+                    value: "\(model.linuxUpdateSummary.updateAvailableCount)",
+                    color: model.linuxUpdateSummary.updateAvailableCount > 0 ? .blue : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Offline",
+                    value: "\(model.linuxUpdateSummary.offlineCount)",
+                    color: model.linuxUpdateSummary.offlineCount > 0 ? .red : .secondary,
+                    isSelected: false
+                )
+                SummaryPill(
+                    label: "Unknown",
+                    value: "\(model.linuxUpdateSummary.unavailableCount)",
+                    color: model.linuxUpdateSummary.unavailableCount > 0 ? .orange : .secondary,
+                    isSelected: false
+                )
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            if model.linuxUpdateHosts.isEmpty {
+                ContentUnavailableView(
+                    "No Linux machines",
+                    systemImage: "terminal",
+                    description: Text("Linux machines appear here after detection or when Linux updates are enabled in fleet configuration.")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(model.linuxUpdateHosts) { host in
+                            LinuxMachineUpdateRow(
+                                host: host,
+                                snapshot: model.linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot(),
+                                progress: model.linuxUpdates[host.id],
+                                isBusy: isBusy,
+                                onUpdate: { pendingHost = host }
+                            )
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+        .confirmationDialog(
+            "Update Linux on \(pendingHost?.displayName ?? "this machine")?",
+            isPresented: Binding(
+                get: { pendingHost != nil },
+                set: { if !$0 { pendingHost = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let host = pendingHost {
+                Button("Update \(host.displayName)") {
+                    pendingHost = nil
+                    Task { await model.updateLinux(on: host) }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingHost = nil }
+        } message: {
+            Text("Fleetlight will run the machine’s full system upgrade, then Snap and Flatpak updates where installed. It verifies available updates afterward and never reboots automatically.")
+        }
+        .confirmationDialog(
+            "Update \(model.linuxUpdateAvailableHosts.count) Linux machine\(model.linuxUpdateAvailableHosts.count == 1 ? "" : "s")?",
+            isPresented: $isConfirmingAll,
+            titleVisibility: .visible
+        ) {
+            Button("Update Sequentially") {
+                Task { await model.updateLinuxOnAvailableHosts() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only machines with known available updates will run. Fleetlight processes them one at a time, verifies each result, and does not reboot them.")
+        }
+    }
+
+    private var statusText: String {
+        if model.isUpdatingLinux {
+            return "Updating \(model.linuxUpdateCompletedCount) of \(model.linuxUpdateTotalCount) completed"
+        }
+        if model.isCheckingLinuxUpdates {
+            return "Refreshing package metadata across the Linux fleet…"
+        }
+        if model.linuxUpdateSummary.totalPendingUpdates > 0 {
+            return "\(model.linuxUpdateSummary.totalPendingUpdates) package update\(model.linuxUpdateSummary.totalPendingUpdates == 1 ? "" : "s") available"
+        }
+        if model.linuxUpdateSummary.unavailableCount == model.linuxUpdateHosts.count {
+            return "Check for available system, Snap, and Flatpak versions"
+        }
+        return "No known package updates"
+    }
+}
+
+private struct LinuxMachineUpdateRow: View {
+    let host: FleetHost
+    let snapshot: LinuxUpdateSnapshot
+    let progress: HostLinuxUpdateProgress?
+    let isBusy: Bool
+    let onUpdate: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle().fill(statusColor.opacity(0.15))
+                    Image(systemName: host.systemImage)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(statusColor)
+                }
+                .frame(width: 34, height: 34)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(host.displayName)
+                            .font(.system(size: 13, weight: .semibold))
+                        if snapshot.rebootRequired {
+                            Label("Restart", systemImage: "arrow.clockwise.circle.fill")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    Text(versionDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text(updateDetail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                VStack(alignment: .trailing, spacing: 5) {
+                    Label(statusTitle, systemImage: statusImage)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(statusColor)
+                        .lineLimit(1)
+                    if snapshot.state == .updateAvailable {
+                        Button("Update", action: onUpdate)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                    }
+                }
+            }
+
+            if let progress {
+                Label(progress.detail, systemImage: progressImage)
+                    .font(.caption2)
+                    .foregroundStyle(progressColor)
+                    .lineLimit(2)
+            }
+
+            ForEach(Array(snapshot.availablePackages.prefix(2)), id: \.name) { package in
+                HStack(spacing: 5) {
+                    Image(systemName: "shippingbox")
+                    Text(package.name)
+                        .fontWeight(.medium)
+                    Text(package.versionTransition)
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption2.monospacedDigit())
+                .lineLimit(1)
+            }
+            if snapshot.packageUpdateCount > 2 {
+                Text("Showing 2 of \(snapshot.packageUpdateCount) system package version changes")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            if let checkedAt = snapshot.checkedAt {
+                Label(
+                    "Checked \(checkedAt.formatted(date: .abbreviated, time: .shortened))",
+                    systemImage: "clock"
+                )
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.primary.opacity(0.045))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.primary.opacity(0.06))
+                }
+        )
+    }
+
+    private var versionDetail: String {
+        let distribution = snapshot.distribution ?? "Linux version not checked"
+        return snapshot.kernelVersion.map { "\(distribution) · kernel \($0)" } ?? distribution
+    }
+
+    private var updateDetail: String {
+        if snapshot.state == .notChecked { return snapshot.detail }
+        let manager = snapshot.packageManager?.uppercased() ?? "Packages"
+        return "\(manager) · \(snapshot.packageUpdateCount) system · \(snapshot.snapUpdateCount) Snap · \(snapshot.flatpakUpdateCount) Flatpak"
+    }
+
+    private var statusTitle: String {
+        if progress?.phase == .updating { return "Updating" }
+        return switch snapshot.state {
+        case .notChecked: "Not checked"
+        case .checking: "Checking"
+        case .current: "Current"
+        case .updateAvailable: "\(snapshot.totalUpdateCount) available"
+        case .offline: "Offline"
+        case .unsupported: "Unsupported"
+        case .failed: "Check failed"
+        }
+    }
+
+    private var statusImage: String {
+        if progress?.phase == .updating { return "arrow.triangle.2.circlepath" }
+        return switch snapshot.state {
+        case .notChecked: "questionmark.circle"
+        case .checking: "arrow.clockwise"
+        case .current: "checkmark.circle.fill"
+        case .updateAvailable: "arrow.up.circle.fill"
+        case .offline: "wifi.slash"
+        case .unsupported: "nosign"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        if progress?.phase == .updating { return .blue }
+        return switch snapshot.state {
+        case .notChecked: .secondary
+        case .checking: .blue
+        case .current: .green
+        case .updateAvailable: .blue
+        case .offline: .red
+        case .unsupported: .secondary
+        case .failed: .orange
+        }
+    }
+
+    private var progressImage: String {
+        switch progress?.phase {
+        case .notAttempted: "circle"
+        case .updating: "arrow.triangle.2.circlepath"
+        case .succeeded: "checkmark.circle.fill"
+        case .offline: "wifi.slash"
+        case .failed: "xmark.octagon.fill"
+        case nil: "circle"
+        }
+    }
+
+    private var progressColor: Color {
+        switch progress?.phase {
+        case .notAttempted: .secondary
+        case .updating: .blue
+        case .succeeded: .green
+        case .offline: .orange
+        case .failed: .red
+        case nil: .secondary
+        }
+    }
+}
+
+
 private struct CodexView: View {
     @ObservedObject var model: FleetModel
     let onUpdateAvailable: () -> Void
@@ -784,59 +1096,66 @@ private struct CodexView: View {
         VStack(spacing: 0) {
             VStack(spacing: 8) {
                 HStack(spacing: 10) {
-                    Picker("Codex view", selection: $selectedSubview) {
+                    Picker("Update view", selection: $selectedSubview) {
                         Text("Mac App (\(model.codexDesktopAppHosts.count))").tag(CodexSubview.desktopApp)
                         Text("CLI (\(model.hosts.count))").tag(CodexSubview.cli)
+                        Text("Linux (\(model.linuxUpdateHosts.count))").tag(CodexSubview.linux)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
 
-                    Toggle("Alerts", isOn: Binding(
-                        get: { model.codexUpdateAlertsEnabled },
-                        set: { model.setCodexUpdateAlertsEnabled($0) }
-                    ))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help("Notify once when a new Codex release affects an online machine")
+                    if selectedSubview != .linux {
+                        Toggle("Alerts", isOn: Binding(
+                            get: { model.codexUpdateAlertsEnabled },
+                            set: { model.setCodexUpdateAlertsEnabled($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help("Notify once when a new Codex release affects an online machine")
+                    }
                 }
 
-                HStack(spacing: 10) {
-                    Image(systemName: updateCenterIcon)
-                        .font(.title3)
-                        .foregroundStyle(updateCenterColor)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Update Center")
-                            .font(.subheadline.weight(.semibold))
-                        Text(model.codexUpdateCenterStatusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if model.codexUpdateCenterSummary.totalUpdateCount > 0 {
-                        Button(model.isUpdatingAllCodex ? "Updating…" : "Update All \(model.codexUpdateCenterSummary.totalUpdateCount)") {
-                            isConfirmingUpdateCenter = true
+                if selectedSubview != .linux {
+                    HStack(spacing: 10) {
+                        Image(systemName: updateCenterIcon)
+                            .font(.title3)
+                            .foregroundStyle(updateCenterColor)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Codex Update Center")
+                                .font(.subheadline.weight(.semibold))
+                            Text(model.codexUpdateCenterStatusText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    } else {
-                        Button("Check Both") {
-                            Task { await model.checkAllCodexReleasesNow() }
+                        Spacer()
+                        if model.codexUpdateCenterSummary.totalUpdateCount > 0 {
+                            Button(model.isUpdatingAllCodex ? "Updating…" : "Update All \(model.codexUpdateCenterSummary.totalUpdateCount)") {
+                                isConfirmingUpdateCenter = true
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        } else {
+                            Button("Check Both") {
+                                Task { await model.checkAllCodexReleasesNow() }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
+                    .padding(10)
+                    .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+                    .disabled(model.isRefreshing || model.isAnyUpdateOperationRunning || model.isCheckingCodexRelease || model.isCheckingCodexDesktopAppRelease)
                 }
-                .padding(10)
-                .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
-                .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning || model.isCheckingCodexRelease || model.isCheckingCodexDesktopAppRelease)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
 
             Divider()
 
-            if selectedSubview == .desktopApp {
+            if selectedSubview == .linux {
+                LinuxUpdatesView(model: model)
+            } else if selectedSubview == .desktopApp {
                 desktopAppContent
             } else {
             HStack(spacing: 8) {
@@ -865,13 +1184,13 @@ private struct CodexView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isAnyCodexUpdateRunning)
+                .disabled(model.isCheckingCodexRelease || model.isRefreshing || model.isAnyUpdateOperationRunning)
 
                 if model.codexUpdateAvailableCount > 0 {
                     Button("Update \(model.codexUpdateAvailableCount)", action: onUpdateAvailable)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
+                        .disabled(model.isRefreshing || model.isAnyUpdateOperationRunning)
                 }
             }
             .padding(12)
@@ -917,7 +1236,7 @@ private struct CodexView: View {
                             state: model.codexFleetVersionState(for: host),
                             latestVersion: model.latestCodexVersion,
                             updateProgress: model.codexUpdates[host.id],
-                            isUpdateBusy: model.isAnyCodexUpdateRunning,
+                            isUpdateBusy: model.isAnyUpdateOperationRunning,
                             onUpdate: { Task { await model.updateCodex(on: host) } }
                         )
                     }
@@ -1022,7 +1341,7 @@ private struct CodexView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.isRefreshing || model.isCheckingCodexDesktopAppRelease || model.isAnyCodexUpdateRunning)
+                .disabled(model.isRefreshing || model.isCheckingCodexDesktopAppRelease || model.isAnyUpdateOperationRunning)
 
                 if model.codexDesktopAppReleaseSummary.updateAvailableCount > 0 {
                     Button("Update \(model.codexDesktopAppReleaseSummary.updateAvailableCount)") {
@@ -1030,14 +1349,14 @@ private struct CodexView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
+                    .disabled(model.isRefreshing || model.isAnyUpdateOperationRunning)
                 } else {
                     Button("Check & Update All") {
                         isConfirmingAllDesktopApps = true
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(model.isRefreshing || model.isAnyCodexUpdateRunning)
+                    .disabled(model.isRefreshing || model.isAnyUpdateOperationRunning)
                 }
             }
             .padding(12)
@@ -1089,7 +1408,7 @@ private struct CodexView: View {
                             releaseState: model.codexDesktopAppReleaseState(for: host),
                             latestRelease: model.latestCodexDesktopAppRelease,
                             updateProgress: model.codexDesktopAppUpdates[host.id],
-                            isUpdateBusy: model.isAnyCodexUpdateRunning,
+                            isUpdateBusy: model.isAnyUpdateOperationRunning,
                             onUpdate: { pendingDesktopAppHost = host }
                         )
                     }

@@ -64,6 +64,7 @@ Supported machine fields:
 - `systemImage`: optional SF Symbol name
 - `isLocal`: use a local process instead of SSH; at most one entry may be local
 - `codexDesktopApp`: set to `true` on a macOS host to show its signed Codex/ChatGPT app version and enable app updates
+- `linuxUpdates`: set to `true` on Linux hosts to keep them visible in the Linux Update Center even while offline
 - `services`: optional checks for `tailscale`, `docker`, `plex`, or `samba`
 - `routes`: one or more SSH aliases tried in order
 - `wakeMACAddress`: optional MAC address enabling Wake-on-LAN
@@ -87,6 +88,9 @@ Supported machine fields:
 - Cached checks of OpenAI’s official Codex Mac app feed, with latest version/build details, per-Mac Current or Update Available status, and targeted updates for outdated Macs only
 - Optional one-time macOS alerts when a new Codex CLI or Mac app release affects an online machine, with visible feed-check freshness and per-release deduplication
 - Unified Codex Update Center with concurrent release checks, a combined CLI/Mac app update count, and one confirmed action that runs outdated CLI machines first and Mac app updates second
+- Linux System Update Center with distro and kernel versions, pending system/Snap/Flatpak counts, and installed-to-available package versions
+- Confirmed per-machine updates or restart-safe sequential fleet updates through apt, dnf, yum, pacman, zypper, or apk, followed by availability verification
+- Explicit restart-required results without automatic reboots; Linux checks and updates require non-interactive passwordless sudo on remote hosts
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

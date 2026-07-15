@@ -20,6 +20,12 @@ final class FleetModel: ObservableObject {
     @Published private(set) var isUpdatingAllCodex = false
     @Published private(set) var codexUpdateCompletedCount = 0
     @Published private(set) var codexUpdateTotalCount = 0
+    @Published private(set) var linuxUpdateSnapshots: [String: LinuxUpdateSnapshot] = LinuxUpdateStore.loadSnapshots()
+    @Published private(set) var linuxUpdates: [String: HostLinuxUpdateProgress] = [:]
+    @Published private(set) var isCheckingLinuxUpdates = false
+    @Published private(set) var isUpdatingLinux = false
+    @Published private(set) var linuxUpdateCompletedCount = 0
+    @Published private(set) var linuxUpdateTotalCount = 0
     @Published private(set) var latestCodexVersion: String?
     @Published private(set) var isCheckingCodexRelease = false
     @Published private(set) var codexReleaseCheckFailed = false
@@ -45,6 +51,7 @@ final class FleetModel: ObservableObject {
     private var performanceFailureCounts: [String: Int] = [:]
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
+    private var linuxUpdateBatch: PersistedLinuxUpdateBatch?
     private var codexReleaseCheckedAt: Date?
     private var codexDesktopAppReleaseCheckedAt: Date?
 
@@ -84,6 +91,7 @@ final class FleetModel: ObservableObject {
         codexDesktopAppReleaseCheckFailed = UserDefaults.standard.bool(forKey: "codexDesktopAppReleaseCheckFailed")
         notice = configurationResult.notice
         restoreCodexUpdateBatch()
+        restoreLinuxUpdateBatch()
     }
 
     deinit {
@@ -184,6 +192,26 @@ final class FleetModel: ObservableObject {
 
     var isAnyCodexUpdateRunning: Bool {
         isUpdatingCodex || isUpdatingCodexDesktopApps || isUpdatingAllCodex
+    }
+
+    var linuxUpdateHosts: [FleetHost] {
+        hosts.filter { host in
+            host.supportsLinuxUpdates
+                || snapshots[host.id]?.operatingSystem == "Linux"
+                || linuxUpdateSnapshots[host.id] != nil
+        }
+    }
+
+    var linuxUpdateSummary: LinuxUpdateSummary {
+        LinuxUpdateAnalyzer.summarize(hosts: linuxUpdateHosts, snapshots: linuxUpdateSnapshots)
+    }
+
+    var linuxUpdateAvailableHosts: [FleetHost] {
+        LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: linuxUpdateSnapshots)
+    }
+
+    var isAnyUpdateOperationRunning: Bool {
+        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isUpdatingLinux
     }
 
     var codexUpdateCenterStatusText: String {
@@ -433,13 +461,15 @@ final class FleetModel: ObservableObject {
         await refreshAll()
         if let batch = codexUpdateBatch, batch.finishedAt == nil {
             await resumeCodexUpdateBatch()
-        } else {
-            schedulePolling()
         }
+        if let batch = linuxUpdateBatch, batch.finishedAt == nil {
+            await resumeLinuxUpdateBatch()
+        }
+        if !isAnyUpdateOperationRunning { schedulePolling() }
     }
 
     func refreshAll() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
         isRefreshing = true
         notice = nil
 
@@ -533,6 +563,7 @@ final class FleetModel: ObservableObject {
 
     func checkCodexReleaseNow() async {
         guard !isCheckingCodexRelease else { return }
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -569,6 +600,7 @@ final class FleetModel: ObservableObject {
 
     func checkCodexDesktopAppReleaseNow() async {
         guard !isCheckingCodexDesktopAppRelease else { return }
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
         isCheckingCodexDesktopAppRelease = true
         notice = nil
         applyCodexDesktopAppReleaseResult(await Self.fetchLatestCodexDesktopAppRelease())
@@ -584,7 +616,7 @@ final class FleetModel: ObservableObject {
 
     func checkAllCodexReleasesNow() async {
         guard !isCheckingCodexRelease, !isCheckingCodexDesktopAppRelease else { return }
-        guard !isRefreshing, !isAnyCodexUpdateRunning else {
+        guard !isRefreshing, !isAnyUpdateOperationRunning else {
             notice = "Wait for the current fleet operation to finish"
             return
         }
@@ -613,7 +645,7 @@ final class FleetModel: ObservableObject {
     }
 
     func updateAllAvailableCodex() async {
-        guard !isAnyCodexUpdateRunning else { return }
+        guard !isAnyUpdateOperationRunning else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -654,6 +686,250 @@ final class FleetModel: ObservableObject {
             ? "All \(verified) available Codex update\(verified == 1 ? "" : "s") verified"
             : "Codex Update Center: \(verified) verified · \(problems) need attention"
     }
+
+    func checkLinuxUpdates() async {
+        guard !isCheckingLinuxUpdates, !isUpdatingLinux, !isAnyCodexUpdateRunning else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+        let targets = linuxUpdateHosts
+        guard !targets.isEmpty else {
+            notice = "No Linux update machines are configured"
+            return
+        }
+
+        pollTask?.cancel()
+        isCheckingLinuxUpdates = true
+        notice = "Checking Linux updates on \(targets.count) machine\(targets.count == 1 ? "" : "s")…"
+        for host in targets {
+            let previous = linuxUpdateSnapshots[host.id]
+            linuxUpdateSnapshots[host.id] = LinuxUpdateSnapshot(
+                state: .checking,
+                distribution: previous?.distribution,
+                kernelVersion: previous?.kernelVersion,
+                packageManager: previous?.packageManager,
+                packageUpdateCount: previous?.packageUpdateCount ?? 0,
+                securityUpdateCount: previous?.securityUpdateCount ?? 0,
+                snapUpdateCount: previous?.snapUpdateCount ?? 0,
+                flatpakUpdateCount: previous?.flatpakUpdateCount ?? 0,
+                availablePackages: previous?.availablePackages ?? [],
+                rebootRequired: previous?.rebootRequired ?? false,
+                checkedAt: previous?.checkedAt,
+                detail: "Refreshing package metadata…"
+            )
+        }
+
+        await withTaskGroup(of: (String, LinuxUpdateSnapshot).self) { group in
+            for host in targets {
+                let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+                group.addTask {
+                    let result = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+                    return (host.id, LinuxUpdateCheckParser.snapshot(from: result))
+                }
+            }
+            for await (hostID, snapshot) in group {
+                linuxUpdateSnapshots[hostID] = snapshot
+                await ActivityLogger.shared.append(
+                    event: "linux-update-checked",
+                    host: hostID,
+                    detail: snapshot.detail
+                )
+            }
+        }
+
+        LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+        isCheckingLinuxUpdates = false
+        if started { schedulePolling() }
+        let summary = linuxUpdateSummary
+        notice = summary.updateAvailableCount > 0
+            ? "\(summary.totalPendingUpdates) Linux update\(summary.totalPendingUpdates == 1 ? "" : "s") available on \(summary.updateAvailableCount) machine\(summary.updateAvailableCount == 1 ? "" : "s")"
+            : "Linux update check complete · no known updates"
+    }
+
+    func updateLinux(on host: FleetHost) async {
+        guard linuxUpdateHosts.contains(where: { $0.id == host.id }) else {
+            notice = "Linux updates are not enabled for \(host.displayName)"
+            return
+        }
+        await performLinuxUpdates(on: [host])
+    }
+
+    func updateLinuxOnAvailableHosts() async {
+        if linuxUpdateHosts.contains(where: {
+            let state = linuxUpdateSnapshots[$0.id]?.state ?? .notChecked
+            return state == .notChecked || state == .failed
+        }) {
+            await checkLinuxUpdates()
+        }
+        let targets = linuxUpdateAvailableHosts
+        guard !targets.isEmpty else {
+            notice = "No Linux package updates are available"
+            return
+        }
+        await performLinuxUpdates(on: targets)
+    }
+
+    private func resumeLinuxUpdateBatch() async {
+        guard let batch = linuxUpdateBatch, batch.finishedAt == nil else { return }
+        let targets = batch.targetHostIDs.compactMap { hostID in
+            linuxUpdateHosts.first { $0.id == hostID }
+        }
+        await performLinuxUpdates(on: targets, resuming: true)
+    }
+
+    private func performLinuxUpdates(on targets: [FleetHost], resuming: Bool = false) async {
+        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isAnyCodexUpdateRunning else { return }
+        guard resuming || !targets.isEmpty else { return }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+
+        pollTask?.cancel()
+        isUpdatingLinux = true
+        if resuming, let batch = linuxUpdateBatch {
+            linuxUpdateTotalCount = batch.targetHostIDs.count
+            linuxUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
+            let remaining = max(0, linuxUpdateTotalCount - linuxUpdateCompletedCount)
+            notice = "Resuming Linux updates on \(remaining) machine\(remaining == 1 ? "" : "s")"
+        } else {
+            linuxUpdateTotalCount = targets.count
+            linuxUpdateCompletedCount = 0
+            linuxUpdates = Dictionary(uniqueKeysWithValues: targets.map {
+                ($0.id, HostLinuxUpdateProgress(phase: .notAttempted, detail: "Waiting"))
+            })
+            linuxUpdateBatch = PersistedLinuxUpdateBatch(
+                targetHostIDs: targets.map(\.id),
+                progress: linuxUpdates
+            )
+            persistLinuxUpdateBatch()
+            notice = targets.count == 1
+                ? "Updating Linux on \(targets[0].displayName)"
+                : "Updating Linux sequentially on \(targets.count) machines"
+            if let batch = linuxUpdateBatch {
+                await ActivityLogger.shared.append(
+                    event: "linux-update-started",
+                    detail: "batch=\(batch.id.uuidString); targets=\(targets.count)"
+                )
+            }
+        }
+
+        for host in targets {
+            guard !(linuxUpdates[host.id]?.phase.isTerminal ?? false) else { continue }
+            linuxUpdates[host.id] = HostLinuxUpdateProgress(
+                phase: .updating,
+                detail: "Updating system, Snap, and Flatpak packages…"
+            )
+            persistLinuxUpdateBatch()
+
+            let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+            let updateResult = await Self.runLinuxUpdate(host: host, routeAlias: routeAlias)
+            let outcome = LinuxUpdateParser.outcome(from: updateResult)
+            var phase: HostLinuxUpdatePhase
+            var detail = outcome.detail
+            var event: String
+
+            switch outcome.status {
+            case .succeeded:
+                let verificationResult = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+                let verified = LinuxUpdateCheckParser.snapshot(from: verificationResult)
+                linuxUpdateSnapshots[host.id] = verified
+                LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+                switch verified.state {
+                case .current:
+                    phase = .succeeded
+                    detail = verified.rebootRequired || outcome.rebootRequired
+                        ? "Verified current · restart required"
+                        : "Verified current"
+                    event = "linux-update-succeeded"
+                case .updateAvailable:
+                    phase = .succeeded
+                    detail = "Update completed · \(verified.totalUpdateCount) still available"
+                    if verified.rebootRequired || outcome.rebootRequired {
+                        detail += " · restart required"
+                    }
+                    event = "linux-update-partial"
+                case .offline:
+                    phase = .offline
+                    detail = "Update ran, but verification could not reconnect"
+                    event = "linux-update-verification-offline"
+                case .notChecked, .checking, .unsupported, .failed:
+                    phase = .failed
+                    detail = "Update ran, but verification failed: \(verified.detail)"
+                    event = "linux-update-verification-failed"
+                }
+            case .offline:
+                phase = .offline
+                event = "linux-update-offline"
+            case .failed:
+                phase = .failed
+                event = "linux-update-failed"
+            }
+
+            linuxUpdates[host.id] = HostLinuxUpdateProgress(phase: phase, detail: detail)
+            linuxUpdateCompletedCount += 1
+            persistLinuxUpdateBatch()
+            await ActivityLogger.shared.append(event: event, host: host.id, detail: detail)
+        }
+
+        if var batch = linuxUpdateBatch {
+            batch.finishedAt = Date()
+            batch.progress = linuxUpdates
+            linuxUpdateBatch = batch
+            persistLinuxUpdateBatch()
+        }
+
+        let succeeded = linuxUpdates.values.filter { $0.phase == .succeeded }.count
+        let offline = linuxUpdates.values.filter { $0.phase == .offline }.count
+        let failed = linuxUpdates.values.filter { $0.phase == .failed }.count
+        await ActivityLogger.shared.append(
+            event: "linux-update-finished",
+            detail: "verified=\(succeeded); offline=\(offline); failed=\(failed)"
+        )
+
+        isUpdatingLinux = false
+        if started { schedulePolling() }
+        notice = offline == 0 && failed == 0
+            ? "Linux updates verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
+            : "Linux update: \(succeeded) verified · \(offline) offline · \(failed) failed"
+    }
+
+    private func restoreLinuxUpdateBatch() {
+        guard var batch = LinuxUpdateStore.loadBatch() else { return }
+        let knownHostIDs = Set(hosts.map(\.id))
+        for hostID in batch.targetHostIDs {
+            if !knownHostIDs.contains(hostID) {
+                batch.progress[hostID] = HostLinuxUpdateProgress(
+                    phase: .failed,
+                    detail: "Failed — machine is no longer configured"
+                )
+            } else if batch.progress[hostID]?.phase == .updating {
+                batch.progress[hostID] = HostLinuxUpdateProgress(
+                    phase: .notAttempted,
+                    detail: "Not completed — retrying after restart"
+                )
+            } else if batch.progress[hostID] == nil {
+                batch.progress[hostID] = HostLinuxUpdateProgress(
+                    phase: .notAttempted,
+                    detail: "Not attempted yet"
+                )
+            }
+        }
+        linuxUpdateBatch = batch
+        linuxUpdates = batch.progress
+        linuxUpdateTotalCount = batch.targetHostIDs.count
+        linuxUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
+        LinuxUpdateStore.saveBatch(batch)
+    }
+
+    private func persistLinuxUpdateBatch() {
+        guard var batch = linuxUpdateBatch else { return }
+        batch.progress = linuxUpdates
+        linuxUpdateBatch = batch
+        LinuxUpdateStore.saveBatch(batch)
+    }
+
 
     func updateCodexOnAvailableHosts() async {
         let targets = codexUpdateAvailableHosts
@@ -705,7 +981,7 @@ final class FleetModel: ObservableObject {
     }
 
     private func performCodexDesktopAppUpdates(on targets: [FleetHost]) async {
-        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex else { return }
+        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
         guard !targets.isEmpty else {
             notice = "No macOS Codex desktop app machines are configured"
             return
@@ -786,7 +1062,7 @@ final class FleetModel: ObservableObject {
         resuming: Bool = false,
         preservingProgress: Bool = false
     ) async {
-        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps else { return }
+        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps, !isUpdatingLinux, !isCheckingLinuxUpdates else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -1692,6 +1968,69 @@ final class FleetModel: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    nonisolated private static func runLinuxUpdateCheck(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        await runLinuxCommand(
+            LinuxUpdateCheckCommandBuilder.build(),
+            host: host,
+            routeAlias: routeAlias,
+            timeout: 180
+        )
+    }
+
+    nonisolated private static func runLinuxUpdate(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        await runLinuxCommand(
+            LinuxUpdateCommandBuilder.build(),
+            host: host,
+            routeAlias: routeAlias,
+            timeout: 3_600
+        )
+    }
+
+    nonisolated private static func runLinuxCommand(
+        _ command: String,
+        host: FleetHost,
+        routeAlias: String?,
+        timeout: TimeInterval
+    ) async -> CommandResult {
+        await Task.detached {
+            if host.isLocal {
+                return CommandRunner.run(
+                    executable: "/bin/sh",
+                    arguments: ["-c", command],
+                    timeout: timeout
+                )
+            }
+            guard let routeAlias else {
+                return CommandResult(
+                    exitCode: -1,
+                    stdout: "",
+                    stderr: "No SSH route configured",
+                    elapsedMilliseconds: 0,
+                    timedOut: false
+                )
+            }
+            return CommandRunner.run(
+                executable: "/usr/bin/ssh",
+                arguments: [
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=12",
+                    "-o", "ConnectionAttempts=1",
+                    "-o", "ServerAliveInterval=30",
+                    "-o", "ServerAliveCountMax=3",
+                    routeAlias,
+                    command,
+                ],
+                timeout: timeout
+            )
+        }.value
     }
 
     nonisolated private static func runCodexUpdate(

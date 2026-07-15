@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.22", build: "26") == "v1.22 (26)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.22", build: nil) == "v1.22", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "26") == "Build 26", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.23", build: "27") == "v1.23 (27)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.23", build: nil) == "v1.23", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "27") == "Build 27", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -973,9 +973,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.22 (26)"
+    appVersion: "v1.23 (27)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.22 (26)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.23 (27)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

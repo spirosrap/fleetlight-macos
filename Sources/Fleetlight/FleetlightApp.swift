@@ -772,15 +772,23 @@ private struct ServiceDashboardRow: View {
     }
 }
 
+private enum LinuxConfirmation {
+    case updateHost(FleetHost)
+    case updateAll
+    case restartHost(FleetHost)
+    case restartAll
+}
+
 private struct LinuxUpdatesView: View {
     @ObservedObject var model: FleetModel
-    @State private var pendingHost: FleetHost?
-    @State private var pendingRestartHost: FleetHost?
-    @State private var isConfirmingAll = false
-    @State private var isConfirmingAllRestarts = false
+    @State private var pendingConfirmation: LinuxConfirmation?
 
     private var isBusy: Bool {
         model.isAnyUpdateOperationRunning || model.isRefreshing
+    }
+
+    private var isRestartBusy: Bool {
+        model.isAnyUpdateOperationRunning
     }
 
     var body: some View {
@@ -805,7 +813,7 @@ private struct LinuxUpdatesView: View {
 
                 if !model.linuxUpdateAvailableHosts.isEmpty {
                     Button("Update \(model.linuxUpdateAvailableHosts.count)") {
-                        isConfirmingAll = true
+                        pendingConfirmation = .updateAll
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
@@ -814,12 +822,12 @@ private struct LinuxUpdatesView: View {
 
                 if !model.linuxRestartRequiredHosts.isEmpty {
                     Button("Restart \(model.linuxRestartRequiredHosts.count)") {
-                        isConfirmingAllRestarts = true
+                        pendingConfirmation = .restartAll
                     }
                     .buttonStyle(.bordered)
                     .tint(.orange)
                     .controlSize(.small)
-                    .disabled(isBusy)
+                    .disabled(isRestartBusy)
                 }
             }
             .padding(12)
@@ -873,8 +881,9 @@ private struct LinuxUpdatesView: View {
                                 progress: model.linuxUpdates[host.id],
                                 restartProgress: model.linuxRestarts[host.id],
                                 isBusy: isBusy,
-                                onUpdate: { pendingHost = host },
-                                onRestart: { pendingRestartHost = host }
+                                isRestartBusy: isRestartBusy,
+                                onUpdate: { pendingConfirmation = .updateHost(host) },
+                                onRestart: { pendingConfirmation = .restartHost(host) }
                             )
                         }
                     }
@@ -883,64 +892,70 @@ private struct LinuxUpdatesView: View {
             }
         }
         .confirmationDialog(
-            "Update Linux on \(pendingHost?.displayName ?? "this machine")?",
+            confirmationTitle,
             isPresented: Binding(
-                get: { pendingHost != nil },
-                set: { if !$0 { pendingHost = nil } }
+                get: { pendingConfirmation != nil },
+                set: { if !$0 { pendingConfirmation = nil } }
             ),
             titleVisibility: .visible
         ) {
-            if let host = pendingHost {
+            switch pendingConfirmation {
+            case let .updateHost(host):
                 Button("Update \(host.displayName)") {
-                    pendingHost = nil
+                    pendingConfirmation = nil
                     Task { await model.updateLinux(on: host) }
                 }
-            }
-            Button("Cancel", role: .cancel) { pendingHost = nil }
-        } message: {
-            Text("Fleetlight will run the machine’s full system upgrade, then Snap and Flatpak updates where installed. It verifies available updates afterward and never reboots automatically.")
-        }
-        .confirmationDialog(
-            "Update \(model.linuxUpdateAvailableHosts.count) Linux machine\(model.linuxUpdateAvailableHosts.count == 1 ? "" : "s")?",
-            isPresented: $isConfirmingAll,
-            titleVisibility: .visible
-        ) {
-            Button("Update Sequentially") {
-                Task { await model.updateLinuxOnAvailableHosts() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Only machines with known available updates will run. Fleetlight processes them one at a time, verifies each result, and does not reboot them.")
-        }
-        .confirmationDialog(
-            "Restart Linux on \(pendingRestartHost?.displayName ?? "this machine")?",
-            isPresented: Binding(
-                get: { pendingRestartHost != nil },
-                set: { if !$0 { pendingRestartHost = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            if let host = pendingRestartHost {
+            case .updateAll:
+                Button("Update Sequentially") {
+                    pendingConfirmation = nil
+                    Task { await model.updateLinuxOnAvailableHosts() }
+                }
+            case let .restartHost(host):
                 Button("Restart \(host.displayName)", role: .destructive) {
-                    pendingRestartHost = nil
+                    pendingConfirmation = nil
                     Task { await model.restartLinux(on: host) }
                 }
+            case .restartAll:
+                Button("Restart Sequentially", role: .destructive) {
+                    pendingConfirmation = nil
+                    Task { await model.restartLinuxOnRequiredHosts() }
+                }
+            case nil:
+                EmptyView()
             }
-            Button("Cancel", role: .cancel) { pendingRestartHost = nil }
+            Button("Cancel", role: .cancel) { pendingConfirmation = nil }
         } message: {
-            Text("Active work and services on this machine will be interrupted. Fleetlight will issue the restart, wait for SSH to go offline and return, then recheck whether Linux still requests another restart.")
+            Text(confirmationMessage)
         }
-        .confirmationDialog(
-            "Restart \(model.linuxRestartRequiredHosts.count) Linux machine\(model.linuxRestartRequiredHosts.count == 1 ? "" : "s")?",
-            isPresented: $isConfirmingAllRestarts,
-            titleVisibility: .visible
-        ) {
-            Button("Restart Sequentially", role: .destructive) {
-                Task { await model.restartLinuxOnRequiredHosts() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Only machines currently reporting Restart Required will restart. Fleetlight handles them one at a time and verifies each machine returns before continuing.")
+    }
+
+    private var confirmationTitle: String {
+        switch pendingConfirmation {
+        case let .updateHost(host):
+            "Update Linux on \(host.displayName)?"
+        case .updateAll:
+            "Update \(model.linuxUpdateAvailableHosts.count) Linux machine\(model.linuxUpdateAvailableHosts.count == 1 ? "" : "s")?"
+        case let .restartHost(host):
+            "Restart Linux on \(host.displayName)?"
+        case .restartAll:
+            "Restart \(model.linuxRestartRequiredHosts.count) Linux machine\(model.linuxRestartRequiredHosts.count == 1 ? "" : "s")?"
+        case nil:
+            "Confirm Linux operation"
+        }
+    }
+
+    private var confirmationMessage: String {
+        switch pendingConfirmation {
+        case .updateHost:
+            "Fleetlight will run the machine’s full system upgrade, then Snap and Flatpak updates where installed. It verifies available updates afterward and never reboots automatically."
+        case .updateAll:
+            "Only machines with known available updates will run. Fleetlight processes them one at a time, verifies each result, and does not reboot them."
+        case .restartHost:
+            "Active work and services on this machine will be interrupted. Fleetlight will issue the restart, wait for SSH to go offline and return, then recheck whether Linux still requests another restart."
+        case .restartAll:
+            "Only machines currently reporting Restart Required will restart. Fleetlight handles them one at a time and verifies each machine returns before continuing."
+        case nil:
+            ""
         }
     }
 
@@ -970,6 +985,7 @@ private struct LinuxMachineUpdateRow: View {
     let progress: HostLinuxUpdateProgress?
     let restartProgress: HostLinuxRestartProgress?
     let isBusy: Bool
+    let isRestartBusy: Bool
     let onUpdate: () -> Void
     let onRestart: () -> Void
 
@@ -1022,7 +1038,7 @@ private struct LinuxMachineUpdateRow: View {
                             .buttonStyle(.bordered)
                             .tint(.orange)
                             .controlSize(.small)
-                            .disabled(isBusy)
+                            .disabled(isRestartBusy)
                     }
                 }
             }

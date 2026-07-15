@@ -957,13 +957,21 @@ final class FleetModel: ObservableObject {
 
     private func performLinuxRestarts(on targets: [FleetHost]) async {
         guard !isAnyUpdateOperationRunning, !targets.isEmpty else { return }
-        guard !isRefreshing else {
-            notice = "Wait for the current fleet check to finish"
-            return
-        }
-
         pollTask?.cancel()
         isRestartingLinux = true
+        if isRefreshing {
+            notice = "Finishing the current fleet check before restarting…"
+            let refreshDeadline = Date().addingTimeInterval(30)
+            while isRefreshing, Date() < refreshDeadline {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            guard !isRefreshing else {
+                isRestartingLinux = false
+                if started { schedulePolling() }
+                notice = "The fleet check is still running · try Restart again"
+                return
+            }
+        }
         linuxRestartTotalCount = targets.count
         linuxRestartCompletedCount = 0
         linuxRestarts = Dictionary(uniqueKeysWithValues: targets.map {

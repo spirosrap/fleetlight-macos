@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.27", build: "31") == "v1.27 (31)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.27", build: nil) == "v1.27", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "31") == "Build 31", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.28", build: "32") == "v1.28 (32)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.28", build: nil) == "v1.28", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "32") == "Build 32", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -461,9 +461,11 @@ test.require(availableLinuxSnapshot.securityUpdateCount == 1, "Linux checks shou
 test.require(availableLinuxSnapshot.availablePackages.first?.versionTransition == "8.5.0-2ubuntu10.6 → 8.5.0-2ubuntu10.7", "Linux checks should show installed and available package versions")
 test.require(availableLinuxSnapshot.rebootRequired, "Linux checks should surface reboot-required state")
 test.require(availableLinuxSnapshot.checkedAt == linuxCheckedAt, "Linux checks should retain freshness timestamps")
+test.require(availableLinuxSnapshot.restartCheckedAt == linuxCheckedAt, "Linux package checks should timestamp their restart verification")
 let reconciledLinuxSnapshot = availableLinuxSnapshot.replacingRebootRequired(false)
 test.require(!reconciledLinuxSnapshot.rebootRequired, "live restart reconciliation should clear a stale restart flag")
 test.require(reconciledLinuxSnapshot.totalUpdateCount == availableLinuxSnapshot.totalUpdateCount && reconciledLinuxSnapshot.checkedAt == availableLinuxSnapshot.checkedAt, "restart reconciliation should preserve package details and check freshness")
+test.require(reconciledLinuxSnapshot.restartCheckedAt == linuxCheckedAt, "restart reconciliation should preserve an existing verification timestamp when no newer time is supplied")
 test.require(LinuxRestartDetailReconciler.clearingRestartRequirement(from: "Verified current · restart required") == "Verified current", "restart reconciliation should clear stale update progress wording")
 test.require(LinuxRestartDetailReconciler.clearingRestartRequirement(from: "Update completed · 2 still available · restart required") == "Update completed · 2 still available", "restart reconciliation should clear a restart suffix while preserving update detail")
 test.require(LinuxRestartDetailReconciler.clearingRestartRequirement(from: "Restart verified · Linux still requests another restart") == "Restart verified · machine is back online", "restart reconciliation should correct a stale repeated-restart result")
@@ -477,6 +479,14 @@ let currentLinuxCheck = CommandResult(
 )
 let currentLinuxSnapshot = LinuxUpdateCheckParser.snapshot(from: currentLinuxCheck)
 test.require(currentLinuxSnapshot.state == .current, "zero pending packages should report a current Linux machine")
+let liveRestartCheckedAt = Date(timeIntervalSince1970: 1_720_000_600)
+let newlyRequiredLinuxSnapshot = currentLinuxSnapshot.replacingRebootRequired(true, checkedAt: liveRestartCheckedAt)
+test.require(newlyRequiredLinuxSnapshot.rebootRequired && newlyRequiredLinuxSnapshot.restartCheckedAt == liveRestartCheckedAt, "lightweight checks should detect and timestamp a new restart requirement")
+test.require(newlyRequiredLinuxSnapshot.checkedAt == currentLinuxSnapshot.checkedAt && newlyRequiredLinuxSnapshot.totalUpdateCount == currentLinuxSnapshot.totalUpdateCount, "lightweight restart checks should not rewrite package freshness or counts")
+
+let legacyLinuxSnapshotJSON = Data(#"{"state":"current","distribution":"Linux","kernelVersion":"6.8","packageManager":"apt","packageUpdateCount":0,"securityUpdateCount":0,"snapUpdateCount":0,"flatpakUpdateCount":0,"availablePackages":[],"rebootRequired":false,"checkedAt":0,"detail":"System packages are current"}"#.utf8)
+let legacyLinuxSnapshot = try? JSONDecoder().decode(LinuxUpdateSnapshot.self, from: legacyLinuxSnapshotJSON)
+test.require(legacyLinuxSnapshot != nil && legacyLinuxSnapshot?.restartCheckedAt == nil, "saved Linux snapshots from earlier Fleetlight versions should remain readable")
 
 let offlineLinuxCheck = CommandResult(
     exitCode: 255,
@@ -1011,9 +1021,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.27 (31)"
+    appVersion: "v1.28 (32)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.27 (31)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.28 (32)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

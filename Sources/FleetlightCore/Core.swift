@@ -2460,6 +2460,7 @@ public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
     public let flatpakUpdateCount: Int
     public let availablePackages: [LinuxPackageUpdate]
     public let rebootRequired: Bool
+    public let restartCheckedAt: Date?
     public let checkedAt: Date?
     public let detail: String
 
@@ -2478,6 +2479,7 @@ public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
         flatpakUpdateCount: Int = 0,
         availablePackages: [LinuxPackageUpdate] = [],
         rebootRequired: Bool = false,
+        restartCheckedAt: Date? = nil,
         checkedAt: Date? = nil,
         detail: String = "Updates have not been checked"
     ) {
@@ -2491,11 +2493,12 @@ public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
         self.flatpakUpdateCount = flatpakUpdateCount
         self.availablePackages = availablePackages
         self.rebootRequired = rebootRequired
+        self.restartCheckedAt = restartCheckedAt
         self.checkedAt = checkedAt
         self.detail = detail
     }
 
-    public func replacingRebootRequired(_ rebootRequired: Bool) -> LinuxUpdateSnapshot {
+    public func replacingRebootRequired(_ rebootRequired: Bool, checkedAt restartCheckedAt: Date? = nil) -> LinuxUpdateSnapshot {
         LinuxUpdateSnapshot(
             state: state,
             distribution: distribution,
@@ -2507,6 +2510,7 @@ public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
             flatpakUpdateCount: flatpakUpdateCount,
             availablePackages: availablePackages,
             rebootRequired: rebootRequired,
+            restartCheckedAt: restartCheckedAt ?? self.restartCheckedAt,
             checkedAt: checkedAt,
             detail: detail
         )
@@ -2759,6 +2763,7 @@ public enum LinuxUpdateCheckParser {
             flatpakUpdateCount: flatpakCount,
             availablePackages: packages,
             rebootRequired: rebootRequired,
+            restartCheckedAt: checkedAt,
             checkedAt: checkedAt,
             detail: detail
         )

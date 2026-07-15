@@ -555,24 +555,24 @@ final class FleetModel: ObservableObject {
 
     private func reconcileLinuxRestartRequirements() async {
         reconcileClearedRestartDetails()
-        let targets = linuxRestartRequiredHosts.filter {
+        let targets = linuxUpdateHosts.filter {
             snapshots[$0.id]?.state == .online
         }
         guard !targets.isEmpty else { return }
 
         let results = await withTaskGroup(
-            of: (String, LinuxRestartRequirementOutcome).self,
-            returning: [(String, LinuxRestartRequirementOutcome)].self
+            of: (String, LinuxRestartRequirementOutcome, Date).self,
+            returning: [(String, LinuxRestartRequirementOutcome, Date)].self
         ) { group in
             for host in targets {
                 let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
                 group.addTask {
                     let result = await Self.runLinuxRestartRequirementCheck(host: host, routeAlias: routeAlias)
-                    return (host.id, LinuxRestartRequirementParser.outcome(from: result))
+                    return (host.id, LinuxRestartRequirementParser.outcome(from: result), Date())
                 }
             }
 
-            var values: [(String, LinuxRestartRequirementOutcome)] = []
+            var values: [(String, LinuxRestartRequirementOutcome, Date)] = []
             for await value in group {
                 values.append(value)
             }
@@ -580,23 +580,45 @@ final class FleetModel: ObservableObject {
         }
 
         var reconciledSnapshots = linuxUpdateSnapshots
-        var changedHostIDs: [String] = []
-        for (hostID, outcome) in results where outcome.status == .notRequired {
-            guard let cached = reconciledSnapshots[hostID], cached.rebootRequired else { continue }
-            reconciledSnapshots[hostID] = cached.replacingRebootRequired(false)
-            changedHostIDs.append(hostID)
-            await ActivityLogger.shared.append(
-                event: "linux-restart-requirement-cleared",
-                host: hostID,
-                detail: "Live reboot flag is no longer present"
-            )
+        var clearedHostIDs: Set<String> = []
+        var snapshotsChanged = false
+        for (hostID, outcome, restartCheckedAt) in results {
+            let rebootRequired: Bool
+            switch outcome.status {
+            case .required: rebootRequired = true
+            case .notRequired: rebootRequired = false
+            case .offline, .unsupported, .failed: continue
+            }
+
+            let cached = reconciledSnapshots[hostID] ?? LinuxUpdateSnapshot()
+            let updated = cached.replacingRebootRequired(rebootRequired, checkedAt: restartCheckedAt)
+            if updated != cached {
+                reconciledSnapshots[hostID] = updated
+                snapshotsChanged = true
+            }
+
+            guard cached.rebootRequired != rebootRequired else { continue }
+            if rebootRequired {
+                await ActivityLogger.shared.append(
+                    event: "linux-restart-requirement-detected",
+                    host: hostID,
+                    detail: "Live reboot flag is present"
+                )
+            } else {
+                clearedHostIDs.insert(hostID)
+                await ActivityLogger.shared.append(
+                    event: "linux-restart-requirement-cleared",
+                    host: hostID,
+                    detail: "Live reboot flag is no longer present"
+                )
+            }
         }
-        if !changedHostIDs.isEmpty {
-            // Publish one complete replacement so an open menu popover cannot
-            // retain a row rendered from the previous dictionary value.
+        if snapshotsChanged {
             linuxUpdateSnapshots = reconciledSnapshots
             LinuxUpdateStore.saveSnapshots(reconciledSnapshots)
-            reconcileClearedRestartDetails(for: Set(changedHostIDs))
+        }
+        if !clearedHostIDs.isEmpty {
+            reconcileClearedRestartDetails(for: clearedHostIDs)
         }
     }
 
@@ -813,6 +835,7 @@ final class FleetModel: ObservableObject {
                 flatpakUpdateCount: previous?.flatpakUpdateCount ?? 0,
                 availablePackages: previous?.availablePackages ?? [],
                 rebootRequired: previous?.rebootRequired ?? false,
+                restartCheckedAt: previous?.restartCheckedAt,
                 checkedAt: previous?.checkedAt,
                 detail: "Refreshing package metadata…"
             )

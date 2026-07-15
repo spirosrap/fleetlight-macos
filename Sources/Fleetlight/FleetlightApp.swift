@@ -1134,6 +1134,12 @@ private struct LinuxMachineUpdateRow: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             }
+            if let restartCheckedAt = snapshot.restartCheckedAt {
+                LinuxRestartVerificationLabel(
+                    rebootRequired: snapshot.rebootRequired,
+                    checkedAt: restartCheckedAt
+                )
+            }
         }
         .padding(10)
         .background(
@@ -1255,6 +1261,27 @@ private struct LinuxMachineUpdateRow: View {
         case .failed: .red
         case nil: .secondary
         }
+    }
+}
+
+private struct LinuxRestartVerificationLabel: View {
+    let rebootRequired: Bool
+    let checkedAt: Date
+
+    var body: some View {
+        Label(detail, systemImage: systemImage)
+            .font(.caption2)
+            .foregroundStyle(rebootRequired ? Color.orange : Color.secondary)
+    }
+
+    private var detail: String {
+        let status = rebootRequired ? "Restart required" : "No restart required"
+        let timestamp = checkedAt.formatted(date: .abbreviated, time: .shortened)
+        return "\(status) · verified \(timestamp)"
+    }
+
+    private var systemImage: String {
+        rebootRequired ? "arrow.clockwise.circle.fill" : "checkmark.circle"
     }
 }
 

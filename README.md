@@ -92,7 +92,7 @@ Supported machine fields:
 - Confirmed per-machine updates or restart-safe sequential fleet updates through apt, dnf, yum, pacman, zypper, or apk, followed by availability verification
 - Explicit restart-required results without automatic reboots; Linux checks, updates, and user-confirmed restarts require non-interactive passwordless sudo on remote hosts
 - Confirmed per-machine and sequential Restart Required actions that wait for shutdown, verify SSH recovery or a changed boot time, and recheck the Linux restart flag
-- Live restart reconciliation during normal fleet refreshes so multiple Fleetlight observers clear stale Restart Required badges and completed-operation wording after another observer reboots a machine, with an explicit model publication that refreshes an already-open popover
+- Bidirectional live restart verification during every normal fleet refresh, so multiple Fleetlight observers detect new restart requirements, clear stale badges and completed-operation wording, and show when each restart status was verified
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

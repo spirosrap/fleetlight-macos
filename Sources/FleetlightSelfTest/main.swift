@@ -268,6 +268,42 @@ test.require(CodexReleaseChecker.isUpdateAvailable(installedVersion: "0.145.0-al
 test.require(!CodexReleaseChecker.isUpdateAvailable(installedVersion: "Not installed", latestVersion: "0.144.3"), "non-version installation states should not produce false update badges")
 test.require(CodexReleaseChecker.isComparableVersion("codex-cli 0.144.3"), "reported Codex CLI versions should be recognized as comparable")
 test.require(!CodexReleaseChecker.isComparableVersion("Unavailable"), "non-version Codex states should not be treated as comparable")
+test.require(
+    CodexUpdateFailureReconciler.verifiedCurrentDetail(
+        installedVersion: "0.144.3",
+        latestVersion: "0.144.3",
+        isOnline: true,
+        releaseCheckFailed: false
+    ) == "Codex 0.144.3 is current · prior update warning cleared",
+    "a live current Codex version should clear a stale update failure"
+)
+test.require(
+    CodexUpdateFailureReconciler.verifiedCurrentDetail(
+        installedVersion: "0.144.2",
+        latestVersion: "0.144.3",
+        isOnline: true,
+        releaseCheckFailed: false
+    ) == nil,
+    "an outdated Codex version must keep its update failure"
+)
+test.require(
+    CodexUpdateFailureReconciler.verifiedCurrentDetail(
+        installedVersion: "0.144.3",
+        latestVersion: "0.144.3",
+        isOnline: false,
+        releaseCheckFailed: false
+    ) == nil,
+    "an offline machine must not clear an update failure"
+)
+test.require(
+    CodexUpdateFailureReconciler.verifiedCurrentDetail(
+        installedVersion: "0.144.3",
+        latestVersion: "0.144.3",
+        isOnline: true,
+        releaseCheckFailed: true
+    ) == nil,
+    "a failed release check must not clear an update failure from stale release data"
+)
 
 let codexPlannerHosts = [
     FleetHost(id: "outdated", displayName: "Outdated", systemImage: "desktopcomputer"),

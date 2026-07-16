@@ -592,6 +592,7 @@ final class FleetModel: ObservableObject {
         if let appReleaseTask {
             applyCodexDesktopAppReleaseResult(await appReleaseTask.value)
         }
+        await reconcileCodexUpdateFailuresVerifiedCurrent()
         await postCodexUpdateAlertsIfNeeded()
         historySamples = await MetricHistoryStore.shared.append(snapshots: snapshots, recentHours: 7 * 24)
         lastRefresh = Date()
@@ -890,6 +891,7 @@ final class FleetModel: ObservableObject {
         isCheckingCodexRelease = true
         notice = nil
         applyCodexReleaseResult(await Self.fetchLatestCodexRelease())
+        await reconcileCodexUpdateFailuresVerifiedCurrent()
         await postCodexUpdateAlertsIfNeeded()
         if codexReleaseCheckFailed {
             notice = "Couldn’t check the latest Codex version"
@@ -949,6 +951,7 @@ final class FleetModel: ObservableObject {
         let appcastXML = await appcastTask
         applyCodexReleaseResult(registryJSON)
         applyCodexDesktopAppReleaseResult(appcastXML)
+        await reconcileCodexUpdateFailuresVerifiedCurrent()
         await postCodexUpdateAlertsIfNeeded()
 
         let failedChecks = (codexReleaseCheckFailed ? 1 : 0) + (codexDesktopAppReleaseCheckFailed ? 1 : 0)
@@ -1714,6 +1717,37 @@ final class FleetModel: ObservableObject {
         codexUpdateTotalCount = batch.targetHostIDs.count
         codexUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
         CodexUpdateBatchStore.save(batch)
+    }
+
+    private func reconcileCodexUpdateFailuresVerifiedCurrent() async {
+        guard !codexUpdates.isEmpty else { return }
+
+        var reconciledUpdates = codexUpdates
+        var reconciled: [(hostID: String, detail: String)] = []
+        for (hostID, progress) in codexUpdates {
+            guard progress.phase == .failed || progress.phase == .offline,
+                  let snapshot = snapshots[hostID],
+                  let detail = CodexUpdateFailureReconciler.verifiedCurrentDetail(
+                    installedVersion: snapshot.codexVersion,
+                    latestVersion: latestCodexVersion,
+                    isOnline: snapshot.state == .online,
+                    releaseCheckFailed: codexReleaseCheckFailed
+                  ) else { continue }
+            reconciledUpdates[hostID] = HostCodexUpdateProgress(phase: .succeeded, detail: detail)
+            reconciled.append((hostID, detail))
+        }
+
+        guard !reconciled.isEmpty else { return }
+        codexUpdates = reconciledUpdates
+        codexUpdateCompletedCount = reconciledUpdates.values.filter { $0.phase.isTerminal }.count
+        persistCodexUpdateBatch()
+        for result in reconciled {
+            await ActivityLogger.shared.append(
+                event: "codex-update-failure-reconciled",
+                host: result.hostID,
+                detail: result.detail
+            )
+        }
     }
 
     private func persistCodexUpdateBatch() {

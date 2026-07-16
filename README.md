@@ -102,6 +102,7 @@ Supported machine fields:
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary
 - Smart Codex updates that target only outdated online machines by default, with a manual latest-version check and an explicit Update All override
 - Persistent Codex update results with separate verified, offline, and failed totals plus reachable-only retries that keep unresolved machines listed
+- Automatic reconciliation of saved Codex update failures after a fresh online probe and successful release check verify that the installed CLI is current
 - Confirmed one-click Codex updates across the fleet, with restart-safe resume, sequential progress, version verification, and individual update actions
 - Clear Codex update outcomes for not-yet-attempted, offline, failed, and verified machines, including shell-wrapper-aware updates
 - Configurable performance-warning thresholds

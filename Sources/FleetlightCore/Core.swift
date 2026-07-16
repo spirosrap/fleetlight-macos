@@ -2418,6 +2418,27 @@ public enum CodexReleaseChecker {
     }
 }
 
+public enum CodexUpdateFailureReconciler {
+    public static func verifiedCurrentDetail(
+        installedVersion: String?,
+        latestVersion: String?,
+        isOnline: Bool,
+        releaseCheckFailed: Bool
+    ) -> String? {
+        guard isOnline,
+              !releaseCheckFailed,
+              let installedVersion,
+              CodexReleaseChecker.isComparableVersion(installedVersion),
+              CodexReleaseChecker.isComparableVersion(latestVersion),
+              !CodexReleaseChecker.isUpdateAvailable(
+                installedVersion: installedVersion,
+                latestVersion: latestVersion
+              ) else { return nil }
+
+        return "Codex \(installedVersion) is current · prior update warning cleared"
+    }
+}
+
 public struct LinuxPackageUpdate: Codable, Equatable, Sendable {
     public let name: String
     public let installedVersion: String?

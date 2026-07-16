@@ -2490,7 +2490,12 @@ private struct TrendsView: View {
 
     private var chartSamples: [MetricSample] {
         guard let host else { return [] }
-        return model.chartSamples(for: host.id, hours: selectedRange.hours, maxPoints: 600)
+        return model.chartSamples(for: host.id, hours: selectedRange.hours, maxPoints: 360)
+    }
+
+    private var statistics: HistorySummary {
+        guard let host else { return HistoryAnalyzer.summary(samples: []) }
+        return model.historySummary(for: host.id, hours: selectedRange.hours)
     }
 
     private var axisMarkCount: Int {
@@ -2515,10 +2520,7 @@ private struct TrendsView: View {
 
     private var selectedSample: MetricSample? {
         guard let selectedTimestamp else { return samples.last }
-        return samples.min {
-            abs($0.timestamp.timeIntervalSince(selectedTimestamp))
-                < abs($1.timestamp.timeIntervalSince(selectedTimestamp))
-        }
+        return HistoryAnalyzer.nearestSample(to: selectedTimestamp, in: samples)
     }
 
     var body: some View {
@@ -2544,7 +2546,7 @@ private struct TrendsView: View {
 
             if let host {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         trendSummary(for: host)
                         latestComparison
 
@@ -2583,7 +2585,8 @@ private struct TrendsView: View {
     }
 
     private func trendSummary(for host: FleetHost) -> some View {
-        let availability = HistoryAnalyzer.availabilityPercent(samples: samples)
+        let summary = statistics
+        let availability = summary.availabilityPercent
         let snapshot = model.snapshots[host.id] ?? HostSnapshot()
         let health = HealthScorer.score(
             snapshot: snapshot,
@@ -2604,34 +2607,34 @@ private struct TrendsView: View {
             if !host.isLocal {
                 TrendStatCard(
                     title: "Avg ping",
-                    value: HistoryAnalyzer.averagePingMilliseconds(samples: samples).map { String(format: "%.0f ms", $0) } ?? "—",
+                    value: summary.averagePingMilliseconds.map { String(format: "%.0f ms", $0) } ?? "—",
                     systemImage: "arrow.left.and.right"
                 )
                 TrendStatCard(
                     title: "Avg jitter",
-                    value: HistoryAnalyzer.averagePingJitterMilliseconds(samples: samples).map { String(format: "%.0f ms", $0) } ?? "—",
+                    value: summary.averagePingJitterMilliseconds.map { String(format: "%.0f ms", $0) } ?? "—",
                     systemImage: "waveform.path"
                 )
             } else {
                 TrendStatCard(
                     title: "Incidents",
-                    value: "\(HistoryAnalyzer.incidentCount(samples: samples))",
+                    value: "\(summary.incidentCount)",
                     systemImage: "exclamationmark.triangle"
                 )
                 TrendStatCard(
                     title: "Avg checks",
-                    value: HistoryAnalyzer.averageProbeWorkMilliseconds(samples: samples).map { String(format: "%.0f ms", $0) } ?? "—",
+                    value: summary.averageProbeWorkMilliseconds.map { String(format: "%.0f ms", $0) } ?? "—",
                     systemImage: "wrench.and.screwdriver"
                 )
             }
             TrendStatCard(
                 title: host.isLocal ? "Avg process ready" : "Avg SSH ready",
-                value: HistoryAnalyzer.averageConnectionReadyMilliseconds(samples: samples).map { String(format: "%.0f ms", $0) } ?? "—",
+                value: summary.averageConnectionReadyMilliseconds.map { String(format: "%.0f ms", $0) } ?? "—",
                 systemImage: "bolt.horizontal"
             )
             TrendStatCard(
                 title: "Avg full probe",
-                value: HistoryAnalyzer.averageProbeDurationMilliseconds(samples: samples).map { String(format: "%.0f ms", $0) } ?? "—",
+                value: summary.averageProbeDurationMilliseconds.map { String(format: "%.0f ms", $0) } ?? "—",
                 systemImage: "stopwatch"
             )
         }
@@ -2640,21 +2643,22 @@ private struct TrendsView: View {
     @ViewBuilder
     private var latestComparison: some View {
         if let latest = samples.last {
+            let summary = statistics
             let comparisons = [
                 comparisonText(
                     label: "Ping",
                     current: latest.pingMilliseconds,
-                    average: HistoryAnalyzer.averagePingMilliseconds(samples: samples)
+                    average: summary.averagePingMilliseconds
                 ),
                 comparisonText(
                     label: host?.isLocal == true ? "Process" : "SSH",
                     current: latest.connectionReadyMilliseconds,
-                    average: HistoryAnalyzer.averageConnectionReadyMilliseconds(samples: samples)
+                    average: summary.averageConnectionReadyMilliseconds
                 ),
                 comparisonText(
                     label: "Probe",
                     current: latest.effectiveProbeDurationMilliseconds,
-                    average: HistoryAnalyzer.averageProbeDurationMilliseconds(samples: samples)
+                    average: summary.averageProbeDurationMilliseconds
                 ),
             ].compactMap { $0 }
 
@@ -2670,7 +2674,7 @@ private struct TrendsView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
-                    Text("\(samples.count) checks")
+                    Text("\(summary.sampleCount) checks")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }

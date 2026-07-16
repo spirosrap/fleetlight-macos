@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import FleetlightCore
 
@@ -244,12 +245,47 @@ test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should 
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")
 test.require(command.contains("CODEX_APP_VERSION=%s"), "remote command should emit the signed Codex desktop app version on macOS")
 test.require(command.contains("\"$HOME\"/.nvm/versions/node/*/bin/codex"), "remote command should inspect every NVM Codex install with a bounded shallow glob")
+test.require(command.contains("setopt NULL_GLOB"), "remote command should make an unmatched NVM glob safe under zsh")
 test.require(!command.contains("find \"$HOME/.nvm/versions/node\""), "routine probes should not recursively scan the NVM tree")
 test.require(command.contains("!seen[$0]++"), "remote command should avoid probing duplicate Codex paths")
 test.require(command.contains("SERVICE=tailscale"), "remote command should include Tailscale")
 test.require(command.contains("SERVICE=plex"), "remote command should include Plex")
 test.require(command.contains("SERVICE=samba"), "remote command should include Samba")
 test.require(!command.contains("SERVICE=docker"), "remote command should exclude unconfigured services")
+test.require(command.range(of: "SERVICE=tailscale")!.lowerBound < command.range(of: "os=$(uname -s)")!.lowerBound, "service checks should launch before slower platform facts")
+test.require(command.hasSuffix("wait"), "remote command should wait for all concurrent fact and service checks")
+
+let sshArguments = SSHCommandArguments.build(
+    routeAlias: "example-route",
+    command: "printf ready",
+    connectTimeout: 5,
+    serverAliveInterval: 15,
+    serverAliveCountMax: 2
+)
+let sshOptions = sshArguments.joined(separator: " ")
+test.require(Array(sshArguments.suffix(3)) == ["--", "example-route", "printf ready"], "pooled SSH arguments should terminate options and preserve the route and remote command")
+test.require(sshOptions.contains("ControlMaster=auto") && sshOptions.contains("ControlPersist=120"), "routine SSH should reuse a short-lived connection pool")
+test.require(sshOptions.contains("ForwardAgent=no") && sshOptions.contains("ClearAllForwardings=yes"), "background SSH pooling should disable inherited forwarding")
+test.require(sshOptions.contains("ServerAliveInterval=15") && sshOptions.contains("ServerAliveCountMax=2"), "all pooled operations should share safe transport keepalives")
+if let controlPath = SSHMultiplexing.controlPathPattern() {
+    let expandedLength = controlPath.replacingOccurrences(of: "%C", with: String(repeating: "a", count: 40)).utf8.count
+    test.require(expandedLength < 104, "the expanded SSH control socket path should remain below the macOS limit")
+    let directory = URL(fileURLWithPath: controlPath).deletingLastPathComponent().path
+    let attributes = try FileManager.default.attributesOfItem(atPath: directory)
+    test.require(attributes[.type] as? FileAttributeType == .typeDirectory, "the SSH control path should use a real directory")
+    test.require((attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(), "the SSH control directory should belong to the running user")
+    test.require((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700, "the SSH control directory should be private")
+}
+let unpooledSSH = SSHCommandArguments.build(
+    routeAlias: "example-route",
+    command: "true",
+    connectTimeout: 5,
+    serverAliveInterval: 15,
+    serverAliveCountMax: 2,
+    multiplex: false
+)
+test.require(unpooledSSH.joined(separator: " ").contains("ControlMaster=no"), "unpooled operations should override user SSH multiplexing settings")
+test.require(!unpooledSSH.joined(separator: " ").contains("ControlMaster=auto"), "unpooled operations should never join Fleetlight's connection pool")
 
 let noCodexResult = CommandResult(
     exitCode: 0,
@@ -946,6 +982,16 @@ test.require(HistoryAnalyzer.averageProbeDurationMilliseconds(samples: history) 
 test.require(HistoryAnalyzer.averageProbeWorkMilliseconds(samples: history) == 50, "average check work should remain separate")
 test.require(HistoryAnalyzer.incidentCount(samples: history) == 2, "incident transitions should be counted")
 test.require(HistoryAnalyzer.availabilityPercent(samples: []) == nil, "empty history should not invent availability")
+let historySummary = HistoryAnalyzer.summary(samples: history)
+test.require(historySummary.sampleCount == history.count, "one-pass history summaries should retain the sample count")
+test.require(historySummary.availabilityPercent == HistoryAnalyzer.availabilityPercent(samples: history), "summary availability should match the established analyzer")
+test.require(historySummary.averageConnectionReadyMilliseconds == HistoryAnalyzer.averageConnectionReadyMilliseconds(samples: history), "summary ready timing should match the established analyzer")
+test.require(historySummary.averagePingMilliseconds == HistoryAnalyzer.averagePingMilliseconds(samples: history), "summary ping should match the established analyzer")
+test.require(historySummary.averagePingJitterMilliseconds == HistoryAnalyzer.averagePingJitterMilliseconds(samples: history), "summary jitter should match the established analyzer")
+test.require(historySummary.averagePacketLossPercent == HistoryAnalyzer.averagePacketLossPercent(samples: history), "summary loss should match the established analyzer")
+test.require(historySummary.averageProbeDurationMilliseconds == HistoryAnalyzer.averageProbeDurationMilliseconds(samples: history), "summary probe timing should match the established analyzer")
+test.require(historySummary.averageProbeWorkMilliseconds == HistoryAnalyzer.averageProbeWorkMilliseconds(samples: history), "summary work timing should match the established analyzer")
+test.require(historySummary.incidentCount == HistoryAnalyzer.incidentCount(samples: history), "summary incidents should match the established analyzer")
 
 let windowNow = ISO8601DateFormatter().date(from: "2026-07-12T12:00:00Z")!
 let windowHistory = [
@@ -962,6 +1008,16 @@ test.require(
     HistoryAnalyzer.recentSortedSamples(sortedWindowHistory, hours: 1, now: windowNow) == oneHourHistory,
     "indexed history windows should match the existing inclusive cutoff behavior"
 )
+let indexedWindowHistory = HistoryIndexBuilder.build(samples: windowHistory + [
+    MetricSample(timestamp: windowNow, hostID: "second", state: .online)
+])
+test.require(indexedWindowHistory["example"]?.map(\.timestamp) == sortedWindowHistory.map(\.timestamp), "history indexing should repair only an out-of-order host")
+test.require(indexedWindowHistory["second"]?.count == 1, "history indexing should group samples by host")
+test.require(HistoryAnalyzer.nearestSample(to: windowNow.addingTimeInterval(-10_000), in: sortedWindowHistory) == sortedWindowHistory.first, "nearest history lookup should clamp before the first sample")
+test.require(HistoryAnalyzer.nearestSample(to: windowNow.addingTimeInterval(10_000), in: sortedWindowHistory) == sortedWindowHistory.last, "nearest history lookup should clamp after the last sample")
+test.require(HistoryAnalyzer.nearestSample(to: sortedWindowHistory[1].timestamp, in: sortedWindowHistory) == sortedWindowHistory[1], "nearest history lookup should return an exact match")
+let midpoint = sortedWindowHistory[0].timestamp.addingTimeInterval(sortedWindowHistory[1].timestamp.timeIntervalSince(sortedWindowHistory[0].timestamp) / 2)
+test.require(HistoryAnalyzer.nearestSample(to: midpoint, in: sortedWindowHistory) == sortedWindowHistory[0], "equidistant history lookup should prefer the earlier point")
 var largeTrendHistory: [MetricSample] = []
 largeTrendHistory.reserveCapacity(10_000)
 for index in 0..<10_000 {
@@ -976,8 +1032,8 @@ for index in 0..<10_000 {
         diskPercent: 40 + index % 3
     ))
 }
-let downsampledTrendHistory = TrendSampleDownsampler.downsample(largeTrendHistory, maxPoints: 600)
-test.require(downsampledTrendHistory.count <= 600, "large trend charts should respect their rendering budget")
+let downsampledTrendHistory = TrendSampleDownsampler.downsample(largeTrendHistory, maxPoints: 360)
+test.require(downsampledTrendHistory.count <= 360, "large trend charts should respect their rendering budget")
 test.require(downsampledTrendHistory.first == largeTrendHistory.first && downsampledTrendHistory.last == largeTrendHistory.last, "trend downsampling should preserve endpoints")
 test.require(downsampledTrendHistory.contains(where: { $0.pingMilliseconds == 9_999 }), "trend downsampling should preserve isolated timing spikes")
 test.require(downsampledTrendHistory.contains(where: { $0.state == .unreachable }), "trend downsampling should preserve outages")

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum HostState: String, Codable, Sendable {
@@ -110,6 +111,92 @@ public struct SSHRoute: Identifiable, Hashable, Codable, Sendable {
     public init(alias: String, displayName: String) {
         self.alias = alias
         self.displayName = displayName
+    }
+}
+
+public enum SSHMultiplexing {
+    private static let controlDirectoryPath = makeControlDirectory()
+
+    public static func controlPathPattern() -> String? {
+        guard let controlDirectoryPath,
+              ensureControlDirectory(atPath: controlDirectoryPath) else { return nil }
+        return URL(fileURLWithPath: controlDirectoryPath).appendingPathComponent("%C").path
+    }
+
+    private static func makeControlDirectory() -> String? {
+        let uid = getuid()
+        pruneEmptyControlDirectories(ownedBy: uid)
+        let nonce = UUID().uuidString.prefix(8).lowercased()
+        let path = "/tmp/fl-\(uid)-\(nonce)"
+        return ensureControlDirectory(atPath: path) ? path : nil
+    }
+
+    private static func ensureControlDirectory(atPath path: String) -> Bool {
+        var metadata = stat()
+        if lstat(path, &metadata) != 0 {
+            guard errno == ENOENT, mkdir(path, S_IRWXU) == 0 else { return false }
+            guard lstat(path, &metadata) == 0 else { return false }
+        }
+        guard metadata.st_uid == getuid(),
+              metadata.st_mode & S_IFMT == S_IFDIR else { return false }
+        return chmod(path, S_IRWXU) == 0
+    }
+
+    private static func pruneEmptyControlDirectories(ownedBy uid: uid_t) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") else { return }
+        let prefix = "fl-\(uid)-"
+        let cutoff = Date().addingTimeInterval(-10 * 60).timeIntervalSince1970
+        for name in names where name.hasPrefix(prefix) {
+            let path = "/tmp/\(name)"
+            var metadata = stat()
+            guard lstat(path, &metadata) == 0,
+                  metadata.st_uid == uid,
+                  metadata.st_mode & S_IFMT == S_IFDIR,
+                  Double(metadata.st_mtimespec.tv_sec) < cutoff,
+                  (try? FileManager.default.contentsOfDirectory(atPath: path).isEmpty) == true else {
+                continue
+            }
+            _ = rmdir(path)
+        }
+    }
+}
+
+public enum SSHCommandArguments {
+    public static func build(
+        routeAlias: String,
+        command: String,
+        connectTimeout: Int,
+        serverAliveInterval: Int,
+        serverAliveCountMax: Int,
+        persistSeconds: Int = 120,
+        multiplex: Bool = true
+    ) -> [String] {
+        var arguments = [
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "ConnectTimeout=\(connectTimeout)",
+            "-o", "ConnectionAttempts=1",
+            "-o", "ForwardAgent=no",
+            "-o", "RequestTTY=no",
+            "-o", "ServerAliveInterval=\(serverAliveInterval)",
+            "-o", "ServerAliveCountMax=\(serverAliveCountMax)",
+        ]
+        if multiplex, let controlPath = SSHMultiplexing.controlPathPattern() {
+            arguments += [
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPersist=\(persistSeconds)",
+                "-o", "ControlPath=\(controlPath)",
+            ]
+        } else if !multiplex {
+            arguments += [
+                "-o", "ControlMaster=no",
+                "-o", "ControlPersist=no",
+                "-o", "ControlPath=none",
+            ]
+        }
+        arguments += ["--", routeAlias, command]
+        return arguments
     }
 }
 
@@ -1490,6 +1577,18 @@ public enum CodexDesktopAppReportBuilder {
     }
 }
 
+public struct HistorySummary: Equatable, Sendable {
+    public let sampleCount: Int
+    public let availabilityPercent: Double?
+    public let averageConnectionReadyMilliseconds: Double?
+    public let averagePingMilliseconds: Double?
+    public let averagePingJitterMilliseconds: Double?
+    public let averagePacketLossPercent: Double?
+    public let averageProbeDurationMilliseconds: Double?
+    public let averageProbeWorkMilliseconds: Double?
+    public let incidentCount: Int
+}
+
 public enum HistoryAnalyzer {
     public static func recentSamples(
         _ samples: [MetricSample],
@@ -1583,6 +1682,109 @@ public enum HistoryAnalyzer {
             previousWasHealthy = isHealthy
         }
         return incidents
+    }
+
+    public static func summary(samples: [MetricSample]) -> HistorySummary {
+        var onlineCount = 0
+        var ready = (total: 0.0, count: 0)
+        var ping = (total: 0.0, count: 0)
+        var jitter = (total: 0.0, count: 0)
+        var loss = (total: 0.0, count: 0)
+        var probe = (total: 0.0, count: 0)
+        var work = (total: 0.0, count: 0)
+        var incidents = 0
+        var previousWasHealthy: Bool?
+
+        for sample in samples {
+            let isOnline = sample.state == .online
+            if isOnline {
+                onlineCount += 1
+                if let value = sample.connectionReadyMilliseconds {
+                    ready.total += Double(value)
+                    ready.count += 1
+                }
+                if let value = sample.effectiveProbeDurationMilliseconds {
+                    probe.total += Double(value)
+                    probe.count += 1
+                }
+                if let value = sample.probeWorkMilliseconds {
+                    work.total += Double(value)
+                    work.count += 1
+                }
+            }
+            if let value = sample.pingMilliseconds {
+                ping.total += Double(value)
+                ping.count += 1
+            }
+            if let value = sample.pingJitterMilliseconds {
+                jitter.total += Double(value)
+                jitter.count += 1
+            }
+            if let value = sample.packetLossPercent {
+                loss.total += value
+                loss.count += 1
+            }
+
+            let isHealthy = isOnline && sample.serviceAttentionCount == 0
+            if previousWasHealthy == true && !isHealthy { incidents += 1 }
+            previousWasHealthy = isHealthy
+        }
+
+        func average(_ values: (total: Double, count: Int)) -> Double? {
+            values.count > 0 ? values.total / Double(values.count) : nil
+        }
+        return HistorySummary(
+            sampleCount: samples.count,
+            availabilityPercent: samples.isEmpty ? nil : Double(onlineCount) * 100 / Double(samples.count),
+            averageConnectionReadyMilliseconds: average(ready),
+            averagePingMilliseconds: average(ping),
+            averagePingJitterMilliseconds: average(jitter),
+            averagePacketLossPercent: average(loss),
+            averageProbeDurationMilliseconds: average(probe),
+            averageProbeWorkMilliseconds: average(work),
+            incidentCount: incidents
+        )
+    }
+
+    public static func nearestSample(to timestamp: Date, in sortedSamples: [MetricSample]) -> MetricSample? {
+        guard !sortedSamples.isEmpty else { return nil }
+        var lower = 0
+        var upper = sortedSamples.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if sortedSamples[middle].timestamp < timestamp {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        if lower == 0 { return sortedSamples[0] }
+        if lower == sortedSamples.count { return sortedSamples[lower - 1] }
+        let before = sortedSamples[lower - 1]
+        let after = sortedSamples[lower]
+        return timestamp.timeIntervalSince(before.timestamp) <= after.timestamp.timeIntervalSince(timestamp)
+            ? before
+            : after
+    }
+}
+
+public enum HistoryIndexBuilder {
+    public static func build(samples: [MetricSample]) -> [String: [MetricSample]] {
+        var grouped: [String: [MetricSample]] = [:]
+        var unorderedHostIDs: Set<String> = []
+        for sample in samples {
+            if let previous = grouped[sample.hostID]?.last,
+               previous.timestamp > sample.timestamp {
+                unorderedHostIDs.insert(sample.hostID)
+            }
+            grouped[sample.hostID, default: []].append(sample)
+        }
+        for hostID in unorderedHostIDs {
+            grouped[hostID]?.sort {
+                $0.timestamp == $1.timestamp ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
+            }
+        }
+        return grouped
     }
 }
 
@@ -2342,8 +2544,11 @@ public enum ProbeParser {
 
 public enum RemoteCommandBuilder {
     public static func build(services: [ServiceKind]) -> String {
-        let base = """
+        let marker = """
         printf 'FLEETLIGHT_OK\n'
+        """
+        let platformFacts = """
+        (
         os=$(uname -s)
         if [ "$os" = Darwin ]; then
           boot=$(sysctl -n kern.boottime 2>/dev/null)
@@ -2358,6 +2563,23 @@ public enum RemoteCommandBuilder {
         if [ "$os" = Linux ]; then
           if [ -f /var/run/reboot-required ]; then printf 'RESTART_REQUIRED=required\n'; else printf 'RESTART_REQUIRED=not-required\n'; fi
         fi
+        if [ "$os" = Darwin ]; then
+          codex_app_plist=/Applications/ChatGPT.app/Contents/Info.plist
+          if [ -r "$codex_app_plist" ]; then
+            codex_app_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$codex_app_plist" 2>/dev/null)
+            if [ "$codex_app_id" = com.openai.codex ]; then
+              codex_app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$codex_app_plist" 2>/dev/null)
+              codex_app_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$codex_app_plist" 2>/dev/null)
+              printf 'CODEX_APP_VERSION=%s\nCODEX_APP_BUILD=%s\n' "$codex_app_version" "$codex_app_build"
+            fi
+          fi
+        fi
+        printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
+        ) &
+        """
+        let codexFacts = """
+        (
+        if [ -n "${ZSH_VERSION:-}" ]; then setopt NULL_GLOB 2>/dev/null || true; fi
         codex_candidates=$(
           command -v codex 2>/dev/null || true
           for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
@@ -2374,25 +2596,13 @@ public enum RemoteCommandBuilder {
           done
         )
         if [ -n "$codex_versions" ]; then printf '%s\n' "$codex_versions"; else printf 'CODEX=not-installed\n'; fi
-        if [ "$os" = Darwin ]; then
-          codex_app_plist=/Applications/ChatGPT.app/Contents/Info.plist
-          if [ -r "$codex_app_plist" ]; then
-            codex_app_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$codex_app_plist" 2>/dev/null)
-            if [ "$codex_app_id" = com.openai.codex ]; then
-              codex_app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$codex_app_plist" 2>/dev/null)
-              codex_app_build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$codex_app_plist" 2>/dev/null)
-              printf 'CODEX_APP_VERSION=%s\nCODEX_APP_BUILD=%s\n' "$codex_app_version" "$codex_app_build"
-            fi
-          fi
-        fi
-        printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
+        ) &
         """
 
         let concurrentServices = services.map { service in
             "(\n\(serviceCommand(service))\n) &"
         }
-        let waitForServices = services.isEmpty ? [] : ["wait"]
-        return ([base] + concurrentServices + waitForServices).joined(separator: "\n")
+        return ([marker] + concurrentServices + [platformFacts, codexFacts, "wait"]).joined(separator: "\n")
     }
 
     private static func serviceCommand(_ service: ServiceKind) -> String {

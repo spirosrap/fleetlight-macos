@@ -19,8 +19,8 @@ private struct TrendSampleCacheKey: Hashable {
 @MainActor
 final class FleetModel: ObservableObject {
     @Published private(set) var snapshots: [String: HostSnapshot]
-    @Published private(set) var historySamples: [MetricSample] = []
-    @Published private(set) var lastPrimaryRefreshDurationMilliseconds: Int?
+    @Published private(set) var historyRevision = 0
+    private(set) var lastPrimaryRefreshDurationMilliseconds: Int?
     @Published private(set) var lastRefreshDurationMilliseconds: Int?
     @Published private(set) var incidents: [IncidentEvent] = []
     @Published private(set) var activeIncidents: [IncidentEvent] = []
@@ -72,8 +72,10 @@ final class FleetModel: ObservableObject {
     private var performanceFailureCounts: [String: Int] = [:]
     private var historySamplesByHost: [String: [MetricSample]] = [:]
     private var historyWindowCache: [HistoryWindowCacheKey: [MetricSample]] = [:]
+    private var historySummaryCache: [HistoryWindowCacheKey: HistorySummary] = [:]
     private var trendSampleCache: [TrendSampleCacheKey: [MetricSample]] = [:]
     private var nextHistoryPruneAt = Date.distantPast
+    private var lastFreshSSHValidationAt: Date?
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
     private var linuxUpdateBatch: PersistedLinuxUpdateBatch?
@@ -84,6 +86,7 @@ final class FleetModel: ObservableObject {
 
     private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
     private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
+    private static let freshSSHValidationInterval: TimeInterval = 10 * 60
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
@@ -532,18 +535,15 @@ final class FleetModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        let startupStartedAt = DispatchTime.now().uptimeNanoseconds
         launchAtLogin = SMAppService.mainApp.status == .enabled
-        async let loadedHistory = MetricHistoryStore.shared.recent(hours: 7 * 24)
+        let historyIndexTask = Task.detached(priority: .utility) {
+            let samples = await MetricHistoryStore.shared.recent(hours: 7 * 24)
+            return HistoryIndexBuilder.build(samples: samples)
+        }
         async let loadedIncidents = IncidentStore.shared.recent(limit: 500)
-        historySamples = await loadedHistory.sorted { lhs, rhs in
-            lhs.timestamp == rhs.timestamp ? lhs.hostID < rhs.hostID : lhs.timestamp < rhs.timestamp
-        }
-        historySamplesByHost = Dictionary(grouping: historySamples, by: \.hostID).mapValues {
-            $0.sorted { $0.timestamp < $1.timestamp }
-        }
-        invalidateHistoryCaches()
-        nextHistoryPruneAt = Date().addingTimeInterval(15 * 60)
         incidents = await loadedIncidents
+        let incidentsReadyMilliseconds = Self.elapsedMilliseconds(since: startupStartedAt)
         activeIncidentState = ActiveIncidentState(events: incidents)
         activeIncidents = activeIncidentState.activeEvents
         for hostID in activeIncidentState.hostDownHostIDs {
@@ -552,7 +552,14 @@ final class FleetModel: ObservableObject {
         for hostID in activeIncidentState.performanceWarningHostIDs {
             performanceFailureCounts[hostID] = 2
         }
-        await refreshAll()
+        let refreshTask = Task { await refreshAll() }
+        mergeHistoryIndex(await historyIndexTask.value)
+        let historyReadyMilliseconds = Self.elapsedMilliseconds(since: startupStartedAt)
+        await refreshTask.value
+        await ActivityLogger.shared.append(
+            event: "startup-performance",
+            detail: "incidents=\(incidentsReadyMilliseconds)ms; history=\(historyReadyMilliseconds)ms; refresh=\(lastRefreshDurationMilliseconds ?? 0)ms; total=\(Self.elapsedMilliseconds(since: startupStartedAt))ms"
+        )
         if let batch = codexUpdateBatch, batch.finishedAt == nil {
             await resumeCodexUpdateBatch()
         }
@@ -597,34 +604,49 @@ final class FleetModel: ObservableObject {
         }
 
         let previousSnapshots = snapshots
+        let hostsByID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
         let isInitialRefresh = lastRefresh == nil
+        let forceFreshSSH = lastFreshSSHValidationAt.map {
+            Date().timeIntervalSince($0) >= Self.freshSSHValidationInterval
+        } ?? false
         refreshingHostIDs = Set(hosts.map(\.id))
         var probeLogEntries: [ActivityLogEntry] = []
+        var pendingTransitions: [(FleetHost, HostSnapshot?, HostSnapshot)] = []
+        var firstHostReadyMilliseconds: Int?
 
         await withTaskGroup(of: (String, HostSnapshot).self) { group in
             for host in hosts {
                 group.addTask {
-                    let snapshot = await Self.probe(host: host)
+                    let snapshot = await Self.probe(host: host, multiplex: !forceFreshSSH)
                     return (host.id, snapshot)
                 }
             }
 
             for await (alias, snapshot) in group {
-                guard let host = hosts.first(where: { $0.id == alias }) else { continue }
+                guard let host = hostsByID[alias] else { continue }
                 let previous = previousSnapshots[alias]
                 snapshots[alias] = snapshot
                 refreshingHostIDs.remove(alias)
-                await handleTransitions(
-                    host: host,
-                    previous: previous,
-                    current: snapshot,
-                    isInitialRefresh: isInitialRefresh
-                )
+                if firstHostReadyMilliseconds == nil {
+                    firstHostReadyMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
+                }
+                pendingTransitions.append((host, previous, snapshot))
                 probeLogEntries.append(probeLogEntry(hostID: alias, snapshot: snapshot))
             }
         }
         refreshingHostIDs.removeAll()
+        if lastFreshSSHValidationAt == nil || forceFreshSSH {
+            lastFreshSSHValidationAt = Date()
+        }
         lastPrimaryRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
+        for (host, previous, current) in pendingTransitions {
+            await handleTransitions(
+                host: host,
+                previous: previous,
+                current: current,
+                isInitialRefresh: isInitialRefresh
+            )
+        }
         await ActivityLogger.shared.append(probeLogEntries)
 
         await reconcileLinuxRestartRequirementsFromProbes()
@@ -646,7 +668,7 @@ final class FleetModel: ObservableObject {
         isRefreshing = false
         await ActivityLogger.shared.append(
             event: "refresh-performance",
-            detail: "primary=\(lastPrimaryRefreshDurationMilliseconds ?? 0)ms; total=\(lastRefreshDurationMilliseconds ?? 0)ms; hosts=\(hosts.count)"
+            detail: "first=\(firstHostReadyMilliseconds ?? 0)ms; primary=\(lastPrimaryRefreshDurationMilliseconds ?? 0)ms; total=\(lastRefreshDurationMilliseconds ?? 0)ms; hosts=\(hosts.count); freshSSH=\(forceFreshSSH)"
         )
     }
 
@@ -1958,72 +1980,96 @@ final class FleetModel: ObservableObject {
         return result
     }
 
+    func historySummary(for hostID: String, hours: Double = 24) -> HistorySummary {
+        let key = HistoryWindowCacheKey(hostID: hostID, hours: hours)
+        if let cached = historySummaryCache[key] { return cached }
+        let result = HistoryAnalyzer.summary(samples: samples(for: hostID, hours: hours))
+        historySummaryCache[key] = result
+        return result
+    }
+
+    private func mergeHistoryIndex(_ loadedIndex: [String: [MetricSample]]) {
+        var merged = loadedIndex
+        for (hostID, liveSamples) in historySamplesByHost where !liveSamples.isEmpty {
+            var hostSamples = merged[hostID, default: []]
+            var knownIDs = Set(hostSamples.map(\.id))
+            hostSamples.append(contentsOf: liveSamples.filter { knownIDs.insert($0.id).inserted })
+            if !zip(hostSamples, hostSamples.dropFirst()).allSatisfy({ pair in
+                pair.0.timestamp <= pair.1.timestamp
+            }) {
+                hostSamples.sort {
+                    $0.timestamp == $1.timestamp ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
+                }
+            }
+            merged[hostID] = hostSamples
+        }
+        historySamplesByHost = merged
+        nextHistoryPruneAt = Date().addingTimeInterval(15 * 60)
+        invalidateHistoryCaches()
+        historyRevision &+= 1
+    }
+
     private func appendHistoryBatch(_ batch: [MetricSample], now: Date = Date()) {
         guard !batch.isEmpty else { return }
-        let preservesGlobalOrder = historySamples.last.map { previous in
-            batch.first.map { previous.timestamp <= $0.timestamp } ?? true
-        } ?? true
-        historySamples.append(contentsOf: batch)
-        if !preservesGlobalOrder {
-            historySamples.sort { lhs, rhs in
-                lhs.timestamp == rhs.timestamp ? lhs.hostID < rhs.hostID : lhs.timestamp < rhs.timestamp
+        for sample in batch {
+            let preservesHostOrder = historySamplesByHost[sample.hostID]?.last.map {
+                $0.timestamp <= sample.timestamp
+            } ?? true
+            historySamplesByHost[sample.hostID, default: []].append(sample)
+            if !preservesHostOrder {
+                historySamplesByHost[sample.hostID]?.sort {
+                    $0.timestamp == $1.timestamp ? $0.id.uuidString < $1.id.uuidString : $0.timestamp < $1.timestamp
+                }
             }
         }
-        for sample in batch {
-            var hostSamples = historySamplesByHost[sample.hostID, default: []]
-            let preservesHostOrder = hostSamples.last.map { $0.timestamp <= sample.timestamp } ?? true
-            hostSamples.append(sample)
-            if !preservesHostOrder {
-                hostSamples.sort { $0.timestamp < $1.timestamp }
+
+        if now >= nextHistoryPruneAt {
+            let cutoff = now.addingTimeInterval(-7 * 24 * 3_600)
+            for hostID in Array(historySamplesByHost.keys) {
+                historySamplesByHost[hostID]?.removeAll { $0.timestamp < cutoff }
             }
-            historySamplesByHost[sample.hostID] = hostSamples
+            nextHistoryPruneAt = now.addingTimeInterval(15 * 60)
         }
         invalidateHistoryCaches()
-
-        guard now >= nextHistoryPruneAt else { return }
-        let cutoff = now.addingTimeInterval(-7 * 24 * 3_600)
-        historySamples.removeAll { $0.timestamp < cutoff }
-        for hostID in Array(historySamplesByHost.keys) {
-            historySamplesByHost[hostID]?.removeAll { $0.timestamp < cutoff }
-        }
-        nextHistoryPruneAt = now.addingTimeInterval(15 * 60)
+        historyRevision &+= 1
     }
 
     private func invalidateHistoryCaches() {
         historyWindowCache.removeAll(keepingCapacity: true)
+        historySummaryCache.removeAll(keepingCapacity: true)
         trendSampleCache.removeAll(keepingCapacity: true)
     }
 
     func availability(for hostID: String) -> Double? {
-        HistoryAnalyzer.availabilityPercent(samples: samples(for: hostID))
+        historySummary(for: hostID).availabilityPercent
     }
 
     func averageConnectionReady(for hostID: String) -> Double? {
-        HistoryAnalyzer.averageConnectionReadyMilliseconds(samples: samples(for: hostID))
+        historySummary(for: hostID).averageConnectionReadyMilliseconds
     }
 
     func averagePing(for hostID: String) -> Double? {
-        HistoryAnalyzer.averagePingMilliseconds(samples: samples(for: hostID))
+        historySummary(for: hostID).averagePingMilliseconds
     }
 
     func averagePingJitter(for hostID: String) -> Double? {
-        HistoryAnalyzer.averagePingJitterMilliseconds(samples: samples(for: hostID))
+        historySummary(for: hostID).averagePingJitterMilliseconds
     }
 
     func averagePacketLoss(for hostID: String) -> Double? {
-        HistoryAnalyzer.averagePacketLossPercent(samples: samples(for: hostID))
+        historySummary(for: hostID).averagePacketLossPercent
     }
 
     func averageProbeDuration(for hostID: String) -> Double? {
-        HistoryAnalyzer.averageProbeDurationMilliseconds(samples: samples(for: hostID))
+        historySummary(for: hostID).averageProbeDurationMilliseconds
     }
 
     func averageProbeWork(for hostID: String) -> Double? {
-        HistoryAnalyzer.averageProbeWorkMilliseconds(samples: samples(for: hostID))
+        historySummary(for: hostID).averageProbeWorkMilliseconds
     }
 
     func incidentCount(for hostID: String) -> Int {
-        HistoryAnalyzer.incidentCount(samples: samples(for: hostID))
+        historySummary(for: hostID).incidentCount
     }
 
     func healthScore(for hostID: String) -> Int {
@@ -2063,7 +2109,7 @@ final class FleetModel: ObservableObject {
         let results = await withTaskGroup(of: RouteProbeResult.self, returning: [RouteProbeResult].self) { group in
             for route in host.routes {
                 group.addTask {
-                    let snapshot = await Self.probe(host: host, route: route, includeServices: false)
+                    let snapshot = await Self.probe(host: host, route: route, includeServices: false, multiplex: false)
                     return RouteProbeResult(
                         route: route,
                         state: snapshot.state == .online ? .reachable : .unreachable,
@@ -2146,6 +2192,7 @@ final class FleetModel: ObservableObject {
             pinnedHostIDs.formIntersection(Set(hosts.map(\.id)))
             UserDefaults.standard.set(Array(hiddenHostIDs).sorted(), forKey: "hiddenHostIDs")
             UserDefaults.standard.set(Array(pinnedHostIDs).sorted(), forKey: "pinnedHostIDs")
+            lastFreshSSHValidationAt = .distantPast
             notice = "Loaded \(hosts.count) machine\(hosts.count == 1 ? "" : "s") from fleet.json"
             if started { Task { await refreshAll() } }
         } catch {
@@ -2641,7 +2688,8 @@ final class FleetModel: ObservableObject {
             LinuxUpdateCheckCommandBuilder.build(),
             host: host,
             routeAlias: routeAlias,
-            timeout: 180
+            timeout: 180,
+            multiplex: false
         )
     }
 
@@ -2665,7 +2713,8 @@ final class FleetModel: ObservableObject {
             LinuxUpdateCommandBuilder.build(),
             host: host,
             routeAlias: routeAlias,
-            timeout: 3_600
+            timeout: 3_600,
+            multiplex: false
         )
     }
 
@@ -2677,7 +2726,8 @@ final class FleetModel: ObservableObject {
             LinuxRestartCommandBuilder.build(),
             host: host,
             routeAlias: routeAlias,
-            timeout: 30
+            timeout: 30,
+            multiplex: false
         )
     }
 
@@ -2697,7 +2747,8 @@ final class FleetModel: ObservableObject {
         _ command: String,
         host: FleetHost,
         routeAlias: String?,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        multiplex: Bool = true
     ) async -> CommandResult {
         if host.isLocal {
             return await CommandRunner.runAsync(
@@ -2717,15 +2768,14 @@ final class FleetModel: ObservableObject {
         }
         return await CommandRunner.runAsync(
             executable: "/usr/bin/ssh",
-            arguments: [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=12",
-                "-o", "ConnectionAttempts=1",
-                "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=3",
-                routeAlias,
-                command,
-            ],
+            arguments: SSHCommandArguments.build(
+                routeAlias: routeAlias,
+                command: command,
+                connectTimeout: 12,
+                serverAliveInterval: 15,
+                serverAliveCountMax: 2,
+                multiplex: multiplex
+            ),
             timeout: timeout
         )
     }
@@ -2753,13 +2803,13 @@ final class FleetModel: ObservableObject {
         }
         return await CommandRunner.runAsync(
             executable: "/usr/bin/ssh",
-            arguments: [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=5",
-                "-o", "ConnectionAttempts=1",
-                routeAlias,
-                command,
-            ],
+            arguments: SSHCommandArguments.build(
+                routeAlias: routeAlias,
+                command: command,
+                connectTimeout: 5,
+                serverAliveInterval: 15,
+                serverAliveCountMax: 2
+            ),
             timeout: 10
         )
     }
@@ -2787,15 +2837,14 @@ final class FleetModel: ObservableObject {
         }
         return await CommandRunner.runAsync(
             executable: "/usr/bin/ssh",
-            arguments: [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=12",
-                "-o", "ConnectionAttempts=1",
-                "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=2",
-                routeAlias,
-                command,
-            ],
+            arguments: SSHCommandArguments.build(
+                routeAlias: routeAlias,
+                command: command,
+                connectTimeout: 12,
+                serverAliveInterval: 15,
+                serverAliveCountMax: 2,
+                multiplex: false
+            ),
             timeout: 300
         )
     }
@@ -2823,21 +2872,20 @@ final class FleetModel: ObservableObject {
         }
         return await CommandRunner.runAsync(
             executable: "/usr/bin/ssh",
-            arguments: [
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=12",
-                "-o", "ConnectionAttempts=1",
-                "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=2",
-                routeAlias,
-                command,
-            ],
+            arguments: SSHCommandArguments.build(
+                routeAlias: routeAlias,
+                command: command,
+                connectTimeout: 12,
+                serverAliveInterval: 15,
+                serverAliveCountMax: 2,
+                multiplex: false
+            ),
             timeout: 420
         )
     }
 
-    nonisolated private static func probe(host: FleetHost) async -> HostSnapshot {
-        async let routeProbe = probeRoutes(host: host)
+    nonisolated private static func probe(host: FleetHost, multiplex: Bool = true) async -> HostSnapshot {
+        async let routeProbe = probeRoutes(host: host, multiplex: multiplex)
         async let pingProbe = measurePing(host: host)
         var snapshot = await routeProbe
         if let ping = await pingProbe {
@@ -2850,18 +2898,18 @@ final class FleetModel: ObservableObject {
         return snapshot
     }
 
-    nonisolated private static func probeRoutes(host: FleetHost) async -> HostSnapshot {
+    nonisolated private static func probeRoutes(host: FleetHost, multiplex: Bool = true) async -> HostSnapshot {
         guard let directRoute = host.routes.first else {
             return HostSnapshot(state: .unreachable, checkedAt: Date(), detail: "No SSH route configured")
         }
 
-        let direct = await probe(host: host, route: directRoute)
+        let direct = await probe(host: host, route: directRoute, multiplex: multiplex)
         guard direct.state != .online, host.routes.count > 1 else { return direct }
 
         let fallbacks = Array(host.routes.dropFirst())
         let recovered = await withTaskGroup(of: HostSnapshot.self, returning: HostSnapshot?.self) { group in
             for route in fallbacks {
-                group.addTask { await probe(host: host, route: route) }
+                group.addTask { await probe(host: host, route: route, multiplex: multiplex) }
             }
 
             var firstOnline: HostSnapshot?
@@ -2903,7 +2951,8 @@ final class FleetModel: ObservableObject {
     nonisolated private static func probe(
         host: FleetHost,
         route: SSHRoute,
-        includeServices: Bool = true
+        includeServices: Bool = true,
+        multiplex: Bool = true
     ) async -> HostSnapshot {
         let remoteCommand = RemoteCommandBuilder.build(services: includeServices ? host.services : [])
         let result: CommandResult
@@ -2916,20 +2965,22 @@ final class FleetModel: ObservableObject {
         } else {
             result = await CommandRunner.runAsync(
                 executable: "/usr/bin/ssh",
-                arguments: [
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=5",
-                    "-o", "ConnectionAttempts=1",
-                    "-o", "ServerAliveInterval=3",
-                    "-o", "ServerAliveCountMax=1",
-                    route.alias,
-                    remoteCommand,
-                ],
-                timeout: 10
+                arguments: SSHCommandArguments.build(
+                    routeAlias: route.alias,
+                    command: remoteCommand,
+                    connectTimeout: 5,
+                    serverAliveInterval: 15,
+                    serverAliveCountMax: 2,
+                    multiplex: multiplex
+                ),
+                timeout: 15
             )
         }
         var snapshot = ProbeParser.snapshot(from: result, route: route)
-        let serviceOrder = Dictionary(uniqueKeysWithValues: host.services.enumerated().map { ($1, $0) })
+        let serviceOrder = Dictionary(
+            host.services.enumerated().map { ($1, $0) },
+            uniquingKeysWith: { min($0, $1) }
+        )
         snapshot.services.sort {
             serviceOrder[$0.kind, default: Int.max] < serviceOrder[$1.kind, default: Int.max]
         }

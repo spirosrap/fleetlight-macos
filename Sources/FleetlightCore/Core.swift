@@ -123,6 +123,21 @@ public enum SSHMultiplexing {
         return URL(fileURLWithPath: controlDirectoryPath).appendingPathComponent("%C").path
     }
 
+    public static func retireArguments(routeAlias: String) -> [String]? {
+        guard let controlPath = controlPathPattern() else { return nil }
+        return [
+            "-S", controlPath,
+            "-O", "exit",
+            "-o", "BatchMode=yes",
+            "-o", "ClearAllForwardings=yes",
+            "--", routeAlias,
+        ]
+    }
+
+    public static func retirementSucceeded(_ result: CommandResult) -> Bool {
+        result.exitCode == 0 && !result.timedOut
+    }
+
     private static func makeControlDirectory() -> String? {
         let uid = getuid()
         pruneEmptyControlDirectories(ownedBy: uid)

@@ -10,6 +10,9 @@ actor MetricHistoryStore {
     private var isLoaded = false
     private var needsCompaction = false
     private var lastCompactionAt: Date
+    private var nextPruneAt = Date.distantPast
+
+    private static let pruneInterval: TimeInterval = 15 * 60
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -28,7 +31,7 @@ actor MetricHistoryStore {
 
     func recent(hours: Double = 24, now: Date = Date()) -> [MetricSample] {
         ensureLoaded()
-        if prune(now: now) { needsCompaction = true }
+        if pruneIfDue(now: now, force: true) { needsCompaction = true }
         let cutoff = now.addingTimeInterval(-hours * 3_600)
         return samples.filter { $0.timestamp >= cutoff }
     }
@@ -46,7 +49,7 @@ actor MetricHistoryStore {
         guard !batch.isEmpty else { return [] }
         samples.append(contentsOf: batch)
         appendToDisk(batch)
-        if prune(now: now) { needsCompaction = true }
+        if pruneIfDue(now: now) { needsCompaction = true }
 
         if needsCompaction,
            now.timeIntervalSince(lastCompactionAt) >= 6 * 3_600,
@@ -71,6 +74,14 @@ actor MetricHistoryStore {
         let previousCount = samples.count
         samples.removeAll { $0.timestamp < cutoff }
         return samples.count != previousCount
+    }
+
+    @discardableResult
+    private func pruneIfDue(now: Date, force: Bool = false) -> Bool {
+        let clockMovedBackward = now < nextPruneAt.addingTimeInterval(-Self.pruneInterval)
+        guard force || now >= nextPruneAt || clockMovedBackward else { return false }
+        nextPruneAt = now.addingTimeInterval(Self.pruneInterval)
+        return prune(now: now)
     }
 
     private func appendToDisk(_ batch: [MetricSample]) {

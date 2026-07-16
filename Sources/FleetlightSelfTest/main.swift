@@ -275,7 +275,13 @@ if let controlPath = SSHMultiplexing.controlPathPattern() {
     test.require(attributes[.type] as? FileAttributeType == .typeDirectory, "the SSH control path should use a real directory")
     test.require((attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(), "the SSH control directory should belong to the running user")
     test.require((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700, "the SSH control directory should be private")
+    let retireArguments = SSHMultiplexing.retireArguments(routeAlias: "example-route") ?? []
+    test.require(retireArguments.contains("-O") && retireArguments.contains("exit"), "background validation should explicitly retire an existing pooled connection")
+    test.require(Array(retireArguments.suffix(2)) == ["--", "example-route"], "pool retirement should preserve the configured route alias")
 }
+test.require(SSHMultiplexing.retirementSucceeded(CommandResult(exitCode: 0, stdout: "", stderr: "", elapsedMilliseconds: 4, timedOut: false)), "a confirmed control-master exit may establish a new validated pool")
+test.require(!SSHMultiplexing.retirementSucceeded(CommandResult(exitCode: 255, stdout: "", stderr: "missing socket", elapsedMilliseconds: 4, timedOut: false)), "a failed control-master exit should force unpooled validation")
+test.require(!SSHMultiplexing.retirementSucceeded(CommandResult(exitCode: -1, stdout: "", stderr: "", elapsedMilliseconds: 2_000, timedOut: true)), "a timed-out control-master exit should force unpooled validation")
 let unpooledSSH = SSHCommandArguments.build(
     routeAlias: "example-route",
     command: "true",

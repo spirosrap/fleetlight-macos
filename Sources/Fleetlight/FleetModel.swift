@@ -27,6 +27,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var routeTests: [String: [RouteProbeResult]] = [:]
     @Published private(set) var refreshingHostIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isValidatingRoutes = false
     @Published private(set) var codexUpdates: [String: HostCodexUpdateProgress] = [:]
     @Published private(set) var isUpdatingCodex = false
     @Published private(set) var codexDesktopAppUpdates: [String: HostCodexUpdateProgress] = [:]
@@ -68,6 +69,7 @@ final class FleetModel: ObservableObject {
 
     private var started = false
     private var pollTask: Task<Void, Never>?
+    private var routeValidationTask: Task<Void, Never>?
     private var failureCounts: [String: Int] = [:]
     private var performanceFailureCounts: [String: Int] = [:]
     private var historySamplesByHost: [String: [MetricSample]] = [:]
@@ -126,6 +128,7 @@ final class FleetModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+        routeValidationTask?.cancel()
     }
 
     var attentionSummary: FleetAttentionSummary {
@@ -284,7 +287,7 @@ final class FleetModel: ObservableObject {
     }
 
     var isAnyUpdateOperationRunning: Bool {
-        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+        isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
     }
 
     var codexUpdateCenterStatusText: String {
@@ -570,7 +573,7 @@ final class FleetModel: ObservableObject {
     }
 
     func refreshAll() async {
-        guard !isRefreshing, refreshingHostIDs.isEmpty, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
+        guard !isRefreshing, !isValidatingRoutes, refreshingHostIDs.isEmpty, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         let refreshStartedAt = DispatchTime.now().uptimeNanoseconds
         isRefreshing = true
         notice = nil
@@ -606,9 +609,10 @@ final class FleetModel: ObservableObject {
         let previousSnapshots = snapshots
         let hostsByID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
         let isInitialRefresh = lastRefresh == nil
-        let forceFreshSSH = lastFreshSSHValidationAt.map {
+        let hasRemoteRoutes = hosts.contains { !$0.isLocal && !$0.routes.isEmpty }
+        let shouldValidateFreshSSH = hasRemoteRoutes && (lastFreshSSHValidationAt.map {
             Date().timeIntervalSince($0) >= Self.freshSSHValidationInterval
-        } ?? false
+        } ?? false)
         refreshingHostIDs = Set(hosts.map(\.id))
         var probeLogEntries: [ActivityLogEntry] = []
         var pendingTransitions: [(FleetHost, HostSnapshot?, HostSnapshot)] = []
@@ -617,7 +621,7 @@ final class FleetModel: ObservableObject {
         await withTaskGroup(of: (String, HostSnapshot).self) { group in
             for host in hosts {
                 group.addTask {
-                    let snapshot = await Self.probe(host: host, multiplex: !forceFreshSSH)
+                    let snapshot = await Self.probe(host: host)
                     return (host.id, snapshot)
                 }
             }
@@ -635,7 +639,7 @@ final class FleetModel: ObservableObject {
             }
         }
         refreshingHostIDs.removeAll()
-        if lastFreshSSHValidationAt == nil || forceFreshSSH {
+        if lastFreshSSHValidationAt == nil {
             lastFreshSSHValidationAt = Date()
         }
         lastPrimaryRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
@@ -666,10 +670,93 @@ final class FleetModel: ObservableObject {
         lastRefresh = Date()
         lastRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
         isRefreshing = false
+        let coldValidationStarted = shouldValidateFreshSSH && startFreshSSHValidation()
         await ActivityLogger.shared.append(
             event: "refresh-performance",
-            detail: "first=\(firstHostReadyMilliseconds ?? 0)ms; primary=\(lastPrimaryRefreshDurationMilliseconds ?? 0)ms; total=\(lastRefreshDurationMilliseconds ?? 0)ms; hosts=\(hosts.count); freshSSH=\(forceFreshSSH)"
+            detail: "first=\(firstHostReadyMilliseconds ?? 0)ms; primary=\(lastPrimaryRefreshDurationMilliseconds ?? 0)ms; total=\(lastRefreshDurationMilliseconds ?? 0)ms; hosts=\(hosts.count); coldValidationStarted=\(coldValidationStarted)"
         )
+    }
+
+    @discardableResult
+    private func startFreshSSHValidation() -> Bool {
+        guard !isValidatingRoutes, !isAnyUpdateOperationRunning else { return false }
+        let targets = hosts.filter { !$0.isLocal && !$0.routes.isEmpty }
+        guard !targets.isEmpty else { return false }
+
+        isValidatingRoutes = true
+        lastFreshSSHValidationAt = Date()
+        routeValidationTask = Task { [weak self] in
+            let results = await Self.validateFreshSSHRoutes(hosts: targets)
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                self.isValidatingRoutes = false
+                self.lastFreshSSHValidationAt = .distantPast
+                self.routeValidationTask = nil
+                return
+            }
+
+            let entries = results.map { hostID, snapshot in
+                ActivityLogEntry(
+                    event: snapshot.state == .online ? "ssh-cold-validation" : "ssh-cold-validation-failed",
+                    host: hostID,
+                    detail: snapshot.state == .online
+                        ? "Verified fresh via \(snapshot.routeName ?? "configured route") in \(snapshot.probeDurationMilliseconds ?? 0) ms"
+                        : snapshot.detail
+                )
+            }
+            await ActivityLogger.shared.append(entries)
+            self.isValidatingRoutes = false
+            self.routeValidationTask = nil
+        }
+        return true
+    }
+
+    nonisolated private static func validateFreshSSHRoutes(
+        hosts: [FleetHost]
+    ) async -> [(String, HostSnapshot)] {
+        await withTaskGroup(
+            of: (String, HostSnapshot).self,
+            returning: [(String, HostSnapshot)].self
+        ) { group in
+            for host in hosts {
+                group.addTask {
+                    var retiredEveryRoute = true
+                    for route in host.routes {
+                        guard !Task.isCancelled else { break }
+                        guard let arguments = SSHMultiplexing.retireArguments(routeAlias: route.alias) else {
+                            retiredEveryRoute = false
+                            continue
+                        }
+                        let retirement = await CommandRunner.runBufferedAsync(
+                            executable: "/usr/bin/ssh",
+                            arguments: arguments,
+                            timeout: 2
+                        )
+                        if !SSHMultiplexing.retirementSucceeded(retirement) {
+                            retiredEveryRoute = false
+                        }
+                    }
+                    guard !Task.isCancelled else {
+                        return (host.id, HostSnapshot(state: .checking, detail: "Validation cancelled"))
+                    }
+                    return (
+                        host.id,
+                        await probeRoutes(
+                            host: host,
+                            includeServices: false,
+                            multiplex: retiredEveryRoute
+                        )
+                    )
+                }
+            }
+
+            var results: [(String, HostSnapshot)] = []
+            results.reserveCapacity(hosts.count)
+            for await result in group where result.1.state != .checking {
+                results.append(result)
+            }
+            return results
+        }
     }
 
     private func reconcileLinuxRestartRequirementsFromProbes() async {
@@ -2082,7 +2169,7 @@ final class FleetModel: ObservableObject {
     }
 
     func refresh(_ host: FleetHost) async {
-        guard !refreshingHostIDs.contains(host.id) else { return }
+        guard !isValidatingRoutes, !refreshingHostIDs.contains(host.id) else { return }
         refreshingHostIDs.insert(host.id)
         defer { refreshingHostIDs.remove(host.id) }
 
@@ -2177,8 +2264,8 @@ final class FleetModel: ObservableObject {
     }
 
     func reloadFleetConfiguration() {
-        guard !isRefreshing else {
-            notice = "Wait for the current refresh before reloading fleet.json"
+        guard !isRefreshing, !isValidatingRoutes else {
+            notice = "Wait for the current refresh or route validation before reloading fleet.json"
             return
         }
         do {
@@ -2898,18 +2985,24 @@ final class FleetModel: ObservableObject {
         return snapshot
     }
 
-    nonisolated private static func probeRoutes(host: FleetHost, multiplex: Bool = true) async -> HostSnapshot {
+    nonisolated private static func probeRoutes(
+        host: FleetHost,
+        includeServices: Bool = true,
+        multiplex: Bool = true
+    ) async -> HostSnapshot {
         guard let directRoute = host.routes.first else {
             return HostSnapshot(state: .unreachable, checkedAt: Date(), detail: "No SSH route configured")
         }
 
-        let direct = await probe(host: host, route: directRoute, multiplex: multiplex)
+        let direct = await probe(host: host, route: directRoute, includeServices: includeServices, multiplex: multiplex)
         guard direct.state != .online, host.routes.count > 1 else { return direct }
 
         let fallbacks = Array(host.routes.dropFirst())
         let recovered = await withTaskGroup(of: HostSnapshot.self, returning: HostSnapshot?.self) { group in
             for route in fallbacks {
-                group.addTask { await probe(host: host, route: route, multiplex: multiplex) }
+                group.addTask {
+                    await probe(host: host, route: route, includeServices: includeServices, multiplex: multiplex)
+                }
             }
 
             var firstOnline: HostSnapshot?

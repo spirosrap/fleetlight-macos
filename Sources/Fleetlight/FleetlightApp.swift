@@ -178,7 +178,7 @@ private struct FleetMenuView: View {
                 Image(systemName: "arrow.clockwise")
             }
             .buttonStyle(.borderless)
-            .disabled(model.isRefreshing)
+            .disabled(model.isRefreshing || model.isValidatingRoutes)
             .help("Refresh all machines")
         }
         .padding(12)
@@ -186,6 +186,11 @@ private struct FleetMenuView: View {
 
     private var summaryText: String {
         if model.isRefreshing { return model.refreshProgressLabel }
+        if model.isValidatingRoutes {
+            return model.attentionCount > 0
+                ? "\(model.attentionDescription) · validating SSH routes…"
+                : "Machines ready · validating SSH routes…"
+        }
         if model.attentionCount > 0 {
             return model.attentionDescription
         }

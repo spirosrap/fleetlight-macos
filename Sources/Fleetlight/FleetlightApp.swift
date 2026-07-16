@@ -798,6 +798,24 @@ private struct LinuxUpdatesView: View {
         return .green
     }
 
+    private var observerConsistencyColor: Color {
+        switch model.observerConsistencySummary.state {
+        case .consistent: .green
+        case .disagreement: .orange
+        case .stale, .unavailable, .insufficient: .secondary
+        }
+    }
+
+    private var observerConsistencySymbol: String {
+        switch model.observerConsistencySummary.state {
+        case .consistent: "checkmark.seal.fill"
+        case .disagreement: "exclamationmark.triangle.fill"
+        case .stale: "clock.badge.exclamationmark"
+        case .unavailable: "wifi.exclamationmark"
+        case .insufficient: "macwindow.on.rectangle"
+        }
+    }
+
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
@@ -891,6 +909,17 @@ private struct LinuxUpdatesView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
+
+                HStack(spacing: 8) {
+                    Label(model.observerConsistencySummary.detail, systemImage: observerConsistencySymbol)
+                        .font(.caption2)
+                        .foregroundStyle(observerConsistencyColor)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+                .help("Compares the privacy-safe restart summary published by each Mac running Fleetlight.")
 
                 Divider()
 

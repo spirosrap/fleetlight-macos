@@ -94,6 +94,7 @@ Supported machine fields:
 - Confirmed per-machine and sequential Restart Required actions that wait for shutdown, verify SSH recovery or a changed boot time, and recheck the Linux restart flag
 - Bidirectional live restart verification during every normal fleet refresh, so multiple Fleetlight observers detect new restart requirements, clear stale badges and completed-operation wording, and show when each restart status was verified
 - A lightweight **Verify Now** action and restart freshness summary that separates recently verified, stale, unverified, and restart-required Linux machines without refreshing package metadata
+- Privacy-safe observer snapshots and a visible agreement check, so two Macs running Fleetlight expose stale or contradictory restart summaries instead of silently showing different answers
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

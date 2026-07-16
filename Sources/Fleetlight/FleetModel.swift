@@ -21,6 +21,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var codexUpdateCompletedCount = 0
     @Published private(set) var codexUpdateTotalCount = 0
     @Published private(set) var linuxUpdateSnapshots: [String: LinuxUpdateSnapshot] = LinuxUpdateStore.loadSnapshots()
+    @Published private(set) var observerStatusOutcomes: [String: ObserverStatusFetchOutcome] = [:]
     @Published private(set) var linuxUpdates: [String: HostLinuxUpdateProgress] = [:]
     @Published private(set) var isCheckingLinuxUpdates = false
     @Published private(set) var isCheckingLinuxRestartRequirements = false
@@ -57,6 +58,7 @@ final class FleetModel: ObservableObject {
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
     private var linuxUpdateBatch: PersistedLinuxUpdateBatch?
+    private var lastObserverConsistencyDetail: String?
     private var codexReleaseCheckedAt: Date?
     private var codexDesktopAppReleaseCheckedAt: Date?
 
@@ -244,6 +246,18 @@ final class FleetModel: ObservableObject {
             parts.append("\(summary.unverifiedCount) unverified")
         }
         return parts.isEmpty ? "No restart verification yet" : "Restart status · " + parts.joined(separator: " · ")
+    }
+
+    var observerHosts: [FleetHost] {
+        hosts.filter(\.supportsCodexDesktopApp)
+    }
+
+    var observerConsistencySummary: ObserverConsistencySummary {
+        ObserverConsistencyAnalyzer.summarize(
+            expectedObserverIDs: observerHosts.map(\.id),
+            outcomes: observerStatusOutcomes,
+            freshnessInterval: max(5 * 60, refreshInterval * 2.5)
+        )
     }
 
     var isAnyUpdateOperationRunning: Bool {
@@ -568,6 +582,7 @@ final class FleetModel: ObservableObject {
         }
 
         await reconcileLinuxRestartRequirements()
+        await refreshObserverConsistency()
 
         if let codexReleaseTask {
             applyCodexReleaseResult(await codexReleaseTask.value)
@@ -650,6 +665,51 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    private func refreshObserverConsistency() async {
+        guard let localObserver = observerHosts.first(where: \.isLocal) else { return }
+        let verification = linuxRestartVerificationSummary
+        let localSnapshot = ObserverStatusSnapshot(
+            appVersion: FleetlightVersion.currentDisplayLabel,
+            linuxHostCount: linuxUpdateHosts.count,
+            restartRequiredCount: verification.requiredCount,
+            recentVerificationCount: verification.recentCount,
+            staleVerificationCount: verification.staleCount,
+            unverifiedCount: verification.unverifiedCount
+        )
+        ObserverStatusStore.save(localSnapshot)
+
+        var outcomes: [String: ObserverStatusFetchOutcome] = [
+            localObserver.id: ObserverStatusFetchOutcome(
+                state: .available,
+                snapshot: localSnapshot,
+                detail: "Local observer status published"
+            )
+        ]
+        let remoteObservers = observerHosts.filter { !$0.isLocal }
+        await withTaskGroup(of: (String, ObserverStatusFetchOutcome).self) { group in
+            for host in remoteObservers {
+                let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+                group.addTask {
+                    let result = await Self.runObserverStatusCheck(host: host, routeAlias: routeAlias)
+                    return (host.id, ObserverStatusParser.outcome(from: result))
+                }
+            }
+            for await (hostID, outcome) in group {
+                outcomes[hostID] = outcome
+            }
+        }
+        observerStatusOutcomes = outcomes
+
+        let summary = observerConsistencySummary
+        if summary.detail != lastObserverConsistencyDetail {
+            await ActivityLogger.shared.append(
+                event: "observer-consistency",
+                detail: "state=\(summary.state.rawValue); available=\(summary.availableCount)/\(summary.expectedCount); \(summary.detail)"
+            )
+            lastObserverConsistencyDetail = summary.detail
+        }
+    }
+
     func verifyLinuxRestartRequirementsNow() async {
         guard !isAnyUpdateOperationRunning else {
             notice = "Wait for the current update operation to finish"
@@ -672,6 +732,7 @@ final class FleetModel: ObservableObject {
             detail: "targets=\(linuxUpdateHosts.count)"
         )
         await reconcileLinuxRestartRequirements()
+        await refreshObserverConsistency()
         let summary = linuxRestartVerificationSummary
         await ActivityLogger.shared.append(
             event: "linux-restart-requirement-check-finished",
@@ -2393,6 +2454,42 @@ final class FleetModel: ObservableObject {
                     command,
                 ],
                 timeout: timeout
+            )
+        }.value
+    }
+
+    nonisolated private static func runObserverStatusCheck(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        let command = ObserverStatusCommandBuilder.build()
+        return await Task.detached {
+            if host.isLocal {
+                return CommandRunner.run(
+                    executable: "/bin/sh",
+                    arguments: ["-c", command],
+                    timeout: 10
+                )
+            }
+            guard let routeAlias else {
+                return CommandResult(
+                    exitCode: -1,
+                    stdout: "",
+                    stderr: "No SSH route configured",
+                    elapsedMilliseconds: 0,
+                    timedOut: false
+                )
+            }
+            return CommandRunner.run(
+                executable: "/usr/bin/ssh",
+                arguments: [
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=5",
+                    "-o", "ConnectionAttempts=1",
+                    routeAlias,
+                    command,
+                ],
+                timeout: 10
             )
         }.value
     }

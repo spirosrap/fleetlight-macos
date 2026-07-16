@@ -2608,6 +2608,212 @@ public enum LinuxRestartVerificationAnalyzer {
     }
 }
 
+public struct ObserverStatusSnapshot: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let generatedAt: Date
+    public let appVersion: String
+    public let linuxHostCount: Int
+    public let restartRequiredCount: Int
+    public let recentVerificationCount: Int
+    public let staleVerificationCount: Int
+    public let unverifiedCount: Int
+
+    public init(
+        generatedAt: Date = Date(),
+        appVersion: String,
+        linuxHostCount: Int,
+        restartRequiredCount: Int,
+        recentVerificationCount: Int,
+        staleVerificationCount: Int,
+        unverifiedCount: Int
+    ) {
+        schemaVersion = 1
+        self.generatedAt = generatedAt
+        self.appVersion = appVersion
+        self.linuxHostCount = linuxHostCount
+        self.restartRequiredCount = restartRequiredCount
+        self.recentVerificationCount = recentVerificationCount
+        self.staleVerificationCount = staleVerificationCount
+        self.unverifiedCount = unverifiedCount
+    }
+}
+
+public enum ObserverStatusFetchState: String, Codable, Sendable {
+    case available
+    case missing
+    case offline
+    case invalid
+}
+
+public struct ObserverStatusFetchOutcome: Equatable, Sendable {
+    public let state: ObserverStatusFetchState
+    public let snapshot: ObserverStatusSnapshot?
+    public let detail: String
+
+    public init(state: ObserverStatusFetchState, snapshot: ObserverStatusSnapshot? = nil, detail: String) {
+        self.state = state
+        self.snapshot = snapshot
+        self.detail = detail
+    }
+}
+
+public enum ObserverStatusCommandBuilder {
+    public static func build() -> String {
+        """
+        printf 'FLEETLIGHT_OBSERVER_STATUS\n'
+        status_file="$HOME/Library/Application Support/Fleetlight/observer-status.json"
+        if [ ! -r "$status_file" ]; then
+          printf 'STATUS:missing\n'
+          exit 4
+        fi
+        printf 'STATUS:available\n'
+        cat "$status_file"
+        printf '\n'
+        """
+    }
+}
+
+public enum ObserverStatusParser {
+    public static func outcome(from result: CommandResult) -> ObserverStatusFetchOutcome {
+        if result.timedOut {
+            return ObserverStatusFetchOutcome(state: .offline, detail: "Observer check timed out")
+        }
+        if result.exitCode == 255 || result.exitCode == -1 {
+            return ObserverStatusFetchOutcome(state: .offline, detail: "Observer is unreachable")
+        }
+        guard result.stdout.contains("FLEETLIGHT_OBSERVER_STATUS") else {
+            return ObserverStatusFetchOutcome(state: .invalid, detail: "Observer response was not verified")
+        }
+        if result.stdout.contains("STATUS:missing") {
+            return ObserverStatusFetchOutcome(state: .missing, detail: "Observer has not published status yet")
+        }
+        guard result.stdout.contains("STATUS:available"),
+              let jsonStart = result.stdout.firstIndex(of: "{") else {
+            return ObserverStatusFetchOutcome(state: .invalid, detail: "Observer status is incomplete")
+        }
+        let json = String(result.stdout[jsonStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = json.data(using: .utf8),
+              let snapshot = try? JSONDecoder().decode(ObserverStatusSnapshot.self, from: data),
+              snapshot.schemaVersion == 1 else {
+            return ObserverStatusFetchOutcome(state: .invalid, detail: "Observer status could not be read")
+        }
+        return ObserverStatusFetchOutcome(state: .available, snapshot: snapshot, detail: "Observer status received")
+    }
+}
+
+public enum ObserverConsistencyState: String, Codable, Sendable {
+    case insufficient
+    case consistent
+    case disagreement
+    case stale
+    case unavailable
+}
+
+public struct ObserverConsistencySummary: Equatable, Sendable {
+    public let state: ObserverConsistencyState
+    public let expectedCount: Int
+    public let availableCount: Int
+    public let detail: String
+
+    public init(state: ObserverConsistencyState, expectedCount: Int, availableCount: Int, detail: String) {
+        self.state = state
+        self.expectedCount = expectedCount
+        self.availableCount = availableCount
+        self.detail = detail
+    }
+}
+
+public enum ObserverConsistencyAnalyzer {
+    public static func summarize(
+        expectedObserverIDs: [String],
+        outcomes: [String: ObserverStatusFetchOutcome],
+        now: Date = Date(),
+        freshnessInterval: TimeInterval = 5 * 60
+    ) -> ObserverConsistencySummary {
+        let expectedCount = expectedObserverIDs.count
+        guard expectedCount >= 2 else {
+            return ObserverConsistencySummary(
+                state: .insufficient,
+                expectedCount: expectedCount,
+                availableCount: outcomes.values.compactMap(\.snapshot).count,
+                detail: "Observer comparison needs two Macs"
+            )
+        }
+
+        let available = expectedObserverIDs.compactMap { outcomes[$0]?.snapshot }
+        guard available.count == expectedCount else {
+            return ObserverConsistencySummary(
+                state: .unavailable,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "Observer status available from \(available.count) of \(expectedCount) Macs"
+            )
+        }
+
+        let freshnessCutoff = now.addingTimeInterval(-freshnessInterval)
+        let staleCount = available.filter { $0.generatedAt < freshnessCutoff }.count
+        guard staleCount == 0 else {
+            return ObserverConsistencySummary(
+                state: .stale,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "\(staleCount) observer report\(staleCount == 1 ? " is" : "s are") stale"
+            )
+        }
+
+        let appVersions = Set(available.map(\.appVersion))
+        if appVersions.count > 1 {
+            return ObserverConsistencySummary(
+                state: .disagreement,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "Observers run different Fleetlight versions"
+            )
+        }
+
+        let linuxHostCounts = Set(available.map(\.linuxHostCount))
+        if linuxHostCounts.count > 1 {
+            return ObserverConsistencySummary(
+                state: .disagreement,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "Observers monitor different Linux machine counts"
+            )
+        }
+
+        let requiredCounts = Set(available.map(\.restartRequiredCount))
+        if requiredCounts.count > 1 {
+            let values = requiredCounts.sorted().map(String.init).joined(separator: " vs ")
+            return ObserverConsistencySummary(
+                state: .disagreement,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "Observers disagree on restarts: \(values) required"
+            )
+        }
+
+        let coverage = Set(available.map {
+            "\($0.recentVerificationCount):\($0.staleVerificationCount):\($0.unverifiedCount)"
+        })
+        if coverage.count > 1 {
+            return ObserverConsistencySummary(
+                state: .disagreement,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: "Observers disagree on restart verification freshness"
+            )
+        }
+
+        let required = available.first?.restartRequiredCount ?? 0
+        return ObserverConsistencySummary(
+            state: .consistent,
+            expectedCount: expectedCount,
+            availableCount: available.count,
+            detail: "\(available.count) observers agree · \(required) restart required"
+        )
+    }
+}
+
 public enum LinuxUpdateAnalyzer {
     public static func summarize(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> LinuxUpdateSummary {
         var currentCount = 0

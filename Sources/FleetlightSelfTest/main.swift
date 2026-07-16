@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.29", build: "33") == "v1.29 (33)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.29", build: nil) == "v1.29", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "33") == "Build 33", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.30", build: "34") == "v1.30 (34)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.30", build: nil) == "v1.30", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "34") == "Build 34", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -543,6 +543,89 @@ let restartVerificationSummary = LinuxRestartVerificationAnalyzer.summarize(
 )
 test.require(restartVerificationSummary == LinuxRestartVerificationSummary(recentCount: 2, staleCount: 1, unverifiedCount: 1, requiredCount: 1, lastVerifiedAt: restartSummaryNow.addingTimeInterval(-30)), "restart verification summaries should separate recent, stale, unverified, and required machines")
 
+let observerGeneratedAt = Date(timeIntervalSince1970: 1_720_001_100)
+let observerStatus = ObserverStatusSnapshot(
+    generatedAt: observerGeneratedAt,
+    appVersion: "v1.30 (34)",
+    linuxHostCount: 4,
+    restartRequiredCount: 1,
+    recentVerificationCount: 4,
+    staleVerificationCount: 0,
+    unverifiedCount: 0
+)
+let observerStatusData = try! JSONEncoder().encode(observerStatus)
+test.require(try! JSONDecoder().decode(ObserverStatusSnapshot.self, from: observerStatusData) == observerStatus, "observer snapshots should round-trip without fleet identities")
+let observerCommand = ObserverStatusCommandBuilder.build()
+test.require(observerCommand.contains("FLEETLIGHT_OBSERVER_STATUS") && observerCommand.contains("observer-status.json"), "observer checks should use a verified aggregate status file")
+test.require(!observerCommand.contains("fleet.json") && !observerCommand.contains(".ssh"), "observer status checks should not read fleet configuration or SSH credentials")
+let observerAvailableResult = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_OBSERVER_STATUS\nSTATUS:available\n\(String(data: observerStatusData, encoding: .utf8)!)\n",
+    stderr: "",
+    elapsedMilliseconds: 20,
+    timedOut: false
+)
+test.require(ObserverStatusParser.outcome(from: observerAvailableResult).snapshot == observerStatus, "observer status responses should decode verified snapshots")
+let observerMissingResult = CommandResult(exitCode: 4, stdout: "FLEETLIGHT_OBSERVER_STATUS\nSTATUS:missing\n", stderr: "", elapsedMilliseconds: 20, timedOut: false)
+test.require(ObserverStatusParser.outcome(from: observerMissingResult).state == .missing, "observers that have not published yet should be distinct from offline observers")
+let observerOfflineResult = CommandResult(exitCode: 255, stdout: "", stderr: "unreachable", elapsedMilliseconds: 20, timedOut: false)
+test.require(ObserverStatusParser.outcome(from: observerOfflineResult).state == .offline, "unreachable observers should remain explicit")
+
+let matchingObserver = ObserverStatusSnapshot(
+    generatedAt: observerGeneratedAt.addingTimeInterval(5),
+    appVersion: observerStatus.appVersion,
+    linuxHostCount: observerStatus.linuxHostCount,
+    restartRequiredCount: observerStatus.restartRequiredCount,
+    recentVerificationCount: observerStatus.recentVerificationCount,
+    staleVerificationCount: observerStatus.staleVerificationCount,
+    unverifiedCount: observerStatus.unverifiedCount
+)
+let observerOutcomes = [
+    "first": ObserverStatusFetchOutcome(state: .available, snapshot: observerStatus, detail: "Available"),
+    "second": ObserverStatusFetchOutcome(state: .available, snapshot: matchingObserver, detail: "Available"),
+]
+let observerConsistency = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: observerOutcomes,
+    now: observerGeneratedAt.addingTimeInterval(30),
+    freshnessInterval: 300
+)
+test.require(observerConsistency.state == .consistent && observerConsistency.detail.contains("2 observers agree"), "fresh matching observers should report agreement")
+let disagreeingObserver = ObserverStatusSnapshot(
+    generatedAt: matchingObserver.generatedAt,
+    appVersion: matchingObserver.appVersion,
+    linuxHostCount: matchingObserver.linuxHostCount,
+    restartRequiredCount: 0,
+    recentVerificationCount: matchingObserver.recentVerificationCount,
+    staleVerificationCount: matchingObserver.staleVerificationCount,
+    unverifiedCount: matchingObserver.unverifiedCount
+)
+let disagreement = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: [
+        "first": observerOutcomes["first"]!,
+        "second": ObserverStatusFetchOutcome(state: .available, snapshot: disagreeingObserver, detail: "Available"),
+    ],
+    now: observerGeneratedAt.addingTimeInterval(30),
+    freshnessInterval: 300
+)
+test.require(disagreement.state == .disagreement && disagreement.detail.contains("0 vs 1"), "different restart counts should be called out as observer disagreement")
+let staleConsistency = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: observerOutcomes,
+    now: observerGeneratedAt.addingTimeInterval(600),
+    freshnessInterval: 300
+)
+test.require(staleConsistency.state == .stale, "expired observer reports should not be presented as agreement")
+let unavailableConsistency = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: ["first": observerOutcomes["first"]!],
+    now: observerGeneratedAt.addingTimeInterval(30),
+    freshnessInterval: 300
+)
+test.require(unavailableConsistency.state == .unavailable, "missing observer reports should stay visible")
+test.require(ObserverConsistencyAnalyzer.summarize(expectedObserverIDs: ["first"], outcomes: ["first": observerOutcomes["first"]!]).state == .insufficient, "single-Mac fleets should explain that comparison needs two observers")
+
 let successfulLinuxUpdate = CommandResult(
     exitCode: 0,
     stdout: "FLEETLIGHT_LINUX_UPDATE\nPKG_MGR:apt\nREBOOT:required\nUPDATE:ok\n",
@@ -1040,9 +1123,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.29 (33)"
+    appVersion: "v1.30 (34)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.29 (33)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.30 (34)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

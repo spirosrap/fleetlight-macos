@@ -962,15 +962,19 @@ test.require(
     HistoryAnalyzer.recentSortedSamples(sortedWindowHistory, hours: 1, now: windowNow) == oneHourHistory,
     "indexed history windows should match the existing inclusive cutoff behavior"
 )
-let largeTrendHistory = (0..<10_000).map { index in
-    MetricSample(
+var largeTrendHistory: [MetricSample] = []
+largeTrendHistory.reserveCapacity(10_000)
+for index in 0..<10_000 {
+    let state: HostState = index == 4_321 ? .unreachable : .online
+    let ping = index == 7_654 ? 9_999 : 20 + index % 5
+    largeTrendHistory.append(MetricSample(
         timestamp: windowNow.addingTimeInterval(Double(index)),
         hostID: "example",
-        state: index == 4_321 ? .unreachable : .online,
-        pingMilliseconds: index == 7_654 ? 9_999 : 20 + index % 5,
+        state: state,
+        pingMilliseconds: ping,
         packetLossPercent: index == 6_543 ? 25 : 0,
         diskPercent: 40 + index % 3
-    )
+    ))
 }
 let downsampledTrendHistory = TrendSampleDownsampler.downsample(largeTrendHistory, maxPoints: 600)
 test.require(downsampledTrendHistory.count <= 600, "large trend charts should respect their rendering budget")
@@ -979,14 +983,17 @@ test.require(downsampledTrendHistory.contains(where: { $0.pingMilliseconds == 9_
 test.require(downsampledTrendHistory.contains(where: { $0.state == .unreachable }), "trend downsampling should preserve outages")
 test.require(downsampledTrendHistory.contains(where: { ($0.packetLossPercent ?? 0) > 0 }), "trend downsampling should preserve packet loss")
 test.require(TrendSampleDownsampler.downsample(Array(largeTrendHistory.prefix(50)), maxPoints: 600) == Array(largeTrendHistory.prefix(50)), "small trend sets should remain unchanged")
-let sustainedLossHistory = (0..<10_000).map { index in
-    MetricSample(
+var sustainedLossHistory: [MetricSample] = []
+sustainedLossHistory.reserveCapacity(10_000)
+for index in 0..<10_000 {
+    let loss: Double = (1_000..<9_000).contains(index) ? 10 : 0
+    sustainedLossHistory.append(MetricSample(
         timestamp: windowNow.addingTimeInterval(Double(index)),
         hostID: "example",
         state: .online,
         pingMilliseconds: index == 5_000 ? 12_000 : 25,
-        packetLossPercent: (1_000..<9_000).contains(index) ? 10 : 0
-    )
+        packetLossPercent: loss
+    ))
 }
 let sustainedLossDownsample = TrendSampleDownsampler.downsample(sustainedLossHistory, maxPoints: 600)
 test.require(sustainedLossDownsample.contains(where: { $0.pingMilliseconds == 12_000 }), "long incidents should not consume the budget reserved for timing extrema")

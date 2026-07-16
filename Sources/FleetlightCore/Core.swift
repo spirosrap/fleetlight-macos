@@ -2548,6 +2548,66 @@ public enum LinuxRestartDetailReconciler {
     }
 }
 
+public struct LinuxRestartVerificationSummary: Equatable, Sendable {
+    public let recentCount: Int
+    public let staleCount: Int
+    public let unverifiedCount: Int
+    public let requiredCount: Int
+    public let lastVerifiedAt: Date?
+
+    public init(recentCount: Int, staleCount: Int, unverifiedCount: Int, requiredCount: Int, lastVerifiedAt: Date?) {
+        self.recentCount = recentCount
+        self.staleCount = staleCount
+        self.unverifiedCount = unverifiedCount
+        self.requiredCount = requiredCount
+        self.lastVerifiedAt = lastVerifiedAt
+    }
+}
+
+public enum LinuxRestartVerificationAnalyzer {
+    public static func summarize(
+        hosts: [FleetHost],
+        snapshots: [String: LinuxUpdateSnapshot],
+        now: Date = Date(),
+        freshnessInterval: TimeInterval = 5 * 60
+    ) -> LinuxRestartVerificationSummary {
+        let freshnessCutoff = now.addingTimeInterval(-freshnessInterval)
+        var recentCount = 0
+        var staleCount = 0
+        var unverifiedCount = 0
+        var requiredCount = 0
+        var lastVerifiedAt: Date?
+
+        for host in hosts {
+            guard let snapshot = snapshots[host.id] else {
+                unverifiedCount += 1
+                continue
+            }
+            if snapshot.rebootRequired {
+                requiredCount += 1
+            }
+            guard let restartCheckedAt = snapshot.restartCheckedAt else {
+                unverifiedCount += 1
+                continue
+            }
+            lastVerifiedAt = max(lastVerifiedAt ?? restartCheckedAt, restartCheckedAt)
+            if restartCheckedAt >= freshnessCutoff {
+                recentCount += 1
+            } else {
+                staleCount += 1
+            }
+        }
+
+        return LinuxRestartVerificationSummary(
+            recentCount: recentCount,
+            staleCount: staleCount,
+            unverifiedCount: unverifiedCount,
+            requiredCount: requiredCount,
+            lastVerifiedAt: lastVerifiedAt
+        )
+    }
+}
+
 public enum LinuxUpdateAnalyzer {
     public static func summarize(hosts: [FleetHost], snapshots: [String: LinuxUpdateSnapshot]) -> LinuxUpdateSummary {
         var currentCount = 0

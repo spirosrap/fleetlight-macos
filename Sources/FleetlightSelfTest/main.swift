@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.28", build: "32") == "v1.28 (32)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.28", build: nil) == "v1.28", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "32") == "Build 32", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.29", build: "33") == "v1.29 (33)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.29", build: nil) == "v1.29", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "33") == "Build 33", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -524,6 +524,25 @@ test.require(linuxSummary == LinuxUpdateSummary(currentCount: 1, updateAvailable
 test.require(LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot]).map(\.id) == ["updates"], "sequential Linux updates should target only machines with known updates")
 test.require(LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot, "current-linux": currentLinuxSnapshot]).map(\.id) == ["updates"], "Linux restarts should target only machines reporting restart required")
 
+let restartSummaryNow = Date(timeIntervalSince1970: 1_720_001_000)
+let restartSummaryHosts = [
+    FleetHost(id: "recent", displayName: "Recent", systemImage: "server.rack", supportsLinuxUpdates: true),
+    FleetHost(id: "required", displayName: "Required", systemImage: "server.rack", supportsLinuxUpdates: true),
+    FleetHost(id: "stale", displayName: "Stale", systemImage: "server.rack", supportsLinuxUpdates: true),
+    FleetHost(id: "unverified", displayName: "Unverified", systemImage: "server.rack", supportsLinuxUpdates: true),
+]
+let restartVerificationSummary = LinuxRestartVerificationAnalyzer.summarize(
+    hosts: restartSummaryHosts,
+    snapshots: [
+        "recent": LinuxUpdateSnapshot(state: .current, restartCheckedAt: restartSummaryNow.addingTimeInterval(-30)),
+        "required": LinuxUpdateSnapshot(state: .current, rebootRequired: true, restartCheckedAt: restartSummaryNow.addingTimeInterval(-60)),
+        "stale": LinuxUpdateSnapshot(state: .current, restartCheckedAt: restartSummaryNow.addingTimeInterval(-600)),
+    ],
+    now: restartSummaryNow,
+    freshnessInterval: 300
+)
+test.require(restartVerificationSummary == LinuxRestartVerificationSummary(recentCount: 2, staleCount: 1, unverifiedCount: 1, requiredCount: 1, lastVerifiedAt: restartSummaryNow.addingTimeInterval(-30)), "restart verification summaries should separate recent, stale, unverified, and required machines")
+
 let successfulLinuxUpdate = CommandResult(
     exitCode: 0,
     stdout: "FLEETLIGHT_LINUX_UPDATE\nPKG_MGR:apt\nREBOOT:required\nUPDATE:ok\n",
@@ -1021,9 +1040,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.28 (32)"
+    appVersion: "v1.29 (33)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.28 (32)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.29 (33)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

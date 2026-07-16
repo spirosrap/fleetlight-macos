@@ -23,6 +23,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var linuxUpdateSnapshots: [String: LinuxUpdateSnapshot] = LinuxUpdateStore.loadSnapshots()
     @Published private(set) var linuxUpdates: [String: HostLinuxUpdateProgress] = [:]
     @Published private(set) var isCheckingLinuxUpdates = false
+    @Published private(set) var isCheckingLinuxRestartRequirements = false
     @Published private(set) var isUpdatingLinux = false
     @Published private(set) var linuxUpdateCompletedCount = 0
     @Published private(set) var linuxUpdateTotalCount = 0
@@ -218,8 +219,35 @@ final class FleetModel: ObservableObject {
         LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: linuxUpdateSnapshots)
     }
 
+    var linuxRestartVerificationSummary: LinuxRestartVerificationSummary {
+        LinuxRestartVerificationAnalyzer.summarize(
+            hosts: linuxUpdateHosts,
+            snapshots: linuxUpdateSnapshots,
+            freshnessInterval: max(5 * 60, refreshInterval * 2.5)
+        )
+    }
+
+    var linuxRestartVerificationStatusText: String {
+        if isCheckingLinuxRestartRequirements { return "Verifying restart status…" }
+        let summary = linuxRestartVerificationSummary
+        var parts: [String] = []
+        if summary.requiredCount > 0 {
+            parts.append("\(summary.requiredCount) required")
+        }
+        if summary.recentCount > 0 {
+            parts.append("\(summary.recentCount) recent")
+        }
+        if summary.staleCount > 0 {
+            parts.append("\(summary.staleCount) stale")
+        }
+        if summary.unverifiedCount > 0 {
+            parts.append("\(summary.unverifiedCount) unverified")
+        }
+        return parts.isEmpty ? "No restart verification yet" : "Restart status · " + parts.joined(separator: " · ")
+    }
+
     var isAnyUpdateOperationRunning: Bool {
-        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isUpdatingLinux || isRestartingLinux
+        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isUpdatingLinux || isRestartingLinux
     }
 
     var codexUpdateCenterStatusText: String {
@@ -622,6 +650,38 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    func verifyLinuxRestartRequirementsNow() async {
+        guard !isAnyUpdateOperationRunning else {
+            notice = "Wait for the current update operation to finish"
+            return
+        }
+        guard !isRefreshing else {
+            notice = "Wait for the current fleet check to finish"
+            return
+        }
+        guard !linuxUpdateHosts.isEmpty else {
+            notice = "No Linux machines are configured"
+            return
+        }
+
+        pollTask?.cancel()
+        isCheckingLinuxRestartRequirements = true
+        notice = "Verifying Linux restart status…"
+        await ActivityLogger.shared.append(
+            event: "linux-restart-requirement-check-started",
+            detail: "targets=\(linuxUpdateHosts.count)"
+        )
+        await reconcileLinuxRestartRequirements()
+        let summary = linuxRestartVerificationSummary
+        await ActivityLogger.shared.append(
+            event: "linux-restart-requirement-check-finished",
+            detail: "required=\(summary.requiredCount); recent=\(summary.recentCount); stale=\(summary.staleCount); unverified=\(summary.unverifiedCount)"
+        )
+        isCheckingLinuxRestartRequirements = false
+        if started { schedulePolling() }
+        notice = linuxRestartVerificationStatusText
+    }
+
     private func reconcileClearedRestartDetails(for scopedHostIDs: Set<String>? = nil) {
         var clearedHostIDs = Set(linuxUpdateSnapshots.compactMap { hostID, snapshot in
             snapshot.rebootRequired ? nil : hostID
@@ -808,7 +868,7 @@ final class FleetModel: ObservableObject {
     }
 
     func checkLinuxUpdates() async {
-        guard !isCheckingLinuxUpdates, !isUpdatingLinux, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
+        guard !isCheckingLinuxUpdates, !isCheckingLinuxRestartRequirements, !isUpdatingLinux, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return

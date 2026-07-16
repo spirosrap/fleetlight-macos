@@ -791,6 +791,13 @@ private struct LinuxUpdatesView: View {
         model.isAnyUpdateOperationRunning
     }
 
+    private var restartVerificationColor: Color {
+        let summary = model.linuxRestartVerificationSummary
+        if summary.requiredCount > 0 { return .orange }
+        if summary.staleCount > 0 || summary.unverifiedCount > 0 { return .secondary }
+        return .green
+    }
+
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
@@ -860,6 +867,27 @@ private struct LinuxUpdatesView: View {
                     isSelected: false
                 )
                 Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+
+                HStack(spacing: 8) {
+                    Label(model.linuxRestartVerificationStatusText, systemImage: "arrow.clockwise.circle")
+                        .font(.caption2)
+                        .foregroundStyle(restartVerificationColor)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Button {
+                        Task { await model.verifyLinuxRestartRequirementsNow() }
+                    } label: {
+                        Label(
+                            model.isCheckingLinuxRestartRequirements ? "Verifying…" : "Verify Now",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isBusy)
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)

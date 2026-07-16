@@ -66,4 +66,8 @@ enum CodexUpdateBatchStore {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try? data.write(to: fileURL, options: .atomic)
     }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: fileURL)
+    }
 }

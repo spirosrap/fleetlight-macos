@@ -310,6 +310,7 @@ public struct HostSnapshot: Sendable, Equatable {
     public var diskPercent: Int?
     public var memoryPercent: Int?
     public var loadAverage: Double?
+    public var linuxRestartRequired: Bool?
     public var routeName: String?
     public var routeAlias: String?
     public var services: [ServiceSnapshot]
@@ -333,6 +334,7 @@ public struct HostSnapshot: Sendable, Equatable {
         diskPercent: Int? = nil,
         memoryPercent: Int? = nil,
         loadAverage: Double? = nil,
+        linuxRestartRequired: Bool? = nil,
         routeName: String? = nil,
         routeAlias: String? = nil,
         services: [ServiceSnapshot] = [],
@@ -355,6 +357,7 @@ public struct HostSnapshot: Sendable, Equatable {
         self.diskPercent = diskPercent
         self.memoryPercent = memoryPercent
         self.loadAverage = loadAverage
+        self.linuxRestartRequired = linuxRestartRequired
         self.routeName = routeName
         self.routeAlias = routeAlias
         self.services = services
@@ -1497,6 +1500,27 @@ public enum HistoryAnalyzer {
         return samples.filter { $0.timestamp >= cutoff }.sorted { $0.timestamp < $1.timestamp }
     }
 
+    public static func recentSortedSamples(
+        _ samples: [MetricSample],
+        hours: Double,
+        now: Date = Date()
+    ) -> [MetricSample] {
+        guard !samples.isEmpty else { return [] }
+        let cutoff = now.addingTimeInterval(-hours * 3_600)
+        var lower = 0
+        var upper = samples.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if samples[middle].timestamp < cutoff {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        guard lower < samples.count else { return [] }
+        return Array(samples[lower...])
+    }
+
     public static func availabilityPercent(samples: [MetricSample]) -> Double? {
         guard !samples.isEmpty else { return nil }
         let online = samples.filter { $0.state == .online }.count
@@ -1559,6 +1583,85 @@ public enum HistoryAnalyzer {
             previousWasHealthy = isHealthy
         }
         return incidents
+    }
+}
+
+public enum TrendSampleDownsampler {
+    public static func downsample(_ samples: [MetricSample], maxPoints: Int = 600) -> [MetricSample] {
+        guard maxPoints > 1, samples.count > maxPoints else { return samples }
+
+        var required = Set([0, samples.count - 1])
+        for index in samples.indices.dropFirst() {
+            let sample = samples[index]
+            let previous = samples[index - 1]
+            let stateChanged = sample.state != previous.state
+            let lossChanged = ((sample.packetLossPercent ?? 0) > 0)
+                != ((previous.packetLossPercent ?? 0) > 0)
+            let serviceAttentionChanged = (sample.serviceAttentionCount > 0)
+                != (previous.serviceAttentionCount > 0)
+            if stateChanged || lossChanged || serviceAttentionChanged {
+                required.insert(index - 1)
+                required.insert(index)
+            }
+        }
+
+        let eventBudget = max(2, maxPoints * 3 / 5)
+        if required.count > eventBudget {
+            required = Set(evenlySelected(Array(required).sorted(), count: eventBudget))
+        }
+
+        let metricCount = 8
+        let availableForExtrema = maxPoints - required.count
+        let bucketCount = max(1, availableForExtrema / (metricCount * 2))
+        var extrema = Set<Int>()
+        for bucket in 0..<bucketCount {
+            let start = bucket * samples.count / bucketCount
+            let end = min(samples.count, (bucket + 1) * samples.count / bucketCount)
+            guard start < end else { continue }
+            for metric in 0..<metricCount {
+                var minimum: (index: Int, value: Double)?
+                var maximum: (index: Int, value: Double)?
+                for index in start..<end {
+                    guard let value = metricValue(metric, sample: samples[index]) else { continue }
+                    if minimum == nil || value < minimum!.value { minimum = (index, value) }
+                    if maximum == nil || value > maximum!.value { maximum = (index, value) }
+                }
+                if let minimum { extrema.insert(minimum.index) }
+                if let maximum { extrema.insert(maximum.index) }
+            }
+        }
+
+        var selected = required
+        let extremaCandidates = Array(extrema.subtracting(required)).sorted()
+        selected.formUnion(evenlySelected(extremaCandidates, count: maxPoints - selected.count))
+
+        if selected.count < maxPoints {
+            let remaining = samples.indices.filter { !selected.contains($0) }
+            selected.formUnion(evenlySelected(remaining, count: maxPoints - selected.count))
+        }
+        return selected.sorted().prefix(maxPoints).map { samples[$0] }
+    }
+
+    private static func metricValue(_ metric: Int, sample: MetricSample) -> Double? {
+        switch metric {
+        case 0: sample.pingMilliseconds.map(Double.init)
+        case 1: sample.pingJitterMilliseconds.map(Double.init)
+        case 2: sample.connectionReadyMilliseconds.map(Double.init)
+        case 3: sample.effectiveProbeDurationMilliseconds.map(Double.init)
+        case 4: sample.diskPercent.map(Double.init)
+        case 5: sample.memoryPercent.map(Double.init)
+        case 6: sample.loadAverage
+        default: sample.packetLossPercent
+        }
+    }
+
+    private static func evenlySelected(_ indices: [Int], count: Int) -> [Int] {
+        guard count > 0, !indices.isEmpty else { return [] }
+        guard indices.count > count else { return indices }
+        guard count > 1 else { return [indices[indices.count / 2]] }
+        return (0..<count).map { position in
+            indices[position * (indices.count - 1) / (count - 1)]
+        }
     }
 }
 
@@ -2110,6 +2213,13 @@ public enum ProbeParser {
         let disk = diskText.flatMap(Int.init)
         let memory = value(after: "MEM=", in: lines).flatMap(Int.init)
         let load = value(after: "LOAD=", in: lines).flatMap(Double.init)
+        let linuxRestartRequired = value(after: "RESTART_REQUIRED=", in: lines).flatMap { value in
+            switch value {
+            case "required": true
+            case "not-required": false
+            default: nil
+            }
+        }
         let services = lines.compactMap(parseService)
         let diskDetail = disk.map { "Root disk \($0)% used" } ?? "Disk usage unavailable"
 
@@ -2126,6 +2236,7 @@ public enum ProbeParser {
             diskPercent: disk,
             memoryPercent: memory,
             loadAverage: load,
+            linuxRestartRequired: linuxRestartRequired,
             routeName: route?.displayName,
             routeAlias: route?.alias,
             services: services,
@@ -2244,14 +2355,17 @@ public enum RemoteCommandBuilder {
           mem=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2} END{if(t>0)printf "%.0f",(t-a)*100/t}' /proc/meminfo 2>/dev/null)
         fi
         disk=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $5}')
+        if [ "$os" = Linux ]; then
+          if [ -f /var/run/reboot-required ]; then printf 'RESTART_REQUIRED=required\n'; else printf 'RESTART_REQUIRED=not-required\n'; fi
+        fi
         codex_candidates=$(
           command -v codex 2>/dev/null || true
           for candidate in "$HOME/.local/bin/codex" "$HOME/.npm-global/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
             if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; fi
           done
-          if [ -d "$HOME/.nvm/versions/node" ]; then
-            find "$HOME/.nvm/versions/node" -type f -path '*/bin/codex' 2>/dev/null
-          fi
+          for candidate in "$HOME"/.nvm/versions/node/*/bin/codex; do
+            if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; fi
+          done
         )
         codex_versions=$(
           printf '%s\n' "$codex_candidates" | awk 'NF && !seen[$0]++' | while IFS= read -r codex_bin; do
@@ -2274,7 +2388,11 @@ public enum RemoteCommandBuilder {
         printf 'OS=%s\nBOOT=%s\nDISK=%s\nLOAD=%s\nMEM=%s\n' "$os" "$boot" "$disk" "$load" "$mem"
         """
 
-        return ([base] + services.map(serviceCommand)).joined(separator: "\n")
+        let concurrentServices = services.map { service in
+            "(\n\(serviceCommand(service))\n) &"
+        }
+        let waitForServices = services.isEmpty ? [] : ["wait"]
+        return ([base] + concurrentServices + waitForServices).joined(separator: "\n")
     }
 
     private static func serviceCommand(_ service: ServiceKind) -> String {
@@ -2436,6 +2554,41 @@ public enum CodexUpdateFailureReconciler {
               ) else { return nil }
 
         return "Codex \(installedVersion) is current · prior update warning cleared"
+    }
+}
+
+public enum CodexUpdateResultPresentation {
+    public static func summary(
+        verifiedCount: Int,
+        offlineCount: Int,
+        failedCount: Int,
+        pendingCount: Int,
+        finishedAt: Date?,
+        now: Date = Date()
+    ) -> String? {
+        var parts: [String] = []
+        if verifiedCount > 0 { parts.append("\(verifiedCount) verified") }
+        if offlineCount > 0 { parts.append("\(offlineCount) offline") }
+        if failedCount > 0 { parts.append("\(failedCount) failed") }
+        if pendingCount > 0 { parts.append("\(pendingCount) pending") }
+        guard !parts.isEmpty else { return nil }
+
+        let prefix = finishedAt.map { "Finished \(age(since: $0, now: now))" } ?? "Previous result"
+        return ([prefix] + parts).joined(separator: " · ")
+    }
+
+    private static func age(since date: Date, now: Date) -> String {
+        let elapsed = max(0, now.timeIntervalSince(date))
+        switch elapsed {
+        case ..<60:
+            return "just now"
+        case ..<3_600:
+            return "\(max(1, Int(elapsed / 60)))m ago"
+        case ..<86_400:
+            return "\(max(1, Int(elapsed / 3_600)))h ago"
+        default:
+            return "\(max(1, Int(elapsed / 86_400)))d ago"
+        }
     }
 }
 

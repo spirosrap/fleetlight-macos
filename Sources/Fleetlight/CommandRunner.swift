@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import FleetlightCore
 
@@ -36,58 +37,72 @@ private final class ProcessOutputCapture: @unchecked Sendable {
     }
 }
 
-enum CommandRunner {
-    static func runBuffered(executable: String, arguments: [String], timeout: TimeInterval) -> CommandResult {
-        let process = Process()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let startedAt = Date()
+private final class CommandCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
 
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = FileHandle.nullDevice
-
-        do {
-            try process.run()
-        } catch {
-            return CommandResult(
-                exitCode: -1,
-                stdout: "",
-                stderr: error.localizedDescription,
-                elapsedMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1_000),
-                timedOut: false
-            )
-        }
-
-        let processReadyMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1_000)
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-
-        let timedOut = process.isRunning
-        if timedOut {
-            process.terminate()
-            Thread.sleep(forTimeInterval: 0.1)
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-        }
-        process.waitUntilExit()
-
-        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        return CommandResult(
-            exitCode: process.terminationStatus,
-            stdout: String(decoding: stdout, as: UTF8.self),
-            stderr: String(decoding: stderr, as: UTF8.self),
-            elapsedMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1_000),
-            firstOutputMilliseconds: stdout.isEmpty ? nil : processReadyMilliseconds,
-            timedOut: timedOut
-        )
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 
-    static func run(executable: String, arguments: [String], timeout: TimeInterval) -> CommandResult {
+    func cancel() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+}
+
+enum CommandRunner {
+    // Process waits are blocking. Keep them off Swift's cooperative executor so
+    // concurrent fleet probes cannot starve their own pipe readers or UI tasks.
+    private static let executionQueue = DispatchQueue(
+        label: "app.fleetlight.command-runner",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    static func runBufferedAsync(
+        executable: String,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async -> CommandResult {
+        await runAsync(executable: executable, arguments: arguments, timeout: timeout)
+    }
+
+    static func runAsync(
+        executable: String,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async -> CommandResult {
+        let cancellation = CommandCancellationState()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                executionQueue.async {
+                    continuation.resume(returning: run(
+                        executable: executable,
+                        arguments: arguments,
+                        timeout: timeout,
+                        isCancelled: { cancellation.isCancelled }
+                    ))
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    static func runBuffered(executable: String, arguments: [String], timeout: TimeInterval) -> CommandResult {
+        run(executable: executable, arguments: arguments, timeout: timeout)
+    }
+
+    static func run(
+        executable: String,
+        arguments: [String],
+        timeout: TimeInterval,
+        isCancelled: (@Sendable () -> Bool)? = nil
+    ) -> CommandResult {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -99,6 +114,8 @@ enum CommandRunner {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         process.standardInput = FileHandle.nullDevice
+        let terminated = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in terminated.signal() }
 
         do {
             try process.run()
@@ -137,21 +154,36 @@ enum CommandRunner {
             readers.leave()
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
+        var timedOut = false
+        var cancelled = false
+        if let isCancelled {
+            let deadline = Date().addingTimeInterval(timeout)
+            while true {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else {
+                    timedOut = true
+                    break
+                }
+                if terminated.wait(timeout: .now() + min(0.05, remaining)) == .success {
+                    break
+                }
+                if isCancelled() {
+                    cancelled = true
+                    break
+                }
+            }
+        } else {
+            timedOut = terminated.wait(timeout: .now() + timeout) == .timedOut
         }
-
-        let timedOut = process.isRunning
-        if timedOut {
+        if timedOut || cancelled {
             process.terminate()
-            Thread.sleep(forTimeInterval: 0.15)
-            if process.isRunning {
+            if terminated.wait(timeout: .now() + 0.15) == .timedOut, process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
+                _ = terminated.wait(timeout: .now() + 1)
             }
         }
         process.waitUntilExit()
-        _ = readers.wait(timeout: .now() + 1)
+        _ = readers.wait(timeout: .now() + 2)
 
         let output = capture.snapshot()
         return CommandResult(

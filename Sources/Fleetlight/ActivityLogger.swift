@@ -1,5 +1,19 @@
 import Foundation
 
+struct ActivityLogEntry: Sendable {
+    let timestamp: Date
+    let event: String
+    let host: String?
+    let detail: String?
+
+    init(timestamp: Date = Date(), event: String, host: String? = nil, detail: String? = nil) {
+        self.timestamp = timestamp
+        self.event = event
+        self.host = host
+        self.detail = detail
+    }
+}
+
 actor ActivityLogger {
     static let shared = ActivityLogger()
 
@@ -13,19 +27,27 @@ actor ActivityLogger {
     }
 
     func append(event: String, host: String? = nil, detail: String? = nil) {
-        var payload: [String: String] = [
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
-            "event": event,
-        ]
-        if let host { payload["host"] = host }
-        if let detail { payload["detail"] = detail }
+        append([ActivityLogEntry(event: event, host: host, detail: detail)])
+    }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              var line = String(data: data, encoding: .utf8) else { return }
-        line.append("\n")
+    func append(_ entries: [ActivityLogEntry]) {
+        guard !entries.isEmpty else { return }
+        let formatter = ISO8601DateFormatter()
+        let payload = entries.reduce(into: Data()) { output, entry in
+            var object: [String: String] = [
+                "timestamp": formatter.string(from: entry.timestamp),
+                "event": entry.event,
+            ]
+            if let host = entry.host { object["host"] = host }
+            if let detail = entry.detail { object["detail"] = detail }
+            guard var line = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+            line.append(0x0A)
+            output.append(line)
+        }
+        guard !payload.isEmpty else { return }
 
         if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: Data(line.utf8))
+            FileManager.default.createFile(atPath: logURL.path, contents: payload)
             return
         }
 
@@ -33,7 +55,7 @@ actor ActivityLogger {
         defer { try? handle.close() }
         do {
             try handle.seekToEnd()
-            try handle.write(contentsOf: Data(line.utf8))
+            try handle.write(contentsOf: payload)
         } catch {
             return
         }

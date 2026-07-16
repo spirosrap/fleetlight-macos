@@ -185,7 +185,7 @@ private struct FleetMenuView: View {
     }
 
     private var summaryText: String {
-        if model.isRefreshing { return "Checking routes, metrics, and services…" }
+        if model.isRefreshing { return model.refreshProgressLabel }
         if model.attentionCount > 0 {
             return model.attentionDescription
         }
@@ -200,7 +200,8 @@ private struct FleetMenuView: View {
         guard let lastRefresh = model.lastRefresh else {
             return "\(source) · no completed refresh"
         }
-        return "\(source) · last check \(lastRefresh.formatted(date: .omitted, time: .standard))"
+        let duration = model.lastRefreshDurationLabel.map { " · \($0)" } ?? ""
+        return "\(source) · last check \(lastRefresh.formatted(date: .omitted, time: .standard))\(duration)"
     }
 
     private var fleetContent: some View {
@@ -345,7 +346,7 @@ private struct FleetMenuView: View {
                                 : Color.green
                     )
                     .lineLimit(1)
-                    .help("Offline means Fleetlight could not connect. Failed means the updater ran but the new version was not verified.")
+                    .help(model.codexUpdateOutcomeHelp)
 
                     Spacer(minLength: 4)
 
@@ -363,6 +364,16 @@ private struct FleetMenuView: View {
                         .controlSize(.small)
                         .disabled(model.isRefreshing)
                         .help("Refresh reachability so reconnected machines become retryable")
+                    }
+
+                    if model.codexUpdateResultIsHistorical {
+                        Button {
+                            Task { await model.clearCodexUpdateResult() }
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear this saved operation result; live version status is unchanged")
                     }
                 }
             }
@@ -1600,6 +1611,28 @@ private struct CodexView: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 10)
 
+            if let resultSummary = model.codexUpdateOutcomeSummary,
+               !model.isUpdatingCodex {
+                HStack(spacing: 8) {
+                    Label(resultSummary, systemImage: cliResultImage)
+                        .font(.caption2.weight(model.codexUpdateProblemCount > 0 ? .semibold : .regular))
+                        .foregroundStyle(cliResultColor)
+                        .lineLimit(1)
+                        .help(model.codexUpdateOutcomeHelp)
+                    Spacer(minLength: 4)
+                    if model.codexUpdateResultIsHistorical {
+                        Button("Clear Result") {
+                            Task { await model.clearCodexUpdateResult() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Remove the saved operation result; live Current and Update Available status remains")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+            }
+
             Divider()
 
             ScrollView {
@@ -1611,6 +1644,7 @@ private struct CodexView: View {
                             state: model.codexFleetVersionState(for: host),
                             latestVersion: model.latestCodexVersion,
                             updateProgress: model.codexUpdates[host.id],
+                            updateProgressIsHistorical: model.codexUpdateResultIsHistorical,
                             isUpdateBusy: model.isAnyUpdateOperationRunning,
                             onUpdate: { Task { await model.updateCodex(on: host) } }
                         )
@@ -1800,6 +1834,18 @@ private struct CodexView: View {
         return model.codexUpdateCenterSummary.totalUpdateCount > 0
             ? "arrow.down.circle.fill"
             : "checkmark.circle.fill"
+    }
+
+    private var cliResultImage: String {
+        if model.codexUpdateFailedCount > 0 { return "exclamationmark.octagon.fill" }
+        if model.codexUpdateOfflineCount > 0 { return "wifi.slash" }
+        return "checkmark.circle.fill"
+    }
+
+    private var cliResultColor: Color {
+        if model.codexUpdateFailedCount > 0 { return .red }
+        if model.codexUpdateOfflineCount > 0 { return .orange }
+        return .green
     }
 
     private var updateCenterColor: Color {
@@ -2036,6 +2082,7 @@ private struct CodexMachineRow: View {
     let state: CodexFleetVersionState
     let latestVersion: String?
     let updateProgress: HostCodexUpdateProgress?
+    let updateProgressIsHistorical: Bool
     let isUpdateBusy: Bool
     let onUpdate: () -> Void
 
@@ -2063,7 +2110,12 @@ private struct CodexMachineRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 if let updateProgress {
-                    Label(updateProgress.detail, systemImage: updateProgressImage)
+                    Label(
+                        updateProgressIsHistorical
+                            ? "Previous result · \(updateProgress.detail)"
+                            : updateProgress.detail,
+                        systemImage: updateProgressImage
+                    )
                         .font(.caption2)
                         .foregroundStyle(updateProgressColor)
                         .lineLimit(1)
@@ -2436,6 +2488,11 @@ private struct TrendsView: View {
         return model.samples(for: host.id, hours: selectedRange.hours)
     }
 
+    private var chartSamples: [MetricSample] {
+        guard let host else { return [] }
+        return model.chartSamples(for: host.id, hours: selectedRange.hours, maxPoints: 600)
+    }
+
     private var axisMarkCount: Int {
         selectedRange == .sevenDays ? 7 : 4
     }
@@ -2644,7 +2701,7 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(samples.filter { $0.pingMilliseconds != nil }) { sample in
+                ForEach(chartSamples.filter { $0.pingMilliseconds != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Milliseconds", sample.pingMilliseconds ?? 0),
@@ -2656,7 +2713,7 @@ private struct TrendsView: View {
                     .symbol(.circle)
                     .symbolSize(28)
                 }
-                ForEach(samples.filter { $0.pingJitterMilliseconds != nil }) { sample in
+                ForEach(chartSamples.filter { $0.pingJitterMilliseconds != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Milliseconds", sample.pingJitterMilliseconds ?? 0),
@@ -2666,7 +2723,7 @@ private struct TrendsView: View {
                     .foregroundStyle(.cyan)
                     .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
                 }
-                ForEach(samples.filter { ($0.packetLossPercent ?? 0) > 0 }) { sample in
+                ForEach(chartSamples.filter { ($0.packetLossPercent ?? 0) > 0 }) { sample in
                     RuleMark(x: .value("Packet loss", sample.timestamp))
                         .foregroundStyle(.red.opacity(0.55))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
@@ -2718,7 +2775,7 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(samples.filter { $0.state == .online && $0.connectionReadyMilliseconds != nil }) { sample in
+                ForEach(chartSamples.filter { $0.state == .online && $0.connectionReadyMilliseconds != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Milliseconds", sample.connectionReadyMilliseconds ?? 0),
@@ -2727,7 +2784,7 @@ private struct TrendsView: View {
                     .interpolationMethod(.catmullRom)
                     .foregroundStyle(.blue)
                 }
-                ForEach(samples.filter { $0.state == .unreachable }) { sample in
+                ForEach(chartSamples.filter { $0.state == .unreachable }) { sample in
                     RuleMark(x: .value("Unreachable", sample.timestamp))
                         .foregroundStyle(.red.opacity(0.55))
                 }
@@ -2775,7 +2832,7 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(samples.filter { $0.state == .online && $0.effectiveProbeDurationMilliseconds != nil }) { sample in
+                ForEach(chartSamples.filter { $0.state == .online && $0.effectiveProbeDurationMilliseconds != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Milliseconds", sample.effectiveProbeDurationMilliseconds ?? 0),
@@ -2784,7 +2841,7 @@ private struct TrendsView: View {
                     .interpolationMethod(.catmullRom)
                     .foregroundStyle(.orange)
                 }
-                ForEach(samples.filter { $0.state == .online && $0.probeWorkMilliseconds != nil }) { sample in
+                ForEach(chartSamples.filter { $0.state == .online && $0.probeWorkMilliseconds != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Milliseconds", sample.probeWorkMilliseconds ?? 0),
@@ -2840,7 +2897,7 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(samples.filter { $0.diskPercent != nil }) { sample in
+                ForEach(chartSamples.filter { $0.diskPercent != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Percent", sample.diskPercent ?? 0),
@@ -2848,7 +2905,7 @@ private struct TrendsView: View {
                     )
                     .foregroundStyle(.orange)
                 }
-                ForEach(samples.filter { $0.memoryPercent != nil }) { sample in
+                ForEach(chartSamples.filter { $0.memoryPercent != nil }) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
                         y: .value("Percent", sample.memoryPercent ?? 0),

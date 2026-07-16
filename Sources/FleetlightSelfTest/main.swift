@@ -35,6 +35,7 @@ let verified = CommandResult(
     DISK=42%
     LOAD=0.73
     MEM=38
+    RESTART_REQUIRED=required
     SERVICE=tailscale|healthy|Connected
     SERVICE=plex|stopped|Server inactive
 
@@ -58,6 +59,7 @@ test.require(verifiedSnapshot.codexDesktopAppBuild == "5211", "Codex desktop app
 test.require(verifiedSnapshot.diskPercent == 42, "disk percentage should be parsed")
 test.require(verifiedSnapshot.memoryPercent == 38, "memory percentage should be parsed")
 test.require(verifiedSnapshot.loadAverage == 0.73, "load average should be parsed")
+test.require(verifiedSnapshot.linuxRestartRequired == true, "primary probes should carry the Linux restart flag")
 test.require(verifiedSnapshot.latencyMilliseconds == 23, "connection-ready time should use first output")
 test.require(verifiedSnapshot.probeDurationMilliseconds == 87, "full probe duration should be retained")
 test.require(verifiedSnapshot.probeWorkMilliseconds == 64, "probe work should exclude connection readiness")
@@ -241,7 +243,8 @@ let command = RemoteCommandBuilder.build(services: [.tailscale, .plex, .samba])
 test.require(command.hasPrefix("printf 'FLEETLIGHT_OK"), "remote command should emit the verification marker before metrics")
 test.require(command.contains("CODEX=%s"), "remote command should emit Codex CLI status")
 test.require(command.contains("CODEX_APP_VERSION=%s"), "remote command should emit the signed Codex desktop app version on macOS")
-test.require(command.contains("find \"$HOME/.nvm/versions/node\""), "remote command should inspect every NVM Codex install without shell glob failures")
+test.require(command.contains("\"$HOME\"/.nvm/versions/node/*/bin/codex"), "remote command should inspect every NVM Codex install with a bounded shallow glob")
+test.require(!command.contains("find \"$HOME/.nvm/versions/node\""), "routine probes should not recursively scan the NVM tree")
 test.require(command.contains("!seen[$0]++"), "remote command should avoid probing duplicate Codex paths")
 test.require(command.contains("SERVICE=tailscale"), "remote command should include Tailscale")
 test.require(command.contains("SERVICE=plex"), "remote command should include Plex")
@@ -303,6 +306,40 @@ test.require(
         releaseCheckFailed: true
     ) == nil,
     "a failed release check must not clear an update failure from stale release data"
+)
+let codexResultNow = Date(timeIntervalSince1970: 2_000_000)
+test.require(
+    CodexUpdateResultPresentation.summary(
+        verifiedCount: 2,
+        offlineCount: 0,
+        failedCount: 1,
+        pendingCount: 0,
+        finishedAt: codexResultNow.addingTimeInterval(-125),
+        now: codexResultNow
+    ) == "Finished 2m ago · 2 verified · 1 failed",
+    "completed Codex results should expose their age and outcome"
+)
+test.require(
+    CodexUpdateResultPresentation.summary(
+        verifiedCount: 0,
+        offlineCount: 1,
+        failedCount: 0,
+        pendingCount: 0,
+        finishedAt: nil,
+        now: codexResultNow
+    ) == "Previous result · 1 offline",
+    "legacy Codex results without a completion time should still read as historical"
+)
+test.require(
+    CodexUpdateResultPresentation.summary(
+        verifiedCount: 0,
+        offlineCount: 0,
+        failedCount: 0,
+        pendingCount: 0,
+        finishedAt: codexResultNow,
+        now: codexResultNow
+    ) == nil,
+    "empty Codex results should not create a historical banner"
 )
 
 let codexPlannerHosts = [
@@ -920,6 +957,44 @@ let oneHourHistory = HistoryAnalyzer.recentSamples(windowHistory, hours: 1, now:
 test.require(oneHourHistory.count == 2, "one-hour trends should include the cutoff sample")
 test.require(oneHourHistory.first?.timestamp == windowNow.addingTimeInterval(-3_600), "trend samples should remain chronological")
 test.require(HistoryAnalyzer.recentSamples(windowHistory, hours: 6, now: windowNow).count == 3, "wider trend ranges should include older samples")
+let sortedWindowHistory = windowHistory.sorted { $0.timestamp < $1.timestamp }
+test.require(
+    HistoryAnalyzer.recentSortedSamples(sortedWindowHistory, hours: 1, now: windowNow) == oneHourHistory,
+    "indexed history windows should match the existing inclusive cutoff behavior"
+)
+let largeTrendHistory = (0..<10_000).map { index in
+    MetricSample(
+        timestamp: windowNow.addingTimeInterval(Double(index)),
+        hostID: "example",
+        state: index == 4_321 ? .unreachable : .online,
+        pingMilliseconds: index == 7_654 ? 9_999 : 20 + index % 5,
+        packetLossPercent: index == 6_543 ? 25 : 0,
+        diskPercent: 40 + index % 3
+    )
+}
+let downsampledTrendHistory = TrendSampleDownsampler.downsample(largeTrendHistory, maxPoints: 600)
+test.require(downsampledTrendHistory.count <= 600, "large trend charts should respect their rendering budget")
+test.require(downsampledTrendHistory.first == largeTrendHistory.first && downsampledTrendHistory.last == largeTrendHistory.last, "trend downsampling should preserve endpoints")
+test.require(downsampledTrendHistory.contains(where: { $0.pingMilliseconds == 9_999 }), "trend downsampling should preserve isolated timing spikes")
+test.require(downsampledTrendHistory.contains(where: { $0.state == .unreachable }), "trend downsampling should preserve outages")
+test.require(downsampledTrendHistory.contains(where: { ($0.packetLossPercent ?? 0) > 0 }), "trend downsampling should preserve packet loss")
+test.require(TrendSampleDownsampler.downsample(Array(largeTrendHistory.prefix(50)), maxPoints: 600) == Array(largeTrendHistory.prefix(50)), "small trend sets should remain unchanged")
+let sustainedLossHistory = (0..<10_000).map { index in
+    MetricSample(
+        timestamp: windowNow.addingTimeInterval(Double(index)),
+        hostID: "example",
+        state: .online,
+        pingMilliseconds: index == 5_000 ? 12_000 : 25,
+        packetLossPercent: (1_000..<9_000).contains(index) ? 10 : 0
+    )
+}
+let sustainedLossDownsample = TrendSampleDownsampler.downsample(sustainedLossHistory, maxPoints: 600)
+test.require(sustainedLossDownsample.contains(where: { $0.pingMilliseconds == 12_000 }), "long incidents should not consume the budget reserved for timing extrema")
+test.require(sustainedLossDownsample.contains(where: { $0.timestamp == sustainedLossHistory[1_000].timestamp }), "long packet-loss runs should retain their start boundary")
+test.require(sustainedLossDownsample.contains(where: { $0.timestamp == sustainedLossHistory[8_999].timestamp }), "long packet-loss runs should retain their end boundary")
+let remoteProbeCommand = RemoteCommandBuilder.build(services: [])
+test.require(remoteProbeCommand.contains("RESTART_REQUIRED=required"), "the primary probe should check Linux restart state")
+test.require(!remoteProbeCommand.contains("sudo"), "restart-state probes should not require elevated privileges")
 
 let fastHost = FleetHost(id: "fast", displayName: "Fast", systemImage: "desktopcomputer")
 let slowHost = FleetHost(id: "slow", displayName: "Slow", systemImage: "desktopcomputer")

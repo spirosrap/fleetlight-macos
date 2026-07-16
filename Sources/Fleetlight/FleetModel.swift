@@ -27,6 +27,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var routeTests: [String: [RouteProbeResult]] = [:]
     @Published private(set) var refreshingHostIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isRefreshQueued = false
     @Published private(set) var isValidatingRoutes = false
     @Published private(set) var codexUpdates: [String: HostCodexUpdateProgress] = [:]
     @Published private(set) var isUpdatingCodex = false
@@ -70,6 +71,9 @@ final class FleetModel: ObservableObject {
     private var started = false
     private var pollTask: Task<Void, Never>?
     private var routeValidationTask: Task<Void, Never>?
+    private var queuedRefreshTask: Task<Void, Never>?
+    private var refreshRequestQueue = RefreshRequestQueue()
+    private var linuxRefreshDeferralDepth = 0
     private var failureCounts: [String: Int] = [:]
     private var performanceFailureCounts: [String: Int] = [:]
     private var historySamplesByHost: [String: [MetricSample]] = [:]
@@ -129,6 +133,7 @@ final class FleetModel: ObservableObject {
     deinit {
         pollTask?.cancel()
         routeValidationTask?.cancel()
+        queuedRefreshTask?.cancel()
     }
 
     var attentionSummary: FleetAttentionSummary {
@@ -288,6 +293,14 @@ final class FleetModel: ObservableObject {
 
     var isAnyUpdateOperationRunning: Bool {
         isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+    }
+
+    private var isLinuxRefreshBlocked: Bool {
+        linuxRefreshDeferralDepth > 0 || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isUpdatingLinux || isRestartingLinux
+    }
+
+    var isManualRefreshDisabled: Bool {
+        isRefreshQueued || (!isLinuxRefreshBlocked && (isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty))
     }
 
     var codexUpdateCenterStatusText: String {
@@ -558,7 +571,7 @@ final class FleetModel: ObservableObject {
         let refreshTask = Task { await refreshAll() }
         mergeHistoryIndex(await historyIndexTask.value)
         let historyReadyMilliseconds = Self.elapsedMilliseconds(since: startupStartedAt)
-        await refreshTask.value
+        _ = await refreshTask.value
         await ActivityLogger.shared.append(
             event: "startup-performance",
             detail: "incidents=\(incidentsReadyMilliseconds)ms; history=\(historyReadyMilliseconds)ms; refresh=\(lastRefreshDurationMilliseconds ?? 0)ms; total=\(Self.elapsedMilliseconds(since: startupStartedAt))ms"
@@ -572,8 +585,91 @@ final class FleetModel: ObservableObject {
         if !isAnyUpdateOperationRunning { schedulePolling() }
     }
 
-    func refreshAll() async {
-        guard !isRefreshing, !isValidatingRoutes, refreshingHostIDs.isEmpty, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
+    func requestRefreshAll() async {
+        if !isLinuxRefreshBlocked, isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty {
+            notice = "A fleet refresh is already running"
+            return
+        }
+
+        switch refreshRequestQueue.request(isBlocked: isLinuxRefreshBlocked) {
+        case .startNow:
+            isRefreshQueued = refreshRequestQueue.isQueued
+            _ = await refreshAll()
+        case .queued:
+            isRefreshQueued = true
+            notice = "Refresh queued · it will run automatically after Linux work finishes"
+            await ActivityLogger.shared.append(
+                event: "refresh-queued",
+                detail: "Waiting for Linux maintenance to finish"
+            )
+        case .alreadyQueued:
+            isRefreshQueued = true
+            notice = "Refresh is already queued after Linux work"
+        }
+    }
+
+    private func beginLinuxRefreshDeferral() {
+        linuxRefreshDeferralDepth += 1
+    }
+
+    private func endLinuxRefreshDeferral() {
+        guard linuxRefreshDeferralDepth > 0 else { return }
+        linuxRefreshDeferralDepth -= 1
+        guard linuxRefreshDeferralDepth == 0 else { return }
+
+        if refreshRequestQueue.isQueued {
+            scheduleQueuedRefreshIfNeeded()
+        } else if started {
+            schedulePolling()
+        }
+    }
+
+    private func scheduleQueuedRefreshIfNeeded() {
+        guard refreshRequestQueue.isQueued, queuedRefreshTask == nil else { return }
+        queuedRefreshTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.queuedRefreshTask = nil
+            await self.runQueuedRefreshIfReady()
+        }
+    }
+
+    private func runQueuedRefreshIfReady() async {
+        let isBlocked = isLinuxRefreshBlocked || isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty
+        guard refreshRequestQueue.takeIfReady(isBlocked: isBlocked) else {
+            isRefreshQueued = refreshRequestQueue.isQueued
+            return
+        }
+
+        isRefreshQueued = false
+        notice = "Running queued fleet refresh…"
+        let startedLogTask = Task {
+            await ActivityLogger.shared.append(
+                event: "queued-refresh-started",
+                detail: "Linux maintenance finished"
+            )
+        }
+        let didRefresh = await refreshAll()
+        await startedLogTask.value
+
+        if didRefresh {
+            await ActivityLogger.shared.append(
+                event: "queued-refresh-completed",
+                detail: "All machines rechecked"
+            )
+            notice = "Queued refresh completed · all machines rechecked"
+        } else {
+            _ = refreshRequestQueue.request(isBlocked: true)
+            isRefreshQueued = true
+            notice = "Refresh remains queued · waiting for the current operation"
+        }
+
+        if started { schedulePolling() }
+    }
+
+    @discardableResult
+    func refreshAll() async -> Bool {
+        guard !isRefreshing, !isValidatingRoutes, refreshingHostIDs.isEmpty, !isLinuxRefreshBlocked else { return false }
         let refreshStartedAt = DispatchTime.now().uptimeNanoseconds
         isRefreshing = true
         notice = nil
@@ -675,6 +771,8 @@ final class FleetModel: ObservableObject {
             event: "refresh-performance",
             detail: "first=\(firstHostReadyMilliseconds ?? 0)ms; primary=\(lastPrimaryRefreshDurationMilliseconds ?? 0)ms; total=\(lastRefreshDurationMilliseconds ?? 0)ms; hosts=\(hosts.count); coldValidationStarted=\(coldValidationStarted)"
         )
+        scheduleQueuedRefreshIfNeeded()
+        return true
     }
 
     @discardableResult
@@ -692,6 +790,7 @@ final class FleetModel: ObservableObject {
                 self.isValidatingRoutes = false
                 self.lastFreshSSHValidationAt = .distantPast
                 self.routeValidationTask = nil
+                self.scheduleQueuedRefreshIfNeeded()
                 return
             }
 
@@ -707,6 +806,7 @@ final class FleetModel: ObservableObject {
             await ActivityLogger.shared.append(entries)
             self.isValidatingRoutes = false
             self.routeValidationTask = nil
+            self.scheduleQueuedRefreshIfNeeded()
         }
         return true
     }
@@ -989,7 +1089,12 @@ final class FleetModel: ObservableObject {
         }
 
         pollTask?.cancel()
+        beginLinuxRefreshDeferral()
         isCheckingLinuxRestartRequirements = true
+        defer {
+            isCheckingLinuxRestartRequirements = false
+            endLinuxRefreshDeferral()
+        }
         notice = "Verifying Linux restart status…"
         await ActivityLogger.shared.append(
             event: "linux-restart-requirement-check-started",
@@ -1002,8 +1107,6 @@ final class FleetModel: ObservableObject {
             event: "linux-restart-requirement-check-finished",
             detail: "required=\(summary.requiredCount); recent=\(summary.recentCount); stale=\(summary.staleCount); unverified=\(summary.unverifiedCount)"
         )
-        isCheckingLinuxRestartRequirements = false
-        if started { schedulePolling() }
         notice = linuxRestartVerificationStatusText
     }
 
@@ -1207,7 +1310,12 @@ final class FleetModel: ObservableObject {
         }
 
         pollTask?.cancel()
+        beginLinuxRefreshDeferral()
         isCheckingLinuxUpdates = true
+        defer {
+            isCheckingLinuxUpdates = false
+            endLinuxRefreshDeferral()
+        }
         notice = "Checking Linux updates on \(targets.count) machine\(targets.count == 1 ? "" : "s")…"
         for host in targets {
             let previous = linuxUpdateSnapshots[host.id]
@@ -1248,8 +1356,6 @@ final class FleetModel: ObservableObject {
 
         LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
         reconcileClearedRestartDetails()
-        isCheckingLinuxUpdates = false
-        if started { schedulePolling() }
         let summary = linuxUpdateSummary
         notice = summary.updateAvailableCount > 0
             ? "\(summary.totalPendingUpdates) Linux update\(summary.totalPendingUpdates == 1 ? "" : "s") available on \(summary.updateAvailableCount) machine\(summary.updateAvailableCount == 1 ? "" : "s")"
@@ -1265,6 +1371,9 @@ final class FleetModel: ObservableObject {
     }
 
     func updateLinuxOnAvailableHosts() async {
+        beginLinuxRefreshDeferral()
+        defer { endLinuxRefreshDeferral() }
+
         if linuxUpdateHosts.contains(where: {
             let state = linuxUpdateSnapshots[$0.id]?.state ?? .notChecked
             return state == .notChecked || state == .failed
@@ -1296,7 +1405,12 @@ final class FleetModel: ObservableObject {
         }
 
         pollTask?.cancel()
+        beginLinuxRefreshDeferral()
         isUpdatingLinux = true
+        defer {
+            isUpdatingLinux = false
+            endLinuxRefreshDeferral()
+        }
         if resuming, let batch = linuxUpdateBatch {
             linuxUpdateTotalCount = batch.targetHostIDs.count
             linuxUpdateCompletedCount = batch.progress.values.filter { $0.phase.isTerminal }.count
@@ -1397,8 +1511,6 @@ final class FleetModel: ObservableObject {
             detail: "verified=\(succeeded); offline=\(offline); failed=\(failed)"
         )
 
-        isUpdatingLinux = false
-        if started { schedulePolling() }
         notice = offline == 0 && failed == 0
             ? "Linux updates verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
             : "Linux update: \(succeeded) verified · \(offline) offline · \(failed) failed"
@@ -1462,7 +1574,12 @@ final class FleetModel: ObservableObject {
     private func performLinuxRestarts(on targets: [FleetHost]) async {
         guard !isAnyUpdateOperationRunning, !targets.isEmpty else { return }
         pollTask?.cancel()
+        beginLinuxRefreshDeferral()
         isRestartingLinux = true
+        defer {
+            isRestartingLinux = false
+            endLinuxRefreshDeferral()
+        }
         if isRefreshing {
             notice = "Finishing the current fleet check before restarting…"
             let refreshDeadline = Date().addingTimeInterval(30)
@@ -1470,8 +1587,6 @@ final class FleetModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(250))
             }
             guard !isRefreshing else {
-                isRestartingLinux = false
-                if started { schedulePolling() }
                 notice = "The fleet check is still running · try Restart again"
                 return
             }
@@ -1590,8 +1705,6 @@ final class FleetModel: ObservableObject {
             event: "linux-restart-finished",
             detail: "verified=\(succeeded); offline=\(offline); failed=\(failed)"
         )
-        isRestartingLinux = false
-        if started { schedulePolling() }
         notice = offline == 0 && failed == 0
             ? "Linux restart verified on \(succeeded) machine\(succeeded == 1 ? "" : "s")"
             : "Linux restart: \(succeeded) verified · \(offline) offline · \(failed) failed"
@@ -2169,9 +2282,16 @@ final class FleetModel: ObservableObject {
     }
 
     func refresh(_ host: FleetHost) async {
+        if isLinuxRefreshBlocked {
+            await requestRefreshAll()
+            return
+        }
         guard !isValidatingRoutes, !refreshingHostIDs.contains(host.id) else { return }
         refreshingHostIDs.insert(host.id)
-        defer { refreshingHostIDs.remove(host.id) }
+        defer {
+            refreshingHostIDs.remove(host.id)
+            scheduleQueuedRefreshIfNeeded()
+        }
 
         let previous = snapshots[host.id]
         let snapshot = await Self.probe(host: host)
@@ -2264,8 +2384,8 @@ final class FleetModel: ObservableObject {
     }
 
     func reloadFleetConfiguration() {
-        guard !isRefreshing, !isValidatingRoutes else {
-            notice = "Wait for the current refresh or route validation before reloading fleet.json"
+        guard !isRefreshing, !isAnyUpdateOperationRunning else {
+            notice = "Wait for the current refresh or maintenance operation before reloading fleet.json"
             return
         }
         do {
@@ -2525,6 +2645,7 @@ final class FleetModel: ObservableObject {
     }
 
     private func schedulePolling() {
+        guard linuxRefreshDeferralDepth == 0, !refreshRequestQueue.isQueued else { return }
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {

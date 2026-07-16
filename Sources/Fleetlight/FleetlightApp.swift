@@ -173,19 +173,24 @@ private struct FleetMenuView: View {
             Spacer()
 
             Button {
-                Task { await model.refreshAll() }
+                Task { await model.requestRefreshAll() }
             } label: {
-                Image(systemName: "arrow.clockwise")
+                Image(systemName: model.isRefreshQueued ? "clock.arrow.circlepath" : "arrow.clockwise")
             }
             .buttonStyle(.borderless)
-            .disabled(model.isRefreshing || model.isValidatingRoutes)
-            .help("Refresh all machines")
+            .disabled(model.isManualRefreshDisabled)
+            .help(model.isRefreshQueued ? "Refresh queued after Linux work" : "Refresh all machines")
         }
         .padding(12)
     }
 
     private var summaryText: String {
         if model.isRefreshing { return model.refreshProgressLabel }
+        if model.isRefreshQueued {
+            if model.isUpdatingLinux { return "Linux update running · refresh queued" }
+            if model.isRestartingLinux { return "Linux restart running · refresh queued" }
+            return "Linux maintenance running · refresh queued"
+        }
         if model.isValidatingRoutes {
             return model.attentionCount > 0
                 ? "\(model.attentionDescription) · validating SSH routes…"
@@ -363,12 +368,12 @@ private struct FleetMenuView: View {
                         .controlSize(.small)
                     } else if model.codexUpdateProblemCount > 0 {
                         Button("Check Again") {
-                            Task { await model.refreshAll() }
+                            Task { await model.requestRefreshAll() }
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .disabled(model.isRefreshing)
-                        .help("Refresh reachability so reconnected machines become retryable")
+                        .disabled(model.isManualRefreshDisabled)
+                        .help(model.isRefreshQueued ? "Refresh queued after Linux work" : "Refresh reachability so reconnected machines become retryable")
                     }
 
                     if model.codexUpdateResultIsHistorical {
@@ -635,14 +640,14 @@ private struct ServicesView: View {
                     .help("Copy the full service report")
 
                     Button {
-                        Task { await model.refreshAll() }
+                        Task { await model.requestRefreshAll() }
                     } label: {
-                        Label("Refresh services", systemImage: "arrow.clockwise")
+                        Label("Refresh services", systemImage: model.isRefreshQueued ? "clock.arrow.circlepath" : "arrow.clockwise")
                             .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless)
-                    .disabled(model.isRefreshing)
-                    .help("Refresh all machine and service checks")
+                    .disabled(model.isManualRefreshDisabled)
+                    .help(model.isRefreshQueued ? "Refresh queued after Linux work" : "Refresh all machine and service checks")
                 }
 
                 HStack(spacing: 7) {

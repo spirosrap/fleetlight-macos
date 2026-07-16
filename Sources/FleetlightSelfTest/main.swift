@@ -643,6 +643,19 @@ test.require(linuxSummary == LinuxUpdateSummary(currentCount: 1, updateAvailable
 test.require(LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot]).map(\.id) == ["updates"], "sequential Linux updates should target only machines with known updates")
 test.require(LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot, "current-linux": currentLinuxSnapshot]).map(\.id) == ["updates"], "Linux restarts should target only machines reporting restart required")
 
+var refreshRequestQueue = RefreshRequestQueue()
+test.require(!refreshRequestQueue.isQueued, "refresh requests should not start queued")
+test.require(refreshRequestQueue.request(isBlocked: false) == .startNow, "unblocked refresh requests should start immediately")
+test.require(!refreshRequestQueue.isQueued, "an immediate refresh should not leave queued work")
+test.require(refreshRequestQueue.request(isBlocked: true) == .queued, "blocked refresh requests should be queued")
+test.require(refreshRequestQueue.isQueued, "queued refresh state should be observable")
+test.require(refreshRequestQueue.request(isBlocked: true) == .alreadyQueued, "repeated blocked requests should coalesce")
+test.require(!refreshRequestQueue.takeIfReady(isBlocked: true) && refreshRequestQueue.isQueued, "queued refreshes should remain pending while work is blocked")
+test.require(refreshRequestQueue.takeIfReady(isBlocked: false), "a queued refresh should become runnable when blocking work finishes")
+test.require(!refreshRequestQueue.isQueued && !refreshRequestQueue.takeIfReady(isBlocked: false), "a queued refresh should be consumed exactly once")
+var staleRefreshRequestQueue = RefreshRequestQueue(isQueued: true)
+test.require(staleRefreshRequestQueue.request(isBlocked: false) == .startNow && !staleRefreshRequestQueue.isQueued, "a direct ready request should consume stale queued state without scheduling a duplicate")
+
 let recoveryNow = Date(timeIntervalSince1970: 1_720_000_900)
 let recoverableOfflineSnapshot = LinuxUpdateSnapshot(
     state: .offline,

@@ -3354,6 +3354,38 @@ public enum LinuxUpdateRecoveryPlanner {
     }
 }
 
+public enum RefreshRequestDecision: Equatable, Sendable {
+    case startNow
+    case queued
+    case alreadyQueued
+}
+
+public struct RefreshRequestQueue: Equatable, Sendable {
+    public private(set) var isQueued: Bool
+
+    public init(isQueued: Bool = false) {
+        self.isQueued = isQueued
+    }
+
+    @discardableResult
+    public mutating func request(isBlocked: Bool) -> RefreshRequestDecision {
+        guard isBlocked else {
+            isQueued = false
+            return .startNow
+        }
+        guard !isQueued else { return .alreadyQueued }
+        isQueued = true
+        return .queued
+    }
+
+    @discardableResult
+    public mutating func takeIfReady(isBlocked: Bool) -> Bool {
+        guard isQueued, !isBlocked else { return false }
+        isQueued = false
+        return true
+    }
+}
+
 
 public enum LinuxUpdateCheckCommandBuilder {
     public static func build(refreshMetadata: Bool = true) -> String {

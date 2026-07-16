@@ -22,6 +22,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var codexUpdateTotalCount = 0
     @Published private(set) var linuxUpdateSnapshots: [String: LinuxUpdateSnapshot] = LinuxUpdateStore.loadSnapshots()
     @Published private(set) var observerStatusOutcomes: [String: ObserverStatusFetchOutcome] = [:]
+    @Published private(set) var isCheckingObserverConsistency = false
     @Published private(set) var linuxUpdates: [String: HostLinuxUpdateProgress] = [:]
     @Published private(set) var isCheckingLinuxUpdates = false
     @Published private(set) var isCheckingLinuxRestartRequirements = false
@@ -261,7 +262,7 @@ final class FleetModel: ObservableObject {
     }
 
     var isAnyUpdateOperationRunning: Bool {
-        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isUpdatingLinux || isRestartingLinux
+        isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
     }
 
     var codexUpdateCenterStatusText: String {
@@ -708,6 +709,33 @@ final class FleetModel: ObservableObject {
             )
             lastObserverConsistencyDetail = summary.detail
         }
+    }
+
+    func checkObserverConsistencyNow() async {
+        guard !isAnyUpdateOperationRunning, !isRefreshing else {
+            notice = "Wait for the current operation to finish"
+            return
+        }
+        guard !observerHosts.isEmpty else {
+            notice = "No Mac observers are configured"
+            return
+        }
+
+        pollTask?.cancel()
+        isCheckingObserverConsistency = true
+        await ActivityLogger.shared.append(
+            event: "observer-consistency-check-started",
+            detail: "expected=\(observerHosts.count)"
+        )
+        await refreshObserverConsistency()
+        let summary = observerConsistencySummary
+        await ActivityLogger.shared.append(
+            event: "observer-consistency-check-finished",
+            detail: "state=\(summary.state.rawValue); available=\(summary.availableCount)/\(summary.expectedCount)"
+        )
+        isCheckingObserverConsistency = false
+        if started { schedulePolling() }
+        notice = summary.detail
     }
 
     func verifyLinuxRestartRequirementsNow() async {

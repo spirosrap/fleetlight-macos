@@ -782,6 +782,7 @@ private enum LinuxConfirmation {
 private struct LinuxUpdatesView: View {
     @ObservedObject var model: FleetModel
     @State private var pendingConfirmation: LinuxConfirmation?
+    @State private var observerDetailsExpanded = false
 
     private var isBusy: Bool {
         model.isAnyUpdateOperationRunning || model.isRefreshing
@@ -910,12 +911,50 @@ private struct LinuxUpdatesView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
 
-                HStack(spacing: 8) {
-                    Label(model.observerConsistencySummary.detail, systemImage: observerConsistencySymbol)
-                        .font(.caption2)
-                        .foregroundStyle(observerConsistencyColor)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Label(model.observerConsistencySummary.detail, systemImage: observerConsistencySymbol)
+                            .font(.caption2)
+                            .foregroundStyle(observerConsistencyColor)
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                observerDetailsExpanded.toggle()
+                            }
+                        } label: {
+                            Label(
+                                observerDetailsExpanded ? "Hide" : "Details",
+                                systemImage: observerDetailsExpanded ? "chevron.up" : "chevron.down"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+
+                        Button {
+                            Task { await model.checkObserverConsistencyNow() }
+                        } label: {
+                            Label(
+                                model.isCheckingObserverConsistency ? "Checking…" : "Recheck",
+                                systemImage: "arrow.clockwise"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .disabled(isBusy)
+                    }
+
+                    if observerDetailsExpanded {
+                        VStack(spacing: 6) {
+                            ForEach(model.observerHosts) { host in
+                                ObserverStatusDetailRow(
+                                    host: host,
+                                    outcome: model.observerStatusOutcomes[host.id]
+                                )
+                            }
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
@@ -1085,6 +1124,82 @@ private struct LinuxUpdatesView: View {
             return "Check for available system, Snap, and Flatpak versions"
         }
         return "No known package updates"
+    }
+}
+
+private struct ObserverStatusDetailRow: View {
+    let host: FleetHost
+    let outcome: ObserverStatusFetchOutcome?
+
+    private var diagnostic: ObserverStatusDiagnostic {
+        ObserverStatusDiagnosticBuilder.build(from: outcome)
+    }
+
+    private var statusColor: Color {
+        switch diagnostic.state {
+        case .available:
+            if outcome?.snapshot?.restartRequiredCount ?? 0 > 0 { return .orange }
+            return .green
+        case .missing: return .secondary
+        case .offline: return .red
+        case .invalid: return .orange
+        }
+    }
+
+    private var statusSymbol: String {
+        switch diagnostic.state {
+        case .available: "checkmark.circle.fill"
+        case .missing: "clock"
+        case .offline: "wifi.slash"
+        case .invalid: "exclamationmark.triangle.fill"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: statusSymbol)
+                .foregroundStyle(statusColor)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(host.displayName)
+                        .font(.caption.weight(.semibold))
+                    Text(diagnostic.statusTitle)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(statusColor)
+                }
+                Text(diagnostic.restartDescription)
+                    .font(.caption2.weight(.medium))
+                Text(diagnostic.verificationDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 3) {
+                if let appVersion = diagnostic.appVersion {
+                    Text(appVersion)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let generatedAt = diagnostic.generatedAt {
+                    Text(generatedAt, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .help(generatedAt.formatted(date: .abbreviated, time: .standard))
+                } else {
+                    Text(diagnostic.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(9)
+        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 9))
     }
 }
 

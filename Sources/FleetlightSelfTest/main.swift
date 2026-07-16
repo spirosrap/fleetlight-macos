@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.30", build: "34") == "v1.30 (34)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.30", build: nil) == "v1.30", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "34") == "Build 34", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.31", build: "35") == "v1.31 (35)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.31", build: nil) == "v1.31", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "35") == "Build 35", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -546,7 +546,7 @@ test.require(restartVerificationSummary == LinuxRestartVerificationSummary(recen
 let observerGeneratedAt = Date(timeIntervalSince1970: 1_720_001_100)
 let observerStatus = ObserverStatusSnapshot(
     generatedAt: observerGeneratedAt,
-    appVersion: "v1.30 (34)",
+    appVersion: "v1.31 (35)",
     linuxHostCount: 4,
     restartRequiredCount: 1,
     recentVerificationCount: 4,
@@ -570,6 +570,16 @@ let observerMissingResult = CommandResult(exitCode: 4, stdout: "FLEETLIGHT_OBSER
 test.require(ObserverStatusParser.outcome(from: observerMissingResult).state == .missing, "observers that have not published yet should be distinct from offline observers")
 let observerOfflineResult = CommandResult(exitCode: 255, stdout: "", stderr: "unreachable", elapsedMilliseconds: 20, timedOut: false)
 test.require(ObserverStatusParser.outcome(from: observerOfflineResult).state == .offline, "unreachable observers should remain explicit")
+let observerDiagnostic = ObserverStatusDiagnosticBuilder.build(
+    from: ObserverStatusFetchOutcome(state: .available, snapshot: observerStatus, detail: "Available")
+)
+test.require(observerDiagnostic.statusTitle == "Reporting" && observerDiagnostic.appVersion == "v1.31 (35)", "observer details should expose the reporting Fleetlight version")
+test.require(observerDiagnostic.restartDescription == "1 restart required", "observer details should use a readable singular restart count")
+test.require(observerDiagnostic.verificationDescription == "4 Linux · 4 recent · 0 stale · 0 unverified", "observer details should summarize verification coverage")
+let waitingObserverDiagnostic = ObserverStatusDiagnosticBuilder.build(from: nil)
+test.require(waitingObserverDiagnostic.statusTitle == "Waiting" && waitingObserverDiagnostic.generatedAt == nil, "observer details should explain the pre-check state")
+let offlineObserverDiagnostic = ObserverStatusDiagnosticBuilder.build(from: ObserverStatusFetchOutcome(state: .offline, detail: "Observer is unreachable"))
+test.require(offlineObserverDiagnostic.statusTitle == "Offline" && offlineObserverDiagnostic.detail == "Observer is unreachable", "observer details should preserve an offline explanation")
 
 let matchingObserver = ObserverStatusSnapshot(
     generatedAt: observerGeneratedAt.addingTimeInterval(5),
@@ -1123,9 +1133,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.30 (34)"
+    appVersion: "v1.31 (35)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.30 (34)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.31 (35)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

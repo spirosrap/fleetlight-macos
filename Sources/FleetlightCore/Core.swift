@@ -2657,6 +2657,91 @@ public struct ObserverStatusFetchOutcome: Equatable, Sendable {
     }
 }
 
+public struct ObserverStatusDiagnostic: Equatable, Sendable {
+    public let state: ObserverStatusFetchState
+    public let statusTitle: String
+    public let generatedAt: Date?
+    public let appVersion: String?
+    public let restartDescription: String
+    public let verificationDescription: String
+    public let detail: String
+
+    public init(
+        state: ObserverStatusFetchState,
+        statusTitle: String,
+        generatedAt: Date?,
+        appVersion: String?,
+        restartDescription: String,
+        verificationDescription: String,
+        detail: String
+    ) {
+        self.state = state
+        self.statusTitle = statusTitle
+        self.generatedAt = generatedAt
+        self.appVersion = appVersion
+        self.restartDescription = restartDescription
+        self.verificationDescription = verificationDescription
+        self.detail = detail
+    }
+}
+
+public enum ObserverStatusDiagnosticBuilder {
+    public static func build(from outcome: ObserverStatusFetchOutcome?) -> ObserverStatusDiagnostic {
+        guard let outcome else {
+            return ObserverStatusDiagnostic(
+                state: .missing,
+                statusTitle: "Waiting",
+                generatedAt: nil,
+                appVersion: nil,
+                restartDescription: "No observer report",
+                verificationDescription: "Waiting for the first comparison",
+                detail: "Observer status has not been checked yet"
+            )
+        }
+
+        guard let snapshot = outcome.snapshot, outcome.state == .available else {
+            let statusTitle: String
+            switch outcome.state {
+            case .available: statusTitle = "Incomplete"
+            case .missing: statusTitle = "Not published"
+            case .offline: statusTitle = "Offline"
+            case .invalid: statusTitle = "Invalid data"
+            }
+            return ObserverStatusDiagnostic(
+                state: outcome.state,
+                statusTitle: statusTitle,
+                generatedAt: nil,
+                appVersion: nil,
+                restartDescription: "No usable observer report",
+                verificationDescription: "Verification coverage unavailable",
+                detail: outcome.detail
+            )
+        }
+
+        let restartDescription: String
+        switch snapshot.restartRequiredCount {
+        case 0: restartDescription = "No restart required"
+        case 1: restartDescription = "1 restart required"
+        default: restartDescription = "\(snapshot.restartRequiredCount) restarts required"
+        }
+        let verificationDescription = [
+            "\(snapshot.linuxHostCount) Linux",
+            "\(snapshot.recentVerificationCount) recent",
+            "\(snapshot.staleVerificationCount) stale",
+            "\(snapshot.unverifiedCount) unverified",
+        ].joined(separator: " · ")
+        return ObserverStatusDiagnostic(
+            state: .available,
+            statusTitle: "Reporting",
+            generatedAt: snapshot.generatedAt,
+            appVersion: snapshot.appVersion,
+            restartDescription: restartDescription,
+            verificationDescription: verificationDescription,
+            detail: outcome.detail
+        )
+    }
+}
+
 public enum ObserverStatusCommandBuilder {
     public static func build() -> String {
         """

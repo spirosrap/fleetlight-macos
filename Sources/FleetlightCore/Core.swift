@@ -2936,11 +2936,31 @@ public enum LinuxUpdateAnalyzer {
     }
 }
 
+public enum LinuxUpdateRecoveryPlanner {
+    public static func hostsToRecheck(
+        hosts: [FleetHost],
+        hostSnapshots: [String: HostSnapshot],
+        updateSnapshots: [String: LinuxUpdateSnapshot],
+        now: Date = Date(),
+        retryInterval: TimeInterval = 15 * 60
+    ) -> [FleetHost] {
+        let retryCutoff = now.addingTimeInterval(-retryInterval)
+        return hosts.filter { host in
+            guard hostSnapshots[host.id]?.state == .online,
+                  let updateSnapshot = updateSnapshots[host.id],
+                  updateSnapshot.state == .offline else { return false }
+            guard let checkedAt = updateSnapshot.checkedAt else { return true }
+            return checkedAt <= retryCutoff
+        }
+    }
+}
+
 
 public enum LinuxUpdateCheckCommandBuilder {
-    public static func build() -> String {
+    public static func build(refreshMetadata: Bool = true) -> String {
         """
         printf 'FLEETLIGHT_LINUX_UPDATE_CHECK\n'
+        refresh_metadata=\(refreshMetadata ? 1 : 0)
         if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
           printf 'STATUS:not-linux\n'
           exit 3
@@ -2950,7 +2970,9 @@ public enum LinuxUpdateCheckCommandBuilder {
         [ -n "$distribution" ] || distribution=$(uname -s)
         printf 'DISTRIBUTION:%s\nKERNEL:%s\n' "$distribution" "$(uname -r 2>/dev/null)"
 
-        if [ "$(id -u)" -eq 0 ]; then
+        if [ "$refresh_metadata" -eq 0 ]; then
+          run_privileged() { "$@"; }
+        elif [ "$(id -u)" -eq 0 ]; then
           run_privileged() { "$@"; }
         elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
           run_privileged() { sudo -n "$@"; }
@@ -2969,7 +2991,7 @@ public enum LinuxUpdateCheckCommandBuilder {
 
         if command -v apt-get >/dev/null 2>&1; then
           package_manager=apt
-          if ! run_privileged apt-get update >"$metadata_log" 2>&1; then
+          if [ "$refresh_metadata" -eq 1 ] && ! run_privileged apt-get update >"$metadata_log" 2>&1; then
             printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
             exit 5
           fi
@@ -2985,11 +3007,15 @@ public enum LinuxUpdateCheckCommandBuilder {
           done
         elif command -v dnf >/dev/null 2>&1; then
           package_manager=dnf
-          if ! run_privileged dnf -q makecache --refresh >"$metadata_log" 2>&1; then
+          if [ "$refresh_metadata" -eq 1 ] && ! run_privileged dnf -q makecache --refresh >"$metadata_log" 2>&1; then
             printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
             exit 5
           fi
-          dnf -q check-update >"$package_file" 2>/dev/null
+          if [ "$refresh_metadata" -eq 1 ]; then
+            dnf -q check-update >"$package_file" 2>/dev/null
+          else
+            dnf -q -C check-update >"$package_file" 2>/dev/null
+          fi
           check_status=$?
           if [ "$check_status" -ne 0 ] && [ "$check_status" -ne 100 ]; then
             printf 'PKG_MGR:%s\nSTATUS:check-failed\n' "$package_manager"
@@ -3001,8 +3027,12 @@ public enum LinuxUpdateCheckCommandBuilder {
           head -n 12 "$package_file" | awk '{printf "PACKAGE:%s||%s\n",$1,$3}'
         elif command -v yum >/dev/null 2>&1; then
           package_manager=yum
-          run_privileged yum -q makecache >"$metadata_log" 2>&1 || true
-          yum -q check-update >"$package_file" 2>/dev/null
+          if [ "$refresh_metadata" -eq 1 ]; then
+            run_privileged yum -q makecache >"$metadata_log" 2>&1 || true
+            yum -q check-update >"$package_file" 2>/dev/null
+          else
+            yum -q -C check-update >"$package_file" 2>/dev/null
+          fi
           check_status=$?
           if [ "$check_status" -ne 0 ] && [ "$check_status" -ne 100 ]; then
             printf 'PKG_MGR:%s\nSTATUS:check-failed\n' "$package_manager"
@@ -3023,7 +3053,7 @@ public enum LinuxUpdateCheckCommandBuilder {
           head -n 12 "$package_file" | awk '{printf "PACKAGE:%s|%s|%s\n",$1,$2,$4}'
         elif command -v zypper >/dev/null 2>&1; then
           package_manager=zypper
-          if ! run_privileged zypper --non-interactive refresh >"$metadata_log" 2>&1; then
+          if [ "$refresh_metadata" -eq 1 ] && ! run_privileged zypper --non-interactive refresh >"$metadata_log" 2>&1; then
             printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
             exit 5
           fi
@@ -3034,7 +3064,7 @@ public enum LinuxUpdateCheckCommandBuilder {
           head -n 12 "$package_file"
         elif command -v apk >/dev/null 2>&1; then
           package_manager=apk
-          if ! run_privileged apk update >"$metadata_log" 2>&1; then
+          if [ "$refresh_metadata" -eq 1 ] && ! run_privileged apk update >"$metadata_log" 2>&1; then
             printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
             exit 5
           fi

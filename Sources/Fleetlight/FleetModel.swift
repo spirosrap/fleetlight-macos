@@ -583,6 +583,7 @@ final class FleetModel: ObservableObject {
         }
 
         await reconcileLinuxRestartRequirements()
+        await revalidateRecoveredLinuxUpdateHosts()
         await refreshObserverConsistency()
 
         if let codexReleaseTask {
@@ -709,6 +710,55 @@ final class FleetModel: ObservableObject {
             )
             lastObserverConsistencyDetail = summary.detail
         }
+    }
+
+    private func revalidateRecoveredLinuxUpdateHosts() async {
+        let targets = LinuxUpdateRecoveryPlanner.hostsToRecheck(
+            hosts: linuxUpdateHosts,
+            hostSnapshots: snapshots,
+            updateSnapshots: linuxUpdateSnapshots
+        )
+        guard !targets.isEmpty else { return }
+
+        for host in targets {
+            let previous = linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot()
+            linuxUpdateSnapshots[host.id] = LinuxUpdateSnapshot(
+                state: .checking,
+                distribution: previous.distribution,
+                kernelVersion: previous.kernelVersion,
+                packageManager: previous.packageManager,
+                packageUpdateCount: previous.packageUpdateCount,
+                securityUpdateCount: previous.securityUpdateCount,
+                snapUpdateCount: previous.snapUpdateCount,
+                flatpakUpdateCount: previous.flatpakUpdateCount,
+                availablePackages: previous.availablePackages,
+                rebootRequired: previous.rebootRequired,
+                restartCheckedAt: previous.restartCheckedAt,
+                checkedAt: previous.checkedAt,
+                detail: "Machine is online · rechecking cached package status…"
+            )
+        }
+
+        await withTaskGroup(of: (String, LinuxUpdateSnapshot).self) { group in
+            for host in targets {
+                let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+                group.addTask {
+                    let result = await Self.runLinuxUpdateRecoveryCheck(host: host, routeAlias: routeAlias)
+                    return (host.id, LinuxUpdateCheckParser.snapshot(from: result))
+                }
+            }
+            for await (hostID, snapshot) in group {
+                linuxUpdateSnapshots[hostID] = snapshot
+                await ActivityLogger.shared.append(
+                    event: "linux-update-recovery-checked",
+                    host: hostID,
+                    detail: snapshot.detail
+                )
+            }
+        }
+
+        LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+        reconcileClearedRestartDetails()
     }
 
     func checkObserverConsistencyNow() async {
@@ -2408,6 +2458,18 @@ final class FleetModel: ObservableObject {
             host: host,
             routeAlias: routeAlias,
             timeout: 180
+        )
+    }
+
+    nonisolated private static func runLinuxUpdateRecoveryCheck(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> CommandResult {
+        await runLinuxCommand(
+            LinuxUpdateCheckCommandBuilder.build(refreshMetadata: false),
+            host: host,
+            routeAlias: routeAlias,
+            timeout: 60
         )
     }
 

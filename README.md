@@ -96,6 +96,7 @@ Supported machine fields:
 - A lightweight **Verify Now** action and restart freshness summary that separates recently verified, stale, unverified, and restart-required Linux machines without refreshing package metadata
 - Privacy-safe observer snapshots and a visible agreement check, so two Macs running Fleetlight expose stale or contradictory restart summaries instead of silently showing different answers
 - Expandable per-observer diagnostics with Fleetlight version, report age, restart count, verification coverage, and an on-demand **Recheck** action
+- Automatic lightweight package revalidation after a previously offline Linux machine is reachable again, replacing stale red warnings with current package status while respecting a retry cooldown
 - Confirmed per-Mac and fleet-wide desktop app updates through OpenAI’s signed updater, with automatic relaunch and post-update verification
 - Dedicated Codex dashboard with fleet-wide Current, Updates, Offline, and Unknown counts plus per-machine versions and direct update actions
 - Cached checks of npm's stable Codex release, with per-machine update badges and a fleet-level available-version summary

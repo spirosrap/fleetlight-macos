@@ -14,9 +14,9 @@ private final class Harness {
 }
 
 private let test = Harness()
-test.require(FleetlightVersion.displayLabel(version: "1.31", build: "35") == "v1.31 (35)", "app version labels should show both release and build")
-test.require(FleetlightVersion.displayLabel(version: "1.31", build: nil) == "v1.31", "app version labels should support a missing build")
-test.require(FleetlightVersion.displayLabel(version: nil, build: "35") == "Build 35", "app version labels should support a build-only bundle")
+test.require(FleetlightVersion.displayLabel(version: "1.32", build: "36") == "v1.32 (36)", "app version labels should show both release and build")
+test.require(FleetlightVersion.displayLabel(version: "1.32", build: nil) == "v1.32", "app version labels should support a missing build")
+test.require(FleetlightVersion.displayLabel(version: nil, build: "36") == "Build 36", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
@@ -417,9 +417,13 @@ test.require(offlineCodexOutcome.detail == "Offline — SSH timed out", "offline
 
 let linuxCheckCommand = LinuxUpdateCheckCommandBuilder.build()
 test.require(linuxCheckCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE_CHECK"), "Linux checks should emit a verification marker")
+test.require(linuxCheckCommand.contains("refresh_metadata=1"), "manual Linux checks should refresh package metadata")
 test.require(linuxCheckCommand.contains("apt-get update"), "Linux checks should refresh apt metadata before reporting availability")
 test.require(linuxCheckCommand.contains("snap refresh --list"), "Linux checks should include available Snap versions")
 test.require(linuxCheckCommand.contains("flatpak remote-ls --updates"), "Linux checks should include available Flatpak versions")
+let recoveredLinuxCheckCommand = LinuxUpdateCheckCommandBuilder.build(refreshMetadata: false)
+test.require(recoveredLinuxCheckCommand.contains("refresh_metadata=0"), "recovered machines should use a lightweight cached-metadata recheck")
+test.require(recoveredLinuxCheckCommand.contains("if [ \"$refresh_metadata\" -eq 0 ]"), "lightweight recovery checks should not require package-manager privileges")
 
 let linuxUpdateCommand = LinuxUpdateCommandBuilder.build()
 test.require(linuxUpdateCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE"), "Linux updates should emit a verification marker")
@@ -524,6 +528,52 @@ test.require(linuxSummary == LinuxUpdateSummary(currentCount: 1, updateAvailable
 test.require(LinuxUpdateAnalyzer.availableHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot]).map(\.id) == ["updates"], "sequential Linux updates should target only machines with known updates")
 test.require(LinuxUpdateAnalyzer.restartRequiredHosts(hosts: linuxUpdateHosts, snapshots: ["updates": availableLinuxSnapshot, "current-linux": currentLinuxSnapshot]).map(\.id) == ["updates"], "Linux restarts should target only machines reporting restart required")
 
+let recoveryNow = Date(timeIntervalSince1970: 1_720_000_900)
+let recoverableOfflineSnapshot = LinuxUpdateSnapshot(
+    state: .offline,
+    checkedAt: recoveryNow.addingTimeInterval(-1_000),
+    detail: "SSH timed out"
+)
+let recoveryHostSnapshots = [
+    "updates": HostSnapshot(state: .online),
+    "current-linux": HostSnapshot(state: .online),
+    "offline-linux": HostSnapshot(state: .online),
+]
+test.require(
+    LinuxUpdateRecoveryPlanner.hostsToRecheck(
+        hosts: linuxUpdateHosts,
+        hostSnapshots: recoveryHostSnapshots,
+        updateSnapshots: [
+            "updates": availableLinuxSnapshot,
+            "current-linux": currentLinuxSnapshot,
+            "offline-linux": recoverableOfflineSnapshot,
+        ],
+        now: recoveryNow,
+        retryInterval: 900
+    ).map(\.id) == ["offline-linux"],
+    "an old offline package result should recheck automatically after normal monitoring proves the machine is online"
+)
+test.require(
+    LinuxUpdateRecoveryPlanner.hostsToRecheck(
+        hosts: linuxUpdateHosts,
+        hostSnapshots: ["offline-linux": HostSnapshot(state: .unreachable)],
+        updateSnapshots: ["offline-linux": recoverableOfflineSnapshot],
+        now: recoveryNow,
+        retryInterval: 900
+    ).isEmpty,
+    "offline machines should not run recovery package checks"
+)
+test.require(
+    LinuxUpdateRecoveryPlanner.hostsToRecheck(
+        hosts: linuxUpdateHosts,
+        hostSnapshots: recoveryHostSnapshots,
+        updateSnapshots: ["offline-linux": LinuxUpdateSnapshot(state: .offline, checkedAt: recoveryNow.addingTimeInterval(-60))],
+        now: recoveryNow,
+        retryInterval: 900
+    ).isEmpty,
+    "recent failed package checks should honor the retry cooldown"
+)
+
 let restartSummaryNow = Date(timeIntervalSince1970: 1_720_001_000)
 let restartSummaryHosts = [
     FleetHost(id: "recent", displayName: "Recent", systemImage: "server.rack", supportsLinuxUpdates: true),
@@ -546,7 +596,7 @@ test.require(restartVerificationSummary == LinuxRestartVerificationSummary(recen
 let observerGeneratedAt = Date(timeIntervalSince1970: 1_720_001_100)
 let observerStatus = ObserverStatusSnapshot(
     generatedAt: observerGeneratedAt,
-    appVersion: "v1.31 (35)",
+    appVersion: "v1.32 (36)",
     linuxHostCount: 4,
     restartRequiredCount: 1,
     recentVerificationCount: 4,
@@ -573,7 +623,7 @@ test.require(ObserverStatusParser.outcome(from: observerOfflineResult).state == 
 let observerDiagnostic = ObserverStatusDiagnosticBuilder.build(
     from: ObserverStatusFetchOutcome(state: .available, snapshot: observerStatus, detail: "Available")
 )
-test.require(observerDiagnostic.statusTitle == "Reporting" && observerDiagnostic.appVersion == "v1.31 (35)", "observer details should expose the reporting Fleetlight version")
+test.require(observerDiagnostic.statusTitle == "Reporting" && observerDiagnostic.appVersion == "v1.32 (36)", "observer details should expose the reporting Fleetlight version")
 test.require(observerDiagnostic.restartDescription == "1 restart required", "observer details should use a readable singular restart count")
 test.require(observerDiagnostic.verificationDescription == "4 Linux · 4 recent · 0 stale · 0 unverified", "observer details should summarize verification coverage")
 let waitingObserverDiagnostic = ObserverStatusDiagnosticBuilder.build(from: nil)
@@ -1133,9 +1183,9 @@ let serviceReport = FleetServiceReportBuilder.build(
     entries: serviceDashboardEntries,
     generatedAt: serviceCheckTime,
     observerName: "Test Observer",
-    appVersion: "v1.31 (35)"
+    appVersion: "v1.32 (36)"
 )
-test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.31 (35)"), "service reports should identify their observer and Fleetlight build")
+test.require(serviceReport.contains("Observer: Test Observer · Fleetlight v1.32 (36)"), "service reports should identify their observer and Fleetlight build")
 test.require(serviceReport.contains("Configured 5 · Healthy 1 · Attention 1 · Unavailable 3"), "service reports should include unambiguous status totals")
 test.require(serviceReport.contains("Docker — 0/1 healthy"), "service reports should group checks by service")
 test.require(serviceReport.contains("Healthy Host [service-healthy]: Stopped · Stopped · checked"), "service reports should include machine state, details, and check freshness")

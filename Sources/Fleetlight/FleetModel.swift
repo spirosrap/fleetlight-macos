@@ -66,6 +66,12 @@ final class FleetModel: ObservableObject {
     @Published var notificationsEnabled: Bool
     @Published var codexUpdateAlertsEnabled: Bool
     @Published private(set) var performanceThresholds: PerformanceThresholds
+    @Published private(set) var mobileControlPairedDeviceCount = MobileControlCredentialStore.shared.count()
+    @Published private(set) var mobileControlCommandAuthorityEnabled = UserDefaults.standard.bool(
+        forKey: "mobileControlCommandAuthorityEnabled"
+    )
+    @Published private(set) var mobileControlJobJournalAvailable = true
+    @Published private(set) var mobileControlPairingDisplay: MobileControlPairingDisplay?
     @Published var notice: String?
 
     private var started = false
@@ -73,6 +79,7 @@ final class FleetModel: ObservableObject {
     private var observerHeartbeatTask: Task<Void, Never>?
     private var routeValidationTask: Task<Void, Never>?
     private var queuedRefreshTask: Task<Void, Never>?
+    private var mobileControlPairingExpiryTask: Task<Void, Never>?
     private var refreshRequestQueue = RefreshRequestQueue()
     private var linuxRefreshDeferralDepth = 0
     private var failureCounts: [String: Int] = [:]
@@ -90,6 +97,9 @@ final class FleetModel: ObservableObject {
     private var observerStatusCheckedAt: Date?
     private var codexReleaseCheckedAt: Date?
     private var codexDesktopAppReleaseCheckedAt: Date?
+    private var mobileControlPairingChallenge: MobileControlPairingChallenge?
+    private var mobileControlJobs: [MobileControlJob] = []
+    private var mobileControlActiveJobID: UUID?
 
     private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
     private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
@@ -101,6 +111,13 @@ final class FleetModel: ObservableObject {
         let resolvedHosts = FleetHost.resolvingLocalHost(in: configurationResult.configuration.hosts)
         hosts = resolvedHosts
         snapshots = Dictionary(uniqueKeysWithValues: resolvedHosts.map { ($0.id, HostSnapshot()) })
+        let mobileControlJournal = MobileControlJobStore.load()
+        mobileControlJobs = mobileControlJournal.jobs
+        mobileControlJobJournalAvailable = mobileControlJournal.isAvailable
+        if !mobileControlJournal.isAvailable {
+            mobileControlCommandAuthorityEnabled = false
+            UserDefaults.standard.set(false, forKey: "mobileControlCommandAuthorityEnabled")
+        }
         hiddenHostIDs = Set(UserDefaults.standard.stringArray(forKey: "hiddenHostIDs") ?? [])
         let configuredInterval = UserDefaults.standard.double(forKey: "refreshInterval")
         refreshInterval = configuredInterval >= 30 ? configuredInterval : 60
@@ -130,6 +147,7 @@ final class FleetModel: ObservableObject {
         notice = configurationResult.notice
         restoreCodexUpdateBatch()
         restoreLinuxUpdateBatch()
+        reconcileInterruptedMobileControlJobs()
     }
 
     deinit {
@@ -137,6 +155,7 @@ final class FleetModel: ObservableObject {
         observerHeartbeatTask?.cancel()
         routeValidationTask?.cancel()
         queuedRefreshTask?.cancel()
+        mobileControlPairingExpiryTask?.cancel()
     }
 
     var attentionSummary: FleetAttentionSummary {
@@ -312,7 +331,7 @@ final class FleetModel: ObservableObject {
     }
 
     var isAnyUpdateOperationRunning: Bool {
-        isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+        mobileControlActiveJobID != nil || isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
     }
 
     private var isLinuxRefreshBlocked: Bool {
@@ -571,7 +590,28 @@ final class FleetModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
-        MobileFeedHTTPServer.shared.start()
+        MobileFeedHTTPServer.shared.start(
+            controlHandler: { [weak self] request in
+                guard let self else {
+                    return MobileControlHTTPResponse(
+                        statusCode: 503,
+                        reason: "Service Unavailable",
+                        body: Data(#"{"schemaVersion":1,"error":{"code":"controller-unavailable","message":"Fleetlight is unavailable"}}"#.utf8)
+                    )
+                }
+                return await self.handleMobileControlHTTPRequest(request)
+            },
+            localPairingHandler: { [weak self] request in
+                guard let self else {
+                    return MobileControlHTTPResponse(
+                        statusCode: 503,
+                        reason: "Service Unavailable",
+                        body: Data(#"{"schemaVersion":1,"error":{"code":"controller-unavailable","message":"Fleetlight is unavailable"}}"#.utf8)
+                    )
+                }
+                return await self.handleLocalMobilePairingStartRequest(request)
+            }
+        )
         scheduleObserverHeartbeat()
         let startupStartedAt = DispatchTime.now().uptimeNanoseconds
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -2397,6 +2437,648 @@ final class FleetModel: ObservableObject {
         CodexUpdateBatchStore.clear()
         notice = "Cleared the previous Codex operation result"
         await ActivityLogger.shared.append(event: "codex-update-result-cleared")
+    }
+
+    func beginMobileControlPairing() -> MobileControlPairingDisplay {
+        mobileControlPairingExpiryTask?.cancel()
+        let now = Date()
+        let expiresAt = now.addingTimeInterval(2 * 60)
+        guard let code = try? MobileControlCrypto.randomPairingCode() else {
+            mobileControlPairingChallenge = nil
+            let unavailable = MobileControlPairingDisplay(code: "Unavailable", expiresAt: now)
+            mobileControlPairingDisplay = unavailable
+            notice = "Could not create a secure mobile pairing code"
+            return unavailable
+        }
+
+        let display = MobileControlPairingDisplay(code: code, expiresAt: expiresAt)
+        mobileControlPairingChallenge = MobileControlPairingChallenge(
+            codeHash: MobileControlCrypto.hash(code),
+            expiresAt: expiresAt,
+            failedAttempts: 0
+        )
+        mobileControlPairingDisplay = display
+        mobileControlPairingExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2 * 60))
+            guard let self, !Task.isCancelled,
+                  self.mobileControlPairingChallenge?.expiresAt == expiresAt else { return }
+            self.clearMobileControlPairingChallenge()
+        }
+        notice = "Mobile pairing code expires in 2 minutes"
+        return display
+    }
+
+    func revokeMobileControlDevices() {
+        do {
+            try MobileControlCredentialStore.shared.revokeAll()
+            mobileControlPairedDeviceCount = 0
+            clearMobileControlPairingChallenge()
+            notice = "Revoked all mobile control devices"
+            Task { await ActivityLogger.shared.append(event: "mobile-control-devices-revoked") }
+        } catch {
+            notice = "Could not revoke mobile control devices"
+        }
+    }
+
+    func setMobileControlCommandAuthorityEnabled(_ enabled: Bool) {
+        guard !enabled || mobileControlJobJournalAvailable else {
+            notice = "Mobile control is unavailable because its request journal could not be read"
+            return
+        }
+        guard mobileControlCommandAuthorityEnabled != enabled else { return }
+        mobileControlCommandAuthorityEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "mobileControlCommandAuthorityEnabled")
+        if !enabled { clearMobileControlPairingChallenge() }
+        notice = enabled
+            ? "This Mac can accept authenticated mobile update commands"
+            : "Mobile update commands are disabled on this Mac"
+        Task {
+            await ActivityLogger.shared.append(
+                event: "mobile-control-authority-changed",
+                detail: enabled ? "enabled" : "disabled"
+            )
+        }
+    }
+
+    private func clearMobileControlPairingChallenge() {
+        mobileControlPairingExpiryTask?.cancel()
+        mobileControlPairingExpiryTask = nil
+        mobileControlPairingChallenge = nil
+        mobileControlPairingDisplay = nil
+    }
+
+    private func consumeMobileControlPairingCode(_ candidate: String, now: Date = Date()) throws {
+        guard var challenge = mobileControlPairingChallenge else {
+            throw MobileControlPairingValidationError.unavailable
+        }
+        guard now < challenge.expiresAt else {
+            clearMobileControlPairingChallenge()
+            throw MobileControlPairingValidationError.expired
+        }
+        guard challenge.failedAttempts < 5 else {
+            clearMobileControlPairingChallenge()
+            throw MobileControlPairingValidationError.rateLimited
+        }
+
+        let matches = MobileControlCrypto.constantTimeEqual(
+            MobileControlCrypto.hash(candidate),
+            challenge.codeHash
+        )
+        guard matches else {
+            challenge.failedAttempts += 1
+            if challenge.failedAttempts >= 5 {
+                clearMobileControlPairingChallenge()
+                throw MobileControlPairingValidationError.rateLimited
+            }
+            mobileControlPairingChallenge = challenge
+            throw MobileControlPairingValidationError.invalid
+        }
+        clearMobileControlPairingChallenge()
+    }
+
+    private func reconcileInterruptedMobileControlJobs() {
+        guard mobileControlJobJournalAvailable else { return }
+        var changed = false
+        for index in mobileControlJobs.indices where !mobileControlJobs[index].state.isTerminal {
+            var job = mobileControlJobs[index]
+            job.state = .failed
+            job.finishedAt = Date()
+            job.progress = job.targetHostIds.map { hostID in
+                MobileControlHostProgress(
+                    hostId: hostID,
+                    phase: "failed",
+                    detail: "Not completed because the controller restarted"
+                )
+            }
+            job.completed = job.total
+            mobileControlJobs[index] = job
+            changed = true
+        }
+        if changed, !MobileControlJobStore.save(mobileControlJobs) {
+            markMobileControlJournalUnavailable()
+        }
+    }
+
+    func handleLocalMobilePairingStartRequest(
+        _ request: MobileControlHTTPRequest
+    ) async -> MobileControlHTTPResponse {
+        let path = request.path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.path
+        guard path == "/pairing/start" else {
+            return mobileControlError(status: 404, reason: "Not Found", code: "not-found", message: "Route not found")
+        }
+        guard request.method == "POST" else {
+            return mobileControlError(status: 405, reason: "Method Not Allowed", code: "method-not-allowed", message: "POST is required")
+        }
+        guard mobileControlCommandAuthorityEnabled else {
+            return mobileControlError(status: 403, reason: "Forbidden", code: "control-disabled", message: "Mobile command authority is disabled")
+        }
+        guard UserDefaults.standard.bool(forKey: "mobileControlLocalPairingAdminEnabled") else {
+            return mobileControlError(status: 403, reason: "Forbidden", code: "local-pairing-disabled", message: "Local administrative pairing is not armed")
+        }
+        // This endpoint is an explicit one-shot administrative escape hatch.
+        // Consume the opt-in before generating or returning a code.
+        UserDefaults.standard.set(false, forKey: "mobileControlLocalPairingAdminEnabled")
+        return mobileControlJSONResponse(beginMobileControlPairing(), status: 200, reason: "OK")
+    }
+
+    func handleMobileControlHTTPRequest(
+        _ request: MobileControlHTTPRequest
+    ) async -> MobileControlHTTPResponse {
+        let canonicalPath = mobileControlCanonicalPath(request.path)
+        guard canonicalPath != nil else {
+            return mobileControlError(status: 404, reason: "Not Found", code: "not-found", message: "Route not found")
+        }
+        guard mobileControlCommandAuthorityEnabled else {
+            return mobileControlError(status: 403, reason: "Forbidden", code: "control-disabled", message: "Mobile command authority is disabled")
+        }
+        guard let path = canonicalPath else {
+            return mobileControlError(status: 404, reason: "Not Found", code: "not-found", message: "Route not found")
+        }
+
+        if path == "/control/v1/pair" {
+            return await handleMobileControlPair(request)
+        }
+
+        guard let credential = authenticatedMobileControlCredential(for: request) else {
+            return mobileControlError(status: 401, reason: "Unauthorized", code: "invalid-credential", message: "A valid paired-device credential is required")
+        }
+
+        switch (request.method, path) {
+        case ("GET", "/control/v1/status"):
+            return mobileControlJSONResponse(mobileControlStatus(), status: 200, reason: "OK")
+        case ("POST", "/control/v1/jobs"):
+            return await handleMobileControlJobCreation(request, credential: credential)
+        case ("GET", let jobPath) where jobPath.hasPrefix("/control/v1/jobs/by-request/"):
+            let rawID = String(jobPath.dropFirst("/control/v1/jobs/by-request/".count))
+            guard let requestID = UUID(uuidString: rawID),
+                  let job = mobileControlJobs.first(where: { $0.requestId == requestID }) else {
+                return mobileControlError(status: 404, reason: "Not Found", code: "job-not-found", message: "No job exists for that request ID")
+            }
+            return mobileControlJSONResponse(mobileControlJobSnapshot(job), status: 200, reason: "OK")
+        case ("GET", let jobPath) where jobPath.hasPrefix("/control/v1/jobs/"):
+            let rawID = String(jobPath.dropFirst("/control/v1/jobs/".count))
+            guard let jobID = UUID(uuidString: rawID),
+                  let job = mobileControlJobs.first(where: { $0.id == jobID }) else {
+                return mobileControlError(status: 404, reason: "Not Found", code: "job-not-found", message: "Job not found")
+            }
+            return mobileControlJSONResponse(mobileControlJobSnapshot(job), status: 200, reason: "OK")
+        default:
+            return mobileControlError(status: 404, reason: "Not Found", code: "not-found", message: "Route not found")
+        }
+    }
+
+    private func handleMobileControlPair(
+        _ request: MobileControlHTTPRequest
+    ) async -> MobileControlHTTPResponse {
+        guard request.method == "POST" else {
+            return mobileControlError(status: 405, reason: "Method Not Allowed", code: "method-not-allowed", message: "POST is required")
+        }
+        guard let tailscaleLogin = normalizedTailscaleLogin(request.header("Tailscale-User-Login")) else {
+            return mobileControlError(status: 403, reason: "Forbidden", code: "identity-missing", message: "A Tailscale user identity is required")
+        }
+        guard mobileControlRequestHasJSONContentType(request) else {
+            return mobileControlError(status: 415, reason: "Unsupported Media Type", code: "json-required", message: "Content-Type must be application/json")
+        }
+
+        let decoder = mobileControlJSONDecoder()
+        guard let pairRequest = try? decoder.decode(MobileControlPairRequest.self, from: request.body),
+              pairRequest.code.count == 8,
+              pairRequest.code.allSatisfy(\.isNumber),
+              isValidMobileControlDeviceID(pairRequest.deviceId),
+              let deviceName = normalizedMobileControlDeviceName(pairRequest.deviceName) else {
+            return mobileControlError(status: 400, reason: "Bad Request", code: "invalid-pair-request", message: "Pairing request fields are invalid")
+        }
+
+        do {
+            try consumeMobileControlPairingCode(pairRequest.code)
+        } catch MobileControlPairingValidationError.expired {
+            return mobileControlError(status: 410, reason: "Gone", code: "pairing-expired", message: "The pairing code expired")
+        } catch MobileControlPairingValidationError.rateLimited {
+            return mobileControlError(status: 429, reason: "Too Many Requests", code: "pairing-rate-limited", message: "Too many pairing attempts; create a new code")
+        } catch MobileControlPairingValidationError.invalid {
+            return mobileControlError(status: 401, reason: "Unauthorized", code: "pairing-invalid", message: "The pairing code is invalid")
+        } catch {
+            return mobileControlError(status: 410, reason: "Gone", code: "pairing-unavailable", message: "Create a new pairing code on the controller")
+        }
+
+        let pairedAt = Date()
+        do {
+            let token = try MobileControlCredentialStore.shared.issue(
+                deviceId: pairRequest.deviceId,
+                deviceName: deviceName,
+                tailscaleLogin: tailscaleLogin,
+                pairedAt: pairedAt
+            )
+            mobileControlPairedDeviceCount = MobileControlCredentialStore.shared.count()
+            await ActivityLogger.shared.append(
+                event: "mobile-control-device-paired",
+                detail: "device=\(MobileFeedSanitizer.redact(deviceName))"
+            )
+            return mobileControlJSONResponse(
+                MobileControlPairResponse(
+                    deviceId: pairRequest.deviceId,
+                    token: token,
+                    controllerId: mobileControlControllerID,
+                    controllerName: FleetObserver.currentDisplayName,
+                    pairedAt: pairedAt
+                ),
+                status: 201,
+                reason: "Created"
+            )
+        } catch {
+            return mobileControlError(status: 500, reason: "Internal Server Error", code: "credential-store-failed", message: "Could not save the paired-device credential")
+        }
+    }
+
+    private func handleMobileControlJobCreation(
+        _ request: MobileControlHTTPRequest,
+        credential: MobileControlPairedCredential
+    ) async -> MobileControlHTTPResponse {
+        guard mobileControlRequestHasJSONContentType(request) else {
+            return mobileControlError(status: 415, reason: "Unsupported Media Type", code: "json-required", message: "Content-Type must be application/json")
+        }
+        guard let jobRequest = try? mobileControlJSONDecoder().decode(MobileControlJobRequest.self, from: request.body) else {
+            return mobileControlError(status: 400, reason: "Bad Request", code: "invalid-job-request", message: "The job request is invalid")
+        }
+        guard let idempotencyKey = request.header("Idempotency-Key"),
+              UUID(uuidString: idempotencyKey) == jobRequest.requestId else {
+            return mobileControlError(status: 400, reason: "Bad Request", code: "idempotency-key-mismatch", message: "Idempotency-Key must match requestId")
+        }
+
+        if let existing = mobileControlJobs.first(where: { $0.requestId == jobRequest.requestId }) {
+            guard existing.action == jobRequest.action,
+                  existing.targetHostIds == jobRequest.targetHostIds else {
+                await ActivityLogger.shared.append(
+                    event: "mobile-control-job-rejected",
+                    detail: "request=conflicting-replay"
+                )
+                return mobileControlError(status: 409, reason: "Conflict", code: "request-id-conflict", message: "That request ID was already used with a different operation")
+            }
+            return mobileControlJSONResponse(mobileControlJobSnapshot(existing), status: 200, reason: "OK")
+        }
+
+        guard mobileControlJobJournalAvailable else {
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal is unavailable; no update was started")
+        }
+        guard mobileControlActiveJobID == nil,
+              !isRefreshing,
+              !isAnyUpdateOperationRunning,
+              !isCheckingCodexRelease,
+              !isCheckingCodexDesktopAppRelease else {
+            return mobileControlError(status: 409, reason: "Conflict", code: "controller-busy", message: "Another fleet operation is already running")
+        }
+
+        let targetResult = mobileControlTargets(for: jobRequest)
+        guard case let .success(targets) = targetResult else {
+            let detail: String
+            if case let .failure(error) = targetResult { detail = error.localizedDescription } else { detail = "Targets are not eligible" }
+            await ActivityLogger.shared.append(
+                event: "mobile-control-job-rejected",
+                detail: "action=\(jobRequest.action.rawValue); targets=\(jobRequest.targetHostIds.count)"
+            )
+            return mobileControlError(status: 422, reason: "Unprocessable Content", code: "targets-not-eligible", message: detail)
+        }
+
+        let job = MobileControlJob(
+            requestId: jobRequest.requestId,
+            action: jobRequest.action,
+            targetHostIds: targets.map(\.id),
+            progress: targets.map {
+                MobileControlHostProgress(hostId: $0.id, phase: "queued", detail: "Waiting")
+            }
+        )
+        var updatedJobs = mobileControlJobs
+        updatedJobs.insert(job, at: 0)
+        do {
+            try MobileControlJobStore.saveDurably(updatedJobs)
+        } catch {
+            markMobileControlJournalUnavailable()
+            await ActivityLogger.shared.append(
+                event: "mobile-control-job-rejected",
+                detail: "action=\(job.action.rawValue); reason=journal-write-failed"
+            )
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal could not be saved; no update was started")
+        }
+        mobileControlJobs = updatedJobs
+        mobileControlActiveJobID = job.id
+        await ActivityLogger.shared.append(
+            event: "mobile-control-job-accepted",
+            detail: "job=\(job.id.uuidString); action=\(job.action.rawValue); targets=\(job.total); device=\(MobileFeedSanitizer.redact(credential.deviceName))"
+        )
+        Task { @MainActor [weak self] in
+            await self?.runMobileControlJob(job.id, targets: targets)
+        }
+        return mobileControlJSONResponse(job, status: 202, reason: "Accepted")
+    }
+
+    private struct MobileControlTargetError: LocalizedError {
+        let errorDescription: String?
+    }
+
+    private func mobileControlTargets(
+        for request: MobileControlJobRequest
+    ) -> Result<[FleetHost], MobileControlTargetError> {
+        guard !request.targetHostIds.isEmpty,
+              request.targetHostIds.count <= visibleHosts.count,
+              Set(request.targetHostIds).count == request.targetHostIds.count else {
+            return .failure(MobileControlTargetError(errorDescription: "Choose one or more unique fleet machines"))
+        }
+        let hostsByID = Dictionary(uniqueKeysWithValues: visibleHosts.map { ($0.id, $0) })
+        let targets = request.targetHostIds.compactMap { hostsByID[$0] }
+        guard targets.count == request.targetHostIds.count else {
+            return .failure(MobileControlTargetError(errorDescription: "One or more machines are not configured"))
+        }
+
+        for host in targets {
+            let eligible: Bool
+            switch request.action {
+            case .codexCLI:
+                eligible = codexFleetVersionState(for: host) == .updateAvailable
+            case .codexMacApp:
+                eligible = codexDesktopAppUpdateAvailableHosts.contains(where: { $0.id == host.id })
+            case .linuxOS:
+                eligible = linuxUpdateHosts.contains(where: { $0.id == host.id })
+                    && linuxUpdateSnapshots[host.id]?.state == .updateAvailable
+            }
+            guard eligible else {
+                return .failure(MobileControlTargetError(
+                    errorDescription: "\(host.displayName) is not currently eligible for \(request.action.rawValue)"
+                ))
+            }
+        }
+        return .success(targets)
+    }
+
+    private func runMobileControlJob(_ jobID: UUID, targets: [FleetHost]) async {
+        guard let index = mobileControlJobs.firstIndex(where: { $0.id == jobID }),
+              mobileControlActiveJobID == jobID else { return }
+        mobileControlJobs[index].state = .running
+        mobileControlJobs[index].startedAt = Date()
+        mobileControlJobs[index].progress = targets.map {
+            MobileControlHostProgress(hostId: $0.id, phase: "queued", detail: "Waiting")
+        }
+        if !MobileControlJobStore.save(mobileControlJobs) { markMobileControlJournalUnavailable() }
+        let action = mobileControlJobs[index].action
+
+        let monitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, !Task.isCancelled else { return }
+                self.syncMobileControlJobProgress(jobID)
+            }
+        }
+
+        switch action {
+        case .codexCLI:
+            await performCodexUpdates(on: targets)
+        case .codexMacApp:
+            await performCodexDesktopAppUpdates(on: targets)
+        case .linuxOS:
+            await performLinuxUpdates(on: targets)
+        }
+
+        monitor.cancel()
+        _ = await monitor.result
+        finishMobileControlJob(jobID)
+    }
+
+    private func syncMobileControlJobProgress(_ jobID: UUID) {
+        guard let index = mobileControlJobs.firstIndex(where: { $0.id == jobID }) else { return }
+        let job = mobileControlJobs[index]
+        guard !job.state.isTerminal else { return }
+        let progress = job.targetHostIds.map { hostID -> MobileControlHostProgress in
+            switch job.action {
+            case .codexCLI:
+                let value = codexUpdates[hostID]
+                return MobileControlHostProgress(
+                    hostId: hostID,
+                    phase: value?.phase.rawValue ?? "queued",
+                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
+                )
+            case .codexMacApp:
+                let value = codexDesktopAppUpdates[hostID]
+                return MobileControlHostProgress(
+                    hostId: hostID,
+                    phase: value?.phase.rawValue ?? "queued",
+                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
+                )
+            case .linuxOS:
+                let value = linuxUpdates[hostID]
+                return MobileControlHostProgress(
+                    hostId: hostID,
+                    phase: value?.phase.rawValue ?? "queued",
+                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
+                )
+            }
+        }
+        let completed = progress.filter {
+            ["succeeded", "offline", "failed"].contains($0.phase)
+        }.count
+        guard progress != mobileControlJobs[index].progress
+                || completed != mobileControlJobs[index].completed else { return }
+        mobileControlJobs[index].progress = progress
+        mobileControlJobs[index].completed = completed
+        if !MobileControlJobStore.save(mobileControlJobs) { markMobileControlJournalUnavailable() }
+    }
+
+    private func finishMobileControlJob(_ jobID: UUID) {
+        syncMobileControlJobProgress(jobID)
+        guard let index = mobileControlJobs.firstIndex(where: { $0.id == jobID }) else { return }
+        var job = mobileControlJobs[index]
+        job.progress = job.progress.map { value in
+            guard !["queued", "notAttempted", "updating"].contains(value.phase) else {
+                return MobileControlHostProgress(
+                    hostId: value.hostId,
+                    phase: "failed",
+                    detail: "Operation did not complete"
+                )
+            }
+            return value
+        }
+        let succeeded = job.progress.filter { $0.phase == "succeeded" }.count
+        job.completed = job.total
+        job.finishedAt = Date()
+        if succeeded == job.total {
+            job.state = .succeeded
+        } else if succeeded > 0 {
+            job.state = .partial
+        } else {
+            job.state = .failed
+        }
+        mobileControlJobs[index] = job
+        mobileControlActiveJobID = nil
+        if !MobileControlJobStore.save(mobileControlJobs) { markMobileControlJournalUnavailable() }
+        Task {
+            await ActivityLogger.shared.append(
+                event: "mobile-control-job-finished",
+                detail: "job=\(job.id.uuidString); state=\(job.state.rawValue); completed=\(job.completed)"
+            )
+        }
+    }
+
+    private func mobileControlJobSnapshot(_ job: MobileControlJob) -> MobileControlJob {
+        if job.id == mobileControlActiveJobID {
+            syncMobileControlJobProgress(job.id)
+            return mobileControlJobs.first(where: { $0.id == job.id }) ?? job
+        }
+        var sanitized = job
+        sanitized.progress = job.progress.map {
+            MobileControlHostProgress(
+                hostId: $0.hostId,
+                phase: $0.phase,
+                detail: MobileFeedSanitizer.redact($0.detail)
+            )
+        }
+        return sanitized
+    }
+
+    private func mobileControlStatus() -> MobileControlStatus {
+        if let mobileControlActiveJobID { syncMobileControlJobProgress(mobileControlActiveJobID) }
+        let cliAvailable = Set(codexUpdateAvailableHosts.map(\.id))
+        let appAvailable = Set(codexDesktopAppUpdateAvailableHosts.map(\.id))
+        let linuxAvailable = Set(linuxUpdateAvailableHosts.map(\.id))
+        let capabilities = visibleHosts.map { host -> MobileControlHostCapability in
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            var actions: [MobileControlAction] = []
+            if cliAvailable.contains(host.id) { actions.append(.codexCLI) }
+            if appAvailable.contains(host.id) { actions.append(.codexMacApp) }
+            if linuxAvailable.contains(host.id) { actions.append(.linuxOS) }
+            return MobileControlHostCapability(
+                hostId: host.id,
+                hostName: host.displayName,
+                state: snapshot.state.rawValue,
+                actions: actions,
+                codexCliUpdateAvailable: cliAvailable.contains(host.id),
+                codexMacAppUpdateAvailable: appAvailable.contains(host.id),
+                linuxUpdateAvailable: linuxAvailable.contains(host.id)
+            )
+        }
+        let recentJobs = Array(mobileControlJobs.sorted { $0.createdAt > $1.createdAt }.prefix(20)).map(mobileControlJobSnapshot)
+        return MobileControlStatus(
+            controllerId: mobileControlControllerID,
+            controllerName: FleetObserver.currentDisplayName,
+            appVersion: FleetlightVersion.currentDisplayLabel,
+            commandAuthorityEnabled: mobileControlCommandAuthorityEnabled,
+            jobJournalAvailable: mobileControlJobJournalAvailable,
+            pairedDeviceCount: mobileControlPairedDeviceCount,
+            busy: mobileControlActiveJobID != nil || isAnyUpdateOperationRunning || isRefreshing,
+            activeJobId: mobileControlActiveJobID,
+            capabilities: capabilities,
+            recentJobs: recentJobs
+        )
+    }
+
+    private var mobileControlControllerID: String {
+        FleetObserver.currentDisplayName
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+    }
+
+    private func markMobileControlJournalUnavailable() {
+        guard mobileControlJobJournalAvailable else { return }
+        mobileControlJobJournalAvailable = false
+        mobileControlCommandAuthorityEnabled = false
+        UserDefaults.standard.set(false, forKey: "mobileControlCommandAuthorityEnabled")
+        clearMobileControlPairingChallenge()
+        notice = "Mobile control request journal is unavailable; new jobs are disabled"
+        Task {
+            await ActivityLogger.shared.append(
+                event: "mobile-control-journal-failed",
+                detail: "New mobile jobs disabled"
+            )
+        }
+    }
+
+    private func authenticatedMobileControlCredential(
+        for request: MobileControlHTTPRequest
+    ) -> MobileControlPairedCredential? {
+        guard let login = normalizedTailscaleLogin(request.header("Tailscale-User-Login")),
+              let credential = MobileControlCredentialStore.shared.authenticate(
+                authorizationHeader: request.header("Authorization")
+              ),
+              credential.tailscaleLogin.caseInsensitiveCompare(login) == .orderedSame else { return nil }
+        return credential
+    }
+
+    private func normalizedTailscaleLogin(_ value: String?) -> String? {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalized.isEmpty,
+              normalized.utf8.count <= 320,
+              !normalized.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+        return normalized
+    }
+
+    private func normalizedMobileControlDeviceName(_ value: String) -> String? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              normalized.utf8.count <= 80,
+              !normalized.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+        return normalized
+    }
+
+    private func isValidMobileControlDeviceID(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 128 else { return false }
+        return value.range(of: #"^[A-Za-z0-9._:-]+$"#, options: .regularExpression) != nil
+    }
+
+    private func mobileControlRequestHasJSONContentType(_ request: MobileControlHTTPRequest) -> Bool {
+        request.header("Content-Type")?
+            .split(separator: ";", maxSplits: 1)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "application/json"
+    }
+
+    private func mobileControlCanonicalPath(_ rawPath: String) -> String? {
+        guard !rawPath.contains("?") else { return nil }
+        let path = rawPath
+        if path == "/control/v1" || path.hasPrefix("/control/v1/") { return path }
+        if path == "/fleetlight/control/v1" { return "/control/v1" }
+        if path.hasPrefix("/fleetlight/control/v1/") {
+            return String(path.dropFirst("/fleetlight".count))
+        }
+        return nil
+    }
+
+    private func mobileControlJSONEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }
+
+    private func mobileControlJSONDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private func mobileControlJSONResponse<Value: Encodable>(
+        _ value: Value,
+        status: Int,
+        reason: String
+    ) -> MobileControlHTTPResponse {
+        guard let data = try? mobileControlJSONEncoder().encode(value) else {
+            return MobileControlHTTPResponse(
+                statusCode: 500,
+                reason: "Internal Server Error",
+                body: Data(#"{"schemaVersion":1,"error":{"code":"encoding-failed","message":"Response encoding failed"}}"#.utf8)
+            )
+        }
+        return MobileControlHTTPResponse(statusCode: status, reason: reason, body: data)
+    }
+
+    private func mobileControlError(
+        status: Int,
+        reason: String,
+        code: String,
+        message: String
+    ) -> MobileControlHTTPResponse {
+        mobileControlJSONResponse(
+            MobileControlAPIErrorBody(code: code, message: MobileFeedSanitizer.redact(message)),
+            status: status,
+            reason: reason
+        )
     }
 
     private func codexUpdateSummary(

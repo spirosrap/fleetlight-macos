@@ -1,3 +1,4 @@
+import AppKit
 import Charts
 import SwiftUI
 import FleetlightCore
@@ -3241,6 +3242,53 @@ private struct FleetSettingsView: View {
                 ))
             }
 
+            Section("Android control") {
+                Toggle("Allow this Mac to run confirmed Android update requests", isOn: Binding(
+                    get: { model.mobileControlCommandAuthorityEnabled },
+                    set: { enabled in
+                        model.setMobileControlCommandAuthorityEnabled(enabled)
+                    }
+                ))
+
+                if model.mobileControlCommandAuthorityEnabled {
+                    LabeledContent(
+                        "Paired devices",
+                        value: "\(model.mobileControlPairedDeviceCount)"
+                    )
+
+                    if let mobilePairing = model.mobileControlPairingDisplay {
+                        HStack {
+                            LabeledContent("Pairing code") {
+                                Text(mobilePairing.code)
+                                    .font(.system(.body, design: .monospaced).weight(.semibold))
+                                    .textSelection(.enabled)
+                            }
+                            Button("Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(mobilePairing.code, forType: .string)
+                            }
+                        }
+                        Text("Expires at \(mobilePairing.expiresAt.formatted(date: .omitted, time: .standard)). Enter it in Fleetlight Android while connected to the same Tailscale network.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Button(model.mobileControlPairingDisplay == nil ? "Create Pairing Code" : "Replace Pairing Code") {
+                            _ = model.beginMobileControlPairing()
+                        }
+                        Button("Revoke Paired Devices", role: .destructive) {
+                            model.revokeMobileControlDevices()
+                        }
+                        .disabled(model.mobileControlPairedDeviceCount == 0)
+                    }
+                }
+
+                Text("Enable command authority on one observer only. Android sends allowlisted Codex CLI, Codex Mac app, or Linux OS requests; Fleetlight keeps all SSH and sudo credentials on this Mac and runs selected machines sequentially.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Visible machines") {
                 ForEach(model.hosts) { host in
                     Toggle(host.displayName, isOn: Binding(
@@ -3319,7 +3367,7 @@ private struct FleetSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 680)
+        .frame(width: 520, height: 780)
         .padding(12)
     }
 

@@ -1776,7 +1776,55 @@ let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
 test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1, "mobile feed schema should round-trip without losing status details")
 test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
 test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")
-let redactedMobileDetail = MobileFeedSanitizer.redact("ssh failed for admin@example.net at 100.64.12.34; see /Users/example/.ssh/config and https://private.example/path")
-test.require(!redactedMobileDetail.contains("admin@example.net") && !redactedMobileDetail.contains("100.64.12.34") && !redactedMobileDetail.contains("/Users/example") && !redactedMobileDetail.contains("https://"), "mobile feed details should redact addresses, accounts, private paths, and URLs")
+let redactedMobileDetail = MobileFeedSanitizer.redact("ssh failed for admin@example.net at 192.0.2.34; see /Users/example/.ssh/config and https://private.example/path")
+test.require(!redactedMobileDetail.contains("admin@example.net") && !redactedMobileDetail.contains("192.0.2.34") && !redactedMobileDetail.contains("/Users/example") && !redactedMobileDetail.contains("https://"), "mobile feed details should redact addresses, accounts, private paths, and URLs")
+
+let controlGETData = Data("GET /fleetlight/control/v1/status HTTP/1.1\r\nHost: controller\r\nAuthorization: Bearer example\r\n\r\n".utf8)
+guard case let .complete(controlGET) = MobileControlHTTPRequestParser.parse(controlGETData) else {
+    fatalError("complete mobile control GET should parse")
+}
+test.require(controlGET.method == "GET" && controlGET.path == "/fleetlight/control/v1/status", "mobile control parser should retain method and exact path")
+test.require(controlGET.header("authorization") == "Bearer example", "mobile control parser should normalize header names")
+
+let controlBody = #"{"requestId":"00000000-0000-0000-0000-000000000001","action":"linux-os","targetHostIds":["example-host"]}"#
+let controlPOSTText = "POST /control/v1/jobs HTTP/1.1\r\nHost: controller\r\nContent-Type: application/json\r\nContent-Length: \(controlBody.utf8.count)\r\n\r\n\(controlBody)"
+let controlPOSTData = Data(controlPOSTText.utf8)
+test.require(MobileControlHTTPRequestParser.parse(controlPOSTData.prefix(controlPOSTData.count - 1)) == .incomplete, "mobile control parser should wait for the complete declared JSON body")
+guard case let .complete(controlPOST) = MobileControlHTTPRequestParser.parse(controlPOSTData) else {
+    fatalError("complete mobile control POST should parse")
+}
+test.require(String(decoding: controlPOST.body, as: UTF8.self) == controlBody, "mobile control parser should preserve an exact JSON body")
+
+let duplicateHeaderRequest = Data("GET /control/v1/status HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n".utf8)
+test.require(MobileControlHTTPRequestParser.parse(duplicateHeaderRequest) == .failure(.malformedRequest), "mobile control parser should reject duplicate headers")
+let chunkedRequest = Data("POST /control/v1/jobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
+test.require(MobileControlHTTPRequestParser.parse(chunkedRequest) == .failure(.unsupportedTransferEncoding), "mobile control parser should reject transfer encodings")
+let oversizedBodyRequest = Data("POST /control/v1/jobs HTTP/1.1\r\nContent-Length: 32769\r\n\r\n".utf8)
+test.require(MobileControlHTTPRequestParser.parse(oversizedBodyRequest) == .failure(.bodyTooLarge), "mobile control parser should cap JSON bodies at 32 KiB")
+
+let controlJob = MobileControlJob(
+    id: UUID(uuidString: "00000000-0000-0000-0000-000000000010")!,
+    requestId: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!,
+    action: .codexCLI,
+    targetHostIds: ["example-host"],
+    state: .running,
+    createdAt: mobileFeedCheckedAt,
+    startedAt: mobileFeedCheckedAt,
+    completed: 0,
+    progress: [
+        MobileControlHostProgress(hostId: "example-host", phase: "updating", detail: "Updating Codex")
+    ]
+)
+let controlEncoder = JSONEncoder()
+controlEncoder.dateEncodingStrategy = .iso8601
+let controlDecoder = JSONDecoder()
+controlDecoder.dateDecodingStrategy = .iso8601
+let controlJobData = try controlEncoder.encode(controlJob)
+let decodedControlJob = try controlDecoder.decode(MobileControlJob.self, from: controlJobData)
+test.require(decodedControlJob == controlJob, "mobile control job schema should round-trip with request ID and host progress")
+let controlErrorData = try controlEncoder.encode(MobileControlAPIErrorBody(code: "controller-busy", message: "Another operation is running"))
+let decodedControlError = try controlDecoder.decode(MobileControlAPIErrorBody.self, from: controlErrorData)
+test.require(decodedControlError.error.code == "controller-busy" && decodedControlError.error.message == "Another operation is running", "mobile control errors should use the documented nested error schema")
+
 
 print("Fleetlight self-test: \(test.count) checks passed")

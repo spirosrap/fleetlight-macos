@@ -1,48 +1,78 @@
 import Foundation
+import FleetlightCore
 import Network
 
 final class MobileFeedHTTPServer: @unchecked Sendable {
+    private enum ListenerRole: Sendable, Equatable {
+        case feedAndControl
+        case localPairing
+    }
+
     static let shared = MobileFeedHTTPServer()
 
     private let queue = DispatchQueue(label: "Fleetlight.MobileFeedHTTPServer", qos: .utility)
     private var listener: NWListener?
+    private var localPairingListener: NWListener?
+    private var controlHandler: (@Sendable (MobileControlHTTPRequest) async -> MobileControlHTTPResponse)?
+    private var localPairingHandler: (@Sendable (MobileControlHTTPRequest) async -> MobileControlHTTPResponse)?
 
     private init() {}
 
-    func start() {
+    func start(
+        controlHandler: @escaping @Sendable (MobileControlHTTPRequest) async -> MobileControlHTTPResponse,
+        localPairingHandler: @escaping @Sendable (MobileControlHTTPRequest) async -> MobileControlHTTPResponse
+    ) {
         queue.async { [weak self] in
-            guard let self, listener == nil else { return }
-            do {
-                let parameters = NWParameters.tcp
-                parameters.allowLocalEndpointReuse = true
-                parameters.requiredLocalEndpoint = .hostPort(
-                    host: NWEndpoint.Host("127.0.0.1"),
-                    port: NWEndpoint.Port(rawValue: 8_787)!
-                )
-                let listener = try NWListener(using: parameters)
-                listener.newConnectionHandler = { [weak self] connection in
-                    self?.accept(connection)
-                }
-                listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            self.controlHandler = controlHandler
+            self.localPairingHandler = localPairingHandler
+            if listener == nil {
+                listener = makeListener(port: 8_787, role: .feedAndControl)
+                listener?.stateUpdateHandler = { [weak self] state in
                     if case .failed = state {
                         self?.listener?.cancel()
                         self?.listener = nil
                     }
                 }
-                self.listener = listener
-                listener.start(queue: queue)
-            } catch {
-                listener = nil
+                listener?.start(queue: queue)
+            }
+            if localPairingListener == nil {
+                localPairingListener = makeListener(port: 8_788, role: .localPairing)
+                localPairingListener?.stateUpdateHandler = { [weak self] state in
+                    if case .failed = state {
+                        self?.localPairingListener?.cancel()
+                        self?.localPairingListener = nil
+                    }
+                }
+                localPairingListener?.start(queue: queue)
             }
         }
     }
 
-    private func accept(_ connection: NWConnection) {
-        connection.start(queue: queue)
-        receiveRequest(on: connection, buffer: Data())
+    private func makeListener(port: UInt16, role: ListenerRole) -> NWListener? {
+        do {
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            parameters.requiredLocalEndpoint = .hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: NWEndpoint.Port(rawValue: port)!
+            )
+            let listener = try NWListener(using: parameters)
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.accept(connection, role: role)
+            }
+            return listener
+        } catch {
+            return nil
+        }
     }
 
-    private func receiveRequest(on connection: NWConnection, buffer: Data) {
+    private func accept(_ connection: NWConnection, role: ListenerRole) {
+        connection.start(queue: queue)
+        receiveRequest(on: connection, role: role, buffer: Data())
+    }
+
+    private func receiveRequest(on connection: NWConnection, role: ListenerRole, buffer: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { [weak self] data, _, isComplete, error in
             guard let self else {
                 connection.cancel()
@@ -50,39 +80,53 @@ final class MobileFeedHTTPServer: @unchecked Sendable {
             }
             var request = buffer
             if let data { request.append(data) }
-            if request.count > 8_192 {
+            if request.count > MobileControlHTTPRequestParser.maximumRequestBytes {
                 respond(status: "413 Payload Too Large", body: Data(), contentType: "text/plain", on: connection)
                 return
             }
-            if request.range(of: Data("\r\n\r\n".utf8)) != nil || isComplete {
-                handle(request, on: connection)
-            } else if error == nil {
-                receiveRequest(on: connection, buffer: request)
-            } else {
-                connection.cancel()
+            switch MobileControlHTTPRequestParser.parse(request) {
+            case .incomplete where error == nil && !isComplete:
+                receiveRequest(on: connection, role: role, buffer: request)
+            case .incomplete:
+                respond(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
+            case let .failure(parseError):
+                let status = switch parseError {
+                case .headersTooLarge, .bodyTooLarge: "413 Payload Too Large"
+                case .unsupportedTransferEncoding: "501 Not Implemented"
+                case .malformedRequest: "400 Bad Request"
+                }
+                respond(status: status, body: Data(), contentType: "text/plain", on: connection)
+            case let .complete(parsedRequest):
+                handle(parsedRequest, role: role, on: connection)
             }
         }
     }
 
-    private func handle(_ request: Data, on connection: NWConnection) {
-        guard let requestText = String(data: request, encoding: .utf8),
-              let requestLine = requestText.components(separatedBy: "\r\n").first else {
-            respond(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
-            return
-        }
-        let parts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
-        guard parts.count == 3 else {
-            respond(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
-            return
-        }
-        guard parts[0] == "GET" else {
-            respond(status: "405 Method Not Allowed", body: Data(), contentType: "text/plain", on: connection)
+    private func handle(_ request: MobileControlHTTPRequest, role: ListenerRole, on connection: NWConnection) {
+        if role == .localPairing {
+            guard request.path == "/pairing/start", let localPairingHandler else {
+                respond(status: "404 Not Found", body: Data(), contentType: "text/plain", on: connection)
+                return
+            }
+            Task {
+                let response = await localPairingHandler(request)
+                respond(
+                    status: "\(response.statusCode) \(response.reason)",
+                    body: response.body,
+                    contentType: response.contentType,
+                    on: connection
+                )
+            }
             return
         }
 
-        let path = parts[1].split(separator: "?", maxSplits: 1).first.map(String.init) ?? parts[1]
+        let path = request.path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.path
         switch path {
         case "/mobile-feed.json", "/fleetlight/mobile-feed.json":
+            guard request.method == "GET" else {
+                respond(status: "405 Method Not Allowed", body: Data(), contentType: "text/plain", on: connection)
+                return
+            }
             guard let data = try? Data(contentsOf: MobileFeedStore.feedURL) else {
                 respond(
                     status: "503 Service Unavailable",
@@ -94,6 +138,10 @@ final class MobileFeedHTTPServer: @unchecked Sendable {
             }
             respond(status: "200 OK", body: data, contentType: "application/json", on: connection)
         case "/health", "/fleetlight/health":
+            guard request.method == "GET" else {
+                respond(status: "405 Method Not Allowed", body: Data(), contentType: "text/plain", on: connection)
+                return
+            }
             respond(
                 status: "200 OK",
                 body: Data(#"{"status":"ok"}"#.utf8),
@@ -101,8 +149,27 @@ final class MobileFeedHTTPServer: @unchecked Sendable {
                 on: connection
             )
         default:
-            respond(status: "404 Not Found", body: Data(), contentType: "text/plain", on: connection)
+            guard isControlPath(path), let controlHandler else {
+                respond(status: "404 Not Found", body: Data(), contentType: "text/plain", on: connection)
+                return
+            }
+            Task {
+                let response = await controlHandler(request)
+                respond(
+                    status: "\(response.statusCode) \(response.reason)",
+                    body: response.body,
+                    contentType: response.contentType,
+                    on: connection
+                )
+            }
         }
+    }
+
+    private func isControlPath(_ path: String) -> Bool {
+        path == "/control/v1"
+            || path.hasPrefix("/control/v1/")
+            || path == "/fleetlight/control/v1"
+            || path.hasPrefix("/fleetlight/control/v1/")
     }
 
     private func respond(

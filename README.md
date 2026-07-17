@@ -100,6 +100,7 @@ Supported machine fields:
 - A lightweight **Verify Now** action and restart freshness summary that separates recently verified, stale, unverified, and restart-required Linux machines without refreshing package metadata
 - Privacy-safe observer snapshots, one-minute heartbeats, and a visible agreement check, so two Macs running Fleetlight expose genuinely stale or contradictory restart summaries instead of silently showing different answers
 - An atomic, versioned mobile feed for the Fleetlight Android companion, designed for tailnet-only delivery without placing fleet SSH keys or sudo credentials on the phone
+- Optional Android update control through one designated Mac observer, with short-lived pairing, per-device credentials, explicit target confirmation, idempotent jobs, sequential Codex CLI/Codex Mac app/Linux OS execution, and live per-machine results
 - Neutral live maintenance reporting during long Linux operations, with prompt recovery checks when work finishes instead of a persistent stale-observer warning
 - Expandable per-observer diagnostics with Fleetlight version, report age, restart count, verification coverage, and an on-demand **Fetch Reports** action
 - Automatic lightweight package revalidation after a previously offline Linux machine is reachable again, replacing stale red warnings with current package status while respecting a retry cooldown
@@ -137,6 +138,8 @@ To expose that directory only to devices already authorized on the same Tailscal
 ```
 
 The script health-checks the local feed, preserves existing Tailscale Serve routes, proxies it under `/fleetlight`, and prints the HTTPS endpoint to enter in the Android app. Configure both Mac observers in Android for automatic freshest-report failover.
+
+Android update control is disabled by default. In Fleetlight Settings, enable **Android control** on exactly one always-on observer, create an eight-digit pairing code, and pair that observer from the Android app while both devices are on the same tailnet. The paired phone can request only Fleetlight's predefined Codex CLI, Codex Mac app, and Linux OS update workflows; it cannot send commands, SSH routes, package names, or credentials. Every request shows the exact target machines for confirmation, is deduplicated by request ID, and continues sequentially on the Mac if the phone disconnects. Linux updates never reboot a machine automatically.
 
 ## Privacy
 

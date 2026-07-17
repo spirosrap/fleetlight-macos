@@ -20,3 +20,4 @@ fi
 dns_name=$("$TAILSCALE_BIN" status --json | plutil -extract Self.DNSName raw -o - -- -)
 dns_name="${dns_name%.}"
 printf 'Fleetlight mobile feed: https://%s%s/mobile-feed.json\n' "$dns_name" "$SERVE_PATH"
+printf 'Fleetlight Android control: https://%s%s/control/v1 (disabled until paired in Settings)\n' "$dns_name" "$SERVE_PATH"

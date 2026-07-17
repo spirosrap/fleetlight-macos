@@ -94,6 +94,7 @@ final class FleetModel: ObservableObject {
     private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
     private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
     private static let freshSSHValidationInterval: TimeInterval = 10 * 60
+    private static let failedLinuxUpdateRecheckInterval: TimeInterval = 15 * 60
 
     init() {
         let configurationResult = FleetConfigurationStore.loadOrCreate()
@@ -770,6 +771,7 @@ final class FleetModel: ObservableObject {
         await ActivityLogger.shared.append(probeLogEntries)
 
         await reconcileLinuxRestartRequirementsFromProbes()
+        await revalidateFailedLinuxUpdateProgress()
         await revalidateRecoveredLinuxUpdateHosts()
         await refreshObserverConsistency()
 
@@ -1109,6 +1111,85 @@ final class FleetModel: ObservableObject {
         reconcileClearedRestartDetails()
     }
 
+    private func revalidateFailedLinuxUpdateProgress() async {
+        guard !isAnyUpdateOperationRunning,
+              linuxUpdateBatch?.finishedAt != nil else { return }
+
+        let retryCutoff = Date().addingTimeInterval(-Self.failedLinuxUpdateRecheckInterval)
+        let targets = linuxUpdateHosts.filter { host in
+            guard snapshots[host.id]?.state == .online,
+                  let progress = linuxUpdates[host.id],
+                  progress.phase == .failed || progress.phase == .offline else { return false }
+            guard let checkedAt = linuxUpdateSnapshots[host.id]?.checkedAt else { return true }
+            return checkedAt <= retryCutoff
+        }
+        guard !targets.isEmpty else { return }
+
+        await withTaskGroup(of: (String, LinuxUpdateSnapshot).self) { group in
+            for host in targets {
+                let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+                group.addTask {
+                    let result = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+                    return (host.id, LinuxUpdateCheckParser.snapshot(from: result))
+                }
+            }
+            for await (hostID, snapshot) in group {
+                linuxUpdateSnapshots[hostID] = snapshot
+                await ActivityLogger.shared.append(
+                    event: "linux-update-failure-rechecked",
+                    host: hostID,
+                    detail: snapshot.detail
+                )
+            }
+        }
+
+        LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+        reconcileClearedRestartDetails()
+        await reconcileLinuxUpdateFailuresVerifiedCurrent(for: Set(targets.map(\.id)))
+    }
+
+    private func reconcileLinuxUpdateFailuresVerifiedCurrent(for checkedHostIDs: Set<String>) async {
+        guard !checkedHostIDs.isEmpty, !linuxUpdates.isEmpty else { return }
+
+        var reconciledUpdates = linuxUpdates
+        var reconciled: [(hostID: String, detail: String)] = []
+        for hostID in checkedHostIDs {
+            guard let progress = linuxUpdates[hostID],
+                  progress.phase == .failed || progress.phase == .offline,
+                  let snapshot = linuxUpdateSnapshots[hostID],
+                  snapshot.state == .current,
+                  snapshot.packageManager == "apt",
+                  let checkedAt = snapshot.checkedAt else { continue }
+            if let batch = linuxUpdateBatch,
+               batch.targetHostIDs.contains(hostID),
+               checkedAt < batch.startedAt {
+                continue
+            }
+
+            let detail = linuxUpdateReconciliationDetail(for: snapshot)
+            reconciledUpdates[hostID] = HostLinuxUpdateProgress(phase: .succeeded, detail: detail)
+            reconciled.append((hostID, detail))
+        }
+
+        guard !reconciled.isEmpty else { return }
+        linuxUpdates = reconciledUpdates
+        linuxUpdateCompletedCount = reconciledUpdates.values.filter { $0.phase.isTerminal }.count
+        persistLinuxUpdateBatch()
+        for result in reconciled {
+            await ActivityLogger.shared.append(
+                event: "linux-update-failure-reconciled",
+                host: result.hostID,
+                detail: result.detail
+            )
+        }
+    }
+
+    private func linuxUpdateReconciliationDetail(for snapshot: LinuxUpdateSnapshot) -> String {
+        snapshot.rebootRequired
+            ? "Verified current after prior update failure · restart required"
+            : "Verified current after prior update failure"
+    }
+
     func checkObserverConsistencyNow() async {
         guard !isAnyUpdateOperationRunning, !isRefreshing else {
             notice = "Wait for the current operation to finish"
@@ -1422,6 +1503,7 @@ final class FleetModel: ObservableObject {
 
         LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
         reconcileClearedRestartDetails()
+        await reconcileLinuxUpdateFailuresVerifiedCurrent(for: Set(targets.map(\.id)))
         let summary = linuxUpdateSummary
         notice = summary.updateAvailableCount > 0
             ? "\(summary.totalPendingUpdates) Linux update\(summary.totalPendingUpdates == 1 ? "" : "s") available on \(summary.updateAvailableCount) machine\(summary.updateAvailableCount == 1 ? "" : "s")"
@@ -1556,6 +1638,21 @@ final class FleetModel: ObservableObject {
             case .failed:
                 phase = .failed
                 event = "linux-update-failed"
+                let recoveryResult = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+                let recoverySnapshot = LinuxUpdateCheckParser.snapshot(from: recoveryResult)
+                linuxUpdateSnapshots[host.id] = recoverySnapshot
+                LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
+                await ActivityLogger.shared.append(
+                    event: "linux-update-post-failure-checked",
+                    host: host.id,
+                    detail: recoverySnapshot.detail
+                )
+                if recoverySnapshot.state == .current,
+                   recoverySnapshot.packageManager == "apt" {
+                    phase = .succeeded
+                    detail = linuxUpdateReconciliationDetail(for: recoverySnapshot)
+                    event = "linux-update-failure-reconciled"
+                }
             }
 
             linuxUpdates[host.id] = HostLinuxUpdateProgress(phase: phase, detail: detail)

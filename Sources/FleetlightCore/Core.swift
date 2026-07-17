@@ -3500,7 +3500,8 @@ public enum LinuxUpdateCheckCommandBuilder {
 
         package_file=$(mktemp /tmp/fleetlight-linux-packages.XXXXXX)
         metadata_log=$(mktemp /tmp/fleetlight-linux-metadata.XXXXXX)
-        cleanup_linux_check() { rm -f "$package_file" "$package_file.clean" "$metadata_log"; }
+        package_audit_log=$(mktemp /tmp/fleetlight-linux-audit.XXXXXX)
+        cleanup_linux_check() { rm -f "$package_file" "$package_file.clean" "$package_file.user" "$package_file.system" "$metadata_log" "$package_audit_log"; }
         trap cleanup_linux_check EXIT
         package_manager=
         package_count=0
@@ -3512,7 +3513,21 @@ public enum LinuxUpdateCheckCommandBuilder {
             printf 'PKG_MGR:%s\nSTATUS:metadata-failed\nERROR:%s\n' "$package_manager" "$(tail -n 1 "$metadata_log" | tr -d '\r')"
             exit 5
           fi
-          apt list --upgradable 2>/dev/null | tail -n +2 >"$package_file"
+          if [ "$refresh_metadata" -eq 1 ]; then
+            if ! run_privileged dpkg --audit >"$package_audit_log" 2>&1; then
+              printf 'PKG_MGR:%s\nSTATUS:package-audit-failed\nERROR:Package health check failed\n' "$package_manager"
+              exit 5
+            fi
+            if grep -q '[^[:space:]]' "$package_audit_log"; then
+              printf 'PKG_MGR:%s\nSTATUS:package-state-broken\nERROR:Package configuration is incomplete\n' "$package_manager"
+              exit 7
+            fi
+          fi
+          if ! apt list --upgradable >"$package_file.clean" 2>"$metadata_log"; then
+            printf 'PKG_MGR:%s\nSTATUS:package-check-failed\nERROR:APT update verification failed\n' "$package_manager"
+            exit 5
+          fi
+          tail -n +2 "$package_file.clean" >"$package_file"
           package_count=$(grep -c . "$package_file" 2>/dev/null || true)
           security_count=$(grep -c -- '-security' "$package_file" 2>/dev/null || true)
           head -n 12 "$package_file" | while IFS= read -r line; do
@@ -3597,7 +3612,10 @@ public enum LinuxUpdateCheckCommandBuilder {
 
         snap_count=0
         if command -v snap >/dev/null 2>&1; then
-          snap refresh --list >"$package_file" 2>/dev/null || true
+          if ! snap refresh --list >"$package_file" 2>"$metadata_log"; then
+            printf 'STATUS:snap-check-failed\nERROR:Snap update verification failed\n'
+            exit 5
+          fi
           if ! grep -qi 'All snaps up to date' "$package_file"; then
             snap_count=$(tail -n +2 "$package_file" | grep -c . 2>/dev/null || true)
           fi
@@ -3606,8 +3624,16 @@ public enum LinuxUpdateCheckCommandBuilder {
 
         flatpak_count=0
         if command -v flatpak >/dev/null 2>&1; then
-          flatpak_user_count=$(flatpak remote-ls --updates --user --columns=application 2>/dev/null | grep -c . || true)
-          flatpak_system_count=$(flatpak remote-ls --updates --system --columns=application 2>/dev/null | grep -c . || true)
+          if ! flatpak remote-ls --updates --user --columns=application >"$package_file.user" 2>"$metadata_log"; then
+            printf 'STATUS:flatpak-user-check-failed\nERROR:Flatpak user update verification failed\n'
+            exit 5
+          fi
+          if ! flatpak remote-ls --updates --system --columns=application >"$package_file.system" 2>"$metadata_log"; then
+            printf 'STATUS:flatpak-system-check-failed\nERROR:Flatpak system update verification failed\n'
+            exit 5
+          fi
+          flatpak_user_count=$(grep -c . "$package_file.user" 2>/dev/null || true)
+          flatpak_system_count=$(grep -c . "$package_file.system" 2>/dev/null || true)
           flatpak_count=$((flatpak_user_count + flatpak_system_count))
         fi
         printf 'FLATPAK_COUNT:%s\n' "$flatpak_count"
@@ -3635,6 +3661,21 @@ public enum LinuxUpdateCheckParser {
         }
         if lines.contains("STATUS:privilege-required") {
             return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Passwordless sudo is required")
+        }
+        if lines.contains("STATUS:package-state-broken") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Package configuration is incomplete · run sudo dpkg --configure -a")
+        }
+        if lines.contains("STATUS:package-check-failed") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "APT update verification failed")
+        }
+        if lines.contains("STATUS:snap-check-failed") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Snap update verification failed")
+        }
+        if lines.contains("STATUS:flatpak-user-check-failed") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Flatpak user update verification failed")
+        }
+        if lines.contains("STATUS:flatpak-system-check-failed") {
+            return LinuxUpdateSnapshot(state: .failed, distribution: distribution, kernelVersion: kernel, packageManager: packageManager, checkedAt: checkedAt, detail: "Flatpak system update verification failed")
         }
         guard result.exitCode == 0, lines.first == "FLEETLIGHT_LINUX_UPDATE_CHECK", lines.contains("STATUS:ok") else {
             let error = value(after: "ERROR:", in: lines) ?? value(after: "STATUS:", in: lines) ?? "Update check failed"
@@ -3743,12 +3784,38 @@ public enum LinuxUpdateCommandBuilder {
         cleanup_linux_update() { rm -f "$update_log"; }
         trap cleanup_linux_update EXIT
         status=0
+        emit_update_error() {
+          error_kind=$1
+          error_id=$2
+          printf 'ERROR_KIND:%s\n' "$error_kind"
+          case "$error_id" in
+            ""|*[!A-Za-z0-9._+:-]*) ;;
+            *) printf 'ERROR_ID:%s\n' "$error_id" ;;
+          esac
+        }
 
         if command -v apt-get >/dev/null 2>&1; then
           package_manager=apt
+          apt_status=0
           run_privileged apt-get update >"$update_log" 2>&1 \
             && run_privileged env DEBIAN_FRONTEND=noninteractive apt-get -y -o APT::Get::Always-Include-Phased-Updates=true full-upgrade >>"$update_log" 2>&1 \
-            && run_privileged apt-get -y autoremove >>"$update_log" 2>&1 || status=1
+            && run_privileged apt-get -y autoremove >>"$update_log" 2>&1 || apt_status=1
+          if [ "$apt_status" -ne 0 ]; then
+            status=1
+            if grep -Eqi 'bad return status for module build|dkms.*failed' "$update_log"; then
+              dkms_module=$(grep -Eio '/var/lib/dkms/[A-Za-z0-9._+-]+|failed for [A-Za-z0-9._+-]+' "$update_log" | tail -n 1 | sed 's#^.*/##; s/^failed for //')
+              emit_update_error dkms "$dkms_module"
+            elif grep -qi 'dpkg: error processing package' "$update_log"; then
+              dpkg_package=$(grep -Eio 'dpkg: error processing package [A-Za-z0-9._+:-]+' "$update_log" | tail -n 1 | awk '{print $5}')
+              emit_update_error dpkg "$dpkg_package"
+            elif grep -Eqi 'could not get lock|unable to acquire the dpkg frontend lock' "$update_log"; then
+              emit_update_error package-manager-busy ""
+            elif grep -qi 'no space left on device' "$update_log"; then
+              emit_update_error disk-full ""
+            else
+              emit_update_error apt ""
+            fi
+          fi
         elif command -v dnf >/dev/null 2>&1; then
           package_manager=dnf
           run_privileged dnf -y upgrade --refresh >"$update_log" 2>&1 || status=1
@@ -3835,7 +3902,105 @@ public enum LinuxUpdateParser {
         if lines.contains("UPDATE:unsupported-package-manager") {
             return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Package manager is not supported")
         }
+        if let detail = actionableFailureDetail(lines: lines, stderr: result.stderr) {
+            return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: detail)
+        }
         return LinuxUpdateOutcome(status: .failed, rebootRequired: rebootRequired, detail: "Linux update failed")
+    }
+
+    private static func actionableFailureDetail(lines: [String], stderr: String) -> String? {
+        let stderrLines = stderr.split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let diagnosticLines = lines + stderrLines
+        let lowercased = diagnosticLines.map { $0.lowercased() }
+
+        if lowercased.contains("error_kind:dkms") {
+            if let module = structuredErrorIdentifier(in: lowercased) {
+                return "Kernel module \(module) failed to build (DKMS)"
+            }
+            return "A kernel module failed to build (DKMS)"
+        }
+        if lowercased.contains("error_kind:dpkg") {
+            if let package = structuredErrorIdentifier(in: lowercased) {
+                return "Package \(package) could not be configured (dpkg)"
+            }
+            return "Package configuration failed (dpkg)"
+        }
+        if lowercased.contains("error_kind:package-manager-busy") {
+            return "Package manager is busy · try again when the other update finishes"
+        }
+        if lowercased.contains("error_kind:disk-full") {
+            return "Linux update failed · disk is full"
+        }
+        if lowercased.contains("error_kind:apt") {
+            return "APT update failed"
+        }
+
+        let hasDKMSFailure = lowercased.contains {
+            ($0.contains("dkms") && $0.contains("failed"))
+                || $0.contains("bad return status for module build")
+        }
+        if hasDKMSFailure {
+            if let module = dkmsModuleName(in: lowercased) {
+                return "Kernel module \(module) failed to build (DKMS)"
+            }
+            return "A kernel module failed to build (DKMS)"
+        }
+
+        if let package = packageNameAfterDPKGError(in: lowercased) {
+            return "Package \(package) could not be configured (dpkg)"
+        }
+        if lowercased.contains(where: { $0.contains("sub-process /usr/bin/dpkg returned an error code") }) {
+            return "Package configuration failed (dpkg)"
+        }
+        if lowercased.contains(where: { $0.contains("could not get lock") || $0.contains("unable to acquire the dpkg frontend lock") }) {
+            return "Package manager is busy · try again when the other update finishes"
+        }
+        if lowercased.contains(where: { $0.contains("no space left on device") }) {
+            return "Linux update failed · disk is full"
+        }
+        return nil
+    }
+
+    private static func structuredErrorIdentifier(in lines: [String]) -> String? {
+        for line in lines {
+            if let identifier = safeIdentifier(after: "error_id:", in: line) {
+                return identifier
+            }
+        }
+        return nil
+    }
+
+    private static func dkmsModuleName(in lines: [String]) -> String? {
+        for line in lines {
+            if line.contains("dkms"), let module = safeIdentifier(after: "failed for ", in: line) {
+                return module
+            }
+            if let module = safeIdentifier(after: "/var/lib/dkms/", in: line) {
+                return module
+            }
+        }
+        return nil
+    }
+
+    private static func packageNameAfterDPKGError(in lines: [String]) -> String? {
+        for line in lines {
+            if let package = safeIdentifier(after: "dpkg: error processing package ", in: line) {
+                return package
+            }
+        }
+        return nil
+    }
+
+    private static func safeIdentifier(after marker: String, in line: String) -> String? {
+        guard let range = line.range(of: marker) else { return nil }
+        let suffix = line[range.upperBound...].drop(while: { $0.isWhitespace })
+        let identifier = suffix.prefix {
+            $0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "+" || $0 == "-" || $0 == ":"
+        }
+        guard !identifier.isEmpty else { return nil }
+        return String(identifier.prefix(80))
     }
 }
 

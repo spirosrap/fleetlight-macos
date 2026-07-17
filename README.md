@@ -91,7 +91,9 @@ Supported machine fields:
 - Optional one-time macOS alerts when a new Codex CLI or Mac app release affects an online machine, with visible feed-check freshness and per-release deduplication
 - Unified Codex Update Center with concurrent release checks, a combined CLI/Mac app update count, and one confirmed action that runs outdated CLI machines first and Mac app updates second
 - Linux System Update Center with distro and kernel versions, pending system/Snap/Flatpak counts, and installed-to-available package versions
+- Package-health checks that detect incomplete `dpkg` configuration even when no upgrades remain, plus actionable DKMS, package, lock, and disk failure details
 - Confirmed per-machine updates or restart-safe sequential fleet updates through apt, dnf, yum, pacman, zypper, or apk, followed by availability verification
+- Automatic revalidation of saved Linux update failures after a machine is repaired, clearing obsolete red results only after a fresh package check verifies the system is current
 - Explicit restart-required results without automatic reboots; Linux checks, updates, and user-confirmed restarts require non-interactive passwordless sudo on remote hosts
 - Confirmed per-machine and sequential Restart Required actions that wait for shutdown, verify SSH recovery or a changed boot time, and recheck the Linux restart flag
 - Bidirectional live restart verification during every normal fleet refresh, so multiple Fleetlight observers detect new restart requirements, clear stale badges and completed-operation wording, and show when each restart status was verified

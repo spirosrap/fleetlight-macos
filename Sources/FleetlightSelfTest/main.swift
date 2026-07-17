@@ -540,11 +540,19 @@ let linuxCheckCommand = LinuxUpdateCheckCommandBuilder.build()
 test.require(linuxCheckCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE_CHECK"), "Linux checks should emit a verification marker")
 test.require(linuxCheckCommand.contains("refresh_metadata=1"), "manual Linux checks should refresh package metadata")
 test.require(linuxCheckCommand.contains("apt-get update"), "Linux checks should refresh apt metadata before reporting availability")
+test.require(linuxCheckCommand.contains("dpkg --audit"), "apt checks should detect incomplete package configuration even when no upgrades remain")
+test.require(linuxCheckCommand.contains("STATUS:package-state-broken"), "broken apt package state should use a distinct structured status")
+test.require(linuxCheckCommand.contains("ERROR:Package configuration is incomplete"), "apt package health failures should emit a concise privacy-safe error")
 test.require(linuxCheckCommand.contains("snap refresh --list"), "Linux checks should include available Snap versions")
 test.require(linuxCheckCommand.contains("flatpak remote-ls --updates"), "Linux checks should include available Flatpak versions")
+test.require(linuxCheckCommand.contains("STATUS:package-check-failed"), "apt availability queries should fail closed instead of reporting a false current state")
+test.require(linuxCheckCommand.contains("STATUS:snap-check-failed"), "Snap availability queries should fail closed instead of reporting zero updates")
+test.require(linuxCheckCommand.contains("STATUS:flatpak-user-check-failed") && linuxCheckCommand.contains("STATUS:flatpak-system-check-failed"), "Flatpak availability queries should fail closed for both installations")
 let recoveredLinuxCheckCommand = LinuxUpdateCheckCommandBuilder.build(refreshMetadata: false)
 test.require(recoveredLinuxCheckCommand.contains("refresh_metadata=0"), "recovered machines should use a lightweight cached-metadata recheck")
 test.require(recoveredLinuxCheckCommand.contains("if [ \"$refresh_metadata\" -eq 0 ]"), "lightweight recovery checks should not require package-manager privileges")
+let normalizedRecoveredLinuxCheckCommand = recoveredLinuxCheckCommand.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+test.require(normalizedRecoveredLinuxCheckCommand.contains("if [ \"$refresh_metadata\" -eq 1 ]; then if ! run_privileged dpkg --audit"), "dpkg audits should run only during privileged full package checks")
 
 let linuxUpdateCommand = LinuxUpdateCommandBuilder.build()
 test.require(linuxUpdateCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_UPDATE"), "Linux updates should emit a verification marker")
@@ -553,6 +561,8 @@ test.require(linuxUpdateCommand.contains("dnf -y upgrade --refresh"), "Linux upd
 test.require(linuxUpdateCommand.contains("pacman -Syu --noconfirm"), "Linux updates should support pacman")
 test.require(linuxUpdateCommand.contains("snap refresh"), "Linux updates should refresh Snap packages")
 test.require(linuxUpdateCommand.contains("flatpak update -y --noninteractive"), "Linux updates should refresh Flatpak packages")
+test.require(linuxUpdateCommand.contains("emit_update_error dkms"), "apt updates should emit DKMS failure metadata before later package-manager output can bury the cause")
+test.require(linuxUpdateCommand.contains("ERROR_KIND:%s"), "Linux update failure metadata should use a structured privacy-safe field")
 test.require(!linuxUpdateCommand.contains("\nreboot") && !linuxUpdateCommand.contains("\nshutdown"), "Linux updates should never restart a machine automatically")
 
 let linuxCheckedAt = Date(timeIntervalSince1970: 1_720_000_000)
@@ -631,6 +641,45 @@ let privilegeLinuxCheck = CommandResult(
     timedOut: false
 )
 test.require(LinuxUpdateCheckParser.snapshot(from: privilegeLinuxCheck).detail == "Passwordless sudo is required", "Linux checks should explain missing update privileges")
+
+let brokenPackageStateLinuxCheck = CommandResult(
+    exitCode: 7,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Ubuntu 24.04 LTS\nKERNEL:7.0.0-28-generic\nPKG_MGR:apt\nSTATUS:package-state-broken\nERROR:Package configuration is incomplete\n",
+    stderr: "",
+    elapsedMilliseconds: 120,
+    timedOut: false
+)
+let brokenPackageStateSnapshot = LinuxUpdateCheckParser.snapshot(from: brokenPackageStateLinuxCheck)
+test.require(brokenPackageStateSnapshot.state == .failed, "incompletely configured apt packages should never be reported as current")
+test.require(brokenPackageStateSnapshot.packageManager == "apt", "broken apt package state should retain the detected package manager")
+test.require(brokenPackageStateSnapshot.detail == "Package configuration is incomplete · run sudo dpkg --configure -a", "broken apt package state should provide a concise recovery command")
+
+let failedPackageQueryLinuxCheck = CommandResult(
+    exitCode: 5,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Ubuntu 24.04 LTS\nKERNEL:6.8.0\nPKG_MGR:apt\nSTATUS:package-check-failed\nERROR:APT update verification failed\n",
+    stderr: "",
+    elapsedMilliseconds: 100,
+    timedOut: false
+)
+test.require(LinuxUpdateCheckParser.snapshot(from: failedPackageQueryLinuxCheck).detail == "APT update verification failed", "failed apt availability queries should remain failed and actionable")
+
+let failedSnapQueryLinuxCheck = CommandResult(
+    exitCode: 5,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Ubuntu 24.04 LTS\nKERNEL:6.8.0\nPKG_MGR:apt\nSTATUS:snap-check-failed\nERROR:Snap update verification failed\n",
+    stderr: "",
+    elapsedMilliseconds: 100,
+    timedOut: false
+)
+test.require(LinuxUpdateCheckParser.snapshot(from: failedSnapQueryLinuxCheck).detail == "Snap update verification failed", "failed Snap queries should never clear a saved update failure")
+
+let failedFlatpakQueryLinuxCheck = CommandResult(
+    exitCode: 5,
+    stdout: "FLEETLIGHT_LINUX_UPDATE_CHECK\nDISTRIBUTION:Ubuntu 24.04 LTS\nKERNEL:6.8.0\nPKG_MGR:apt\nSTATUS:flatpak-system-check-failed\nERROR:Flatpak system update verification failed\n",
+    stderr: "",
+    elapsedMilliseconds: 100,
+    timedOut: false
+)
+test.require(LinuxUpdateCheckParser.snapshot(from: failedFlatpakQueryLinuxCheck).detail == "Flatpak system update verification failed", "failed Flatpak queries should never clear a saved update failure")
 
 let linuxUpdateHosts = [
     FleetHost(id: "updates", displayName: "Updates", systemImage: "server.rack", supportsLinuxUpdates: true),
@@ -976,6 +1025,41 @@ let failedLinuxUpdate = CommandResult(
     timedOut: false
 )
 test.require(LinuxUpdateParser.outcome(from: failedLinuxUpdate).detail == "Passwordless sudo is required", "Linux update failures should explain missing privileges")
+
+let failedDKMSLinuxUpdate = CommandResult(
+    exitCode: 1,
+    stdout: """
+    FLEETLIGHT_LINUX_UPDATE
+    PKG_MGR:apt
+    Error! Bad return status for module build on kernel: 7.0.0-28-generic (x86_64)
+    Consult /var/lib/dkms/rtl8852bu/1.19.14-127/build/make.log for more information.
+    dkms autoinstall on 7.0.0-28-generic/x86_64 failed for rtl8852bu(10)
+    dpkg: error processing package linux-image-7.0.0-28-generic (--configure):
+    UPDATE:failed
+    """,
+    stderr: "",
+    elapsedMilliseconds: 60_000,
+    timedOut: false
+)
+test.require(LinuxUpdateParser.outcome(from: failedDKMSLinuxUpdate).detail == "Kernel module rtl8852bu failed to build (DKMS)", "DKMS failures should identify the safe module name instead of collapsing to a generic update failure")
+
+let structuredDKMSLinuxUpdate = CommandResult(
+    exitCode: 1,
+    stdout: "FLEETLIGHT_LINUX_UPDATE\nERROR_KIND:dkms\nERROR_ID:rtl8852bu\nPKG_MGR:apt\nLater Flatpak output\nUPDATE:failed\n",
+    stderr: "",
+    elapsedMilliseconds: 60_000,
+    timedOut: false
+)
+test.require(LinuxUpdateParser.outcome(from: structuredDKMSLinuxUpdate).detail == "Kernel module rtl8852bu failed to build (DKMS)", "structured apt failure metadata should preserve the root cause after later update output")
+
+let failedDPKGLinuxUpdate = CommandResult(
+    exitCode: 1,
+    stdout: "FLEETLIGHT_LINUX_UPDATE\nPKG_MGR:apt\ndpkg: error processing package linux-image-generic (--configure):\nUPDATE:failed\n",
+    stderr: "",
+    elapsedMilliseconds: 1_000,
+    timedOut: false
+)
+test.require(LinuxUpdateParser.outcome(from: failedDPKGLinuxUpdate).detail == "Package linux-image-generic could not be configured (dpkg)", "dpkg failures should retain a safe actionable package name")
 
 let linuxRestartRequirementCommand = LinuxRestartRequirementCommandBuilder.build()
 test.require(linuxRestartRequirementCommand.hasPrefix("printf 'FLEETLIGHT_LINUX_RESTART_REQUIREMENT"), "restart requirement checks should emit a verification marker")

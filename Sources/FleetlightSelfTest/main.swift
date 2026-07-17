@@ -14,6 +14,12 @@ private final class Harness {
     }
 }
 
+struct LegacyObserverStatusSnapshot: Decodable {
+    let schemaVersion: Int
+    let generatedAt: Date
+    let appVersion: String
+}
+
 private let test = Harness()
 test.require(FleetlightVersion.displayLabel(version: "1.32", build: "36") == "v1.32 (36)", "app version labels should show both release and build")
 test.require(FleetlightVersion.displayLabel(version: "1.32", build: nil) == "v1.32", "app version labels should support a missing build")
@@ -732,7 +738,8 @@ let observerStatus = ObserverStatusSnapshot(
     unverifiedCount: 0
 )
 let observerStatusData = try! JSONEncoder().encode(observerStatus)
-test.require(try! JSONDecoder().decode(ObserverStatusSnapshot.self, from: observerStatusData) == observerStatus, "observer snapshots should round-trip without fleet identities")
+let decodedObserverStatus = try! JSONDecoder().decode(ObserverStatusSnapshot.self, from: observerStatusData)
+test.require(decodedObserverStatus == observerStatus && decodedObserverStatus.maintenanceActivity == nil, "legacy observer snapshots should decode without a maintenance field")
 let observerCommand = ObserverStatusCommandBuilder.build()
 test.require(observerCommand.contains("FLEETLIGHT_OBSERVER_STATUS") && observerCommand.contains("observer-status.json"), "observer checks should use a verified aggregate status file")
 test.require(!observerCommand.contains("fleet.json") && !observerCommand.contains(".ssh"), "observer status checks should not read fleet configuration or SSH credentials")
@@ -768,10 +775,107 @@ let matchingObserver = ObserverStatusSnapshot(
     staleVerificationCount: observerStatus.staleVerificationCount,
     unverifiedCount: observerStatus.unverifiedCount
 )
+let maintenanceObserver = ObserverStatusSnapshot(
+    generatedAt: observerGeneratedAt.addingTimeInterval(350),
+    appVersion: matchingObserver.appVersion,
+    linuxHostCount: matchingObserver.linuxHostCount,
+    restartRequiredCount: 2,
+    recentVerificationCount: 2,
+    staleVerificationCount: 1,
+    unverifiedCount: 1,
+    maintenanceActivity: .updatingLinux
+)
+let maintenanceObserverData = try! JSONEncoder().encode(maintenanceObserver)
+test.require(try! JSONDecoder().decode(ObserverStatusSnapshot.self, from: maintenanceObserverData) == maintenanceObserver, "observer snapshots should preserve active maintenance without exposing fleet details")
+let legacyMaintenanceDecode = try! JSONDecoder().decode(LegacyObserverStatusSnapshot.self, from: maintenanceObserverData)
+test.require(legacyMaintenanceDecode.schemaVersion == 1 && legacyMaintenanceDecode.generatedAt == maintenanceObserver.generatedAt && legacyMaintenanceDecode.appVersion == maintenanceObserver.appVersion, "older observer decoders should ignore the additive maintenance field")
+let maintenanceDiagnostic = ObserverStatusDiagnosticBuilder.build(
+    from: ObserverStatusFetchOutcome(state: .available, snapshot: maintenanceObserver, detail: "Available")
+)
+test.require(maintenanceDiagnostic.statusTitle == "Updating Linux", "observer details should identify active Linux maintenance")
 let observerOutcomes = [
     "first": ObserverStatusFetchOutcome(state: .available, snapshot: observerStatus, detail: "Available"),
     "second": ObserverStatusFetchOutcome(state: .available, snapshot: matchingObserver, detail: "Available"),
 ]
+test.require(ObserverStatusRefreshPolicy.heartbeatInterval == 60, "observer heartbeats should remain frequent enough to detect local status changes")
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 2,
+        outcomes: observerOutcomes,
+        now: observerGeneratedAt.addingTimeInterval(300),
+        freshnessInterval: 300
+    ) == 240,
+    "complete observer results should use the healthy remote cache interval while every snapshot is fresh"
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 3,
+        outcomes: observerOutcomes,
+        now: observerGeneratedAt.addingTimeInterval(30),
+        freshnessInterval: 300
+    ) == 45,
+    "missing observer results should use the recovery cache interval"
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 2,
+        outcomes: [
+            "first": observerOutcomes["first"]!,
+            "second": ObserverStatusFetchOutcome(state: .offline, detail: "Observer is unreachable"),
+        ],
+        now: observerGeneratedAt.addingTimeInterval(30),
+        freshnessInterval: 300
+    ) == 45,
+    "unavailable observer results should use the recovery cache interval"
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 2,
+        outcomes: observerOutcomes,
+        now: observerGeneratedAt.addingTimeInterval(301),
+        freshnessInterval: 300
+    ) == 45,
+    "stale observer snapshots should use the recovery cache interval"
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 1,
+        outcomes: ["first": ObserverStatusFetchOutcome(state: .available, detail: "Incomplete")],
+        now: observerGeneratedAt,
+        freshnessInterval: 300
+    ) == 45,
+    "available observer results without a snapshot should use the recovery cache interval"
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 1,
+        outcomes: ["first": ObserverStatusFetchOutcome(state: .available, snapshot: maintenanceObserver, detail: "Available")],
+        now: observerGeneratedAt.addingTimeInterval(360),
+        freshnessInterval: 300
+    ) == 45,
+    "active observer maintenance should use the recovery cache interval so completion is fetched promptly"
+)
+let mismatchedVersionObserver = ObserverStatusSnapshot(
+    generatedAt: matchingObserver.generatedAt,
+    appVersion: "v1.31 (35)",
+    linuxHostCount: matchingObserver.linuxHostCount,
+    restartRequiredCount: matchingObserver.restartRequiredCount,
+    recentVerificationCount: matchingObserver.recentVerificationCount,
+    staleVerificationCount: matchingObserver.staleVerificationCount,
+    unverifiedCount: matchingObserver.unverifiedCount
+)
+test.require(
+    ObserverStatusRefreshPolicy.remoteCacheInterval(
+        expectedCount: 2,
+        outcomes: [
+            "first": observerOutcomes["first"]!,
+            "second": ObserverStatusFetchOutcome(state: .available, snapshot: mismatchedVersionObserver, detail: "Available"),
+        ],
+        now: observerGeneratedAt.addingTimeInterval(30),
+        freshnessInterval: 300
+    ) == 45,
+    "observer disagreements should use the recovery cache interval so rolling upgrades clear promptly"
+)
 let observerConsistency = ObserverConsistencyAnalyzer.summarize(
     expectedObserverIDs: ["first", "second"],
     outcomes: observerOutcomes,
@@ -779,6 +883,45 @@ let observerConsistency = ObserverConsistencyAnalyzer.summarize(
     freshnessInterval: 300
 )
 test.require(observerConsistency.state == .consistent && observerConsistency.detail.contains("2 observers agree"), "fresh matching observers should report agreement")
+let maintenanceConsistency = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: [
+        "first": observerOutcomes["first"]!,
+        "second": ObserverStatusFetchOutcome(state: .available, snapshot: maintenanceObserver, detail: "Available"),
+    ],
+    now: observerGeneratedAt.addingTimeInterval(360),
+    freshnessInterval: 300
+)
+test.require(maintenanceConsistency.state == .maintenance && maintenanceConsistency.detail.contains("comparison resumes automatically"), "fresh Linux maintenance should override a stale peer and transient restart disagreement")
+let staleMaintenanceObserver = ObserverStatusSnapshot(
+    generatedAt: observerGeneratedAt,
+    appVersion: maintenanceObserver.appVersion,
+    linuxHostCount: maintenanceObserver.linuxHostCount,
+    restartRequiredCount: maintenanceObserver.restartRequiredCount,
+    recentVerificationCount: maintenanceObserver.recentVerificationCount,
+    staleVerificationCount: maintenanceObserver.staleVerificationCount,
+    unverifiedCount: maintenanceObserver.unverifiedCount,
+    maintenanceActivity: .updatingLinux
+)
+let freshIdleObserver = ObserverStatusSnapshot(
+    generatedAt: observerGeneratedAt.addingTimeInterval(350),
+    appVersion: observerStatus.appVersion,
+    linuxHostCount: observerStatus.linuxHostCount,
+    restartRequiredCount: observerStatus.restartRequiredCount,
+    recentVerificationCount: observerStatus.recentVerificationCount,
+    staleVerificationCount: observerStatus.staleVerificationCount,
+    unverifiedCount: observerStatus.unverifiedCount
+)
+let expiredMaintenanceConsistency = ObserverConsistencyAnalyzer.summarize(
+    expectedObserverIDs: ["first", "second"],
+    outcomes: [
+        "first": ObserverStatusFetchOutcome(state: .available, snapshot: staleMaintenanceObserver, detail: "Available"),
+        "second": ObserverStatusFetchOutcome(state: .available, snapshot: freshIdleObserver, detail: "Available"),
+    ],
+    now: observerGeneratedAt.addingTimeInterval(360),
+    freshnessInterval: 300
+)
+test.require(expiredMaintenanceConsistency.state == .stale, "an expired maintenance report should remain stale when its peer is fresh")
 let disagreeingObserver = ObserverStatusSnapshot(
     generatedAt: matchingObserver.generatedAt,
     appVersion: matchingObserver.appVersion,

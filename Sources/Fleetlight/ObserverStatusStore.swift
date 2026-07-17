@@ -11,9 +11,15 @@ enum ObserverStatusStore {
         directoryURL.appendingPathComponent("observer-status.json")
     }
 
-    static func save(_ snapshot: ObserverStatusSnapshot) {
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        try? data.write(to: statusURL, options: .atomic)
+    @discardableResult
+    static func save(_ snapshot: ObserverStatusSnapshot) -> Bool {
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            try data.write(to: statusURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 }

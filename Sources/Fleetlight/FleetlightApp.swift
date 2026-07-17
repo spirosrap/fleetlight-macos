@@ -823,6 +823,7 @@ private struct LinuxUpdatesView: View {
     private var observerConsistencyColor: Color {
         switch model.observerConsistencySummary.state {
         case .consistent: .green
+        case .maintenance: .blue
         case .disagreement: .orange
         case .stale, .unavailable, .insufficient: .secondary
         }
@@ -831,6 +832,7 @@ private struct LinuxUpdatesView: View {
     private var observerConsistencySymbol: String {
         switch model.observerConsistencySummary.state {
         case .consistent: "checkmark.seal.fill"
+        case .maintenance: "arrow.triangle.2.circlepath"
         case .disagreement: "exclamationmark.triangle.fill"
         case .stale: "clock.badge.exclamationmark"
         case .unavailable: "wifi.exclamationmark"
@@ -956,7 +958,7 @@ private struct LinuxUpdatesView: View {
                             Task { await model.checkObserverConsistencyNow() }
                         } label: {
                             Label(
-                                model.isCheckingObserverConsistency ? "Checking…" : "Recheck",
+                                model.isCheckingObserverConsistency ? "Fetching…" : "Fetch Reports",
                                 systemImage: "arrow.clockwise"
                             )
                         }
@@ -1159,6 +1161,7 @@ private struct ObserverStatusDetailRow: View {
     private var statusColor: Color {
         switch diagnostic.state {
         case .available:
+            if outcome?.snapshot?.maintenanceActivity != nil { return .blue }
             if outcome?.snapshot?.restartRequiredCount ?? 0 > 0 { return .orange }
             return .green
         case .missing: return .secondary
@@ -1169,7 +1172,10 @@ private struct ObserverStatusDetailRow: View {
 
     private var statusSymbol: String {
         switch diagnostic.state {
-        case .available: "checkmark.circle.fill"
+        case .available:
+            outcome?.snapshot?.maintenanceActivity == nil
+                ? "checkmark.circle.fill"
+                : "arrow.triangle.2.circlepath"
         case .missing: "clock"
         case .offline: "wifi.slash"
         case .invalid: "exclamationmark.triangle.fill"

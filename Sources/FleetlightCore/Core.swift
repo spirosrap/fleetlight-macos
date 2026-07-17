@@ -3007,6 +3007,31 @@ public enum LinuxRestartVerificationAnalyzer {
     }
 }
 
+public enum ObserverMaintenanceActivity: String, Codable, Sendable {
+    case checkingLinuxUpdates
+    case verifyingLinuxRestarts
+    case updatingLinux
+    case restartingLinux
+
+    public var statusTitle: String {
+        switch self {
+        case .checkingLinuxUpdates: "Checking Linux updates"
+        case .verifyingLinuxRestarts: "Verifying Linux restarts"
+        case .updatingLinux: "Updating Linux"
+        case .restartingLinux: "Restarting Linux"
+        }
+    }
+
+    public var progressDescription: String {
+        switch self {
+        case .checkingLinuxUpdates: "checking Linux updates"
+        case .verifyingLinuxRestarts: "verifying Linux restarts"
+        case .updatingLinux: "updating Linux"
+        case .restartingLinux: "restarting Linux"
+        }
+    }
+}
+
 public struct ObserverStatusSnapshot: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let generatedAt: Date
@@ -3016,6 +3041,7 @@ public struct ObserverStatusSnapshot: Codable, Equatable, Sendable {
     public let recentVerificationCount: Int
     public let staleVerificationCount: Int
     public let unverifiedCount: Int
+    public let maintenanceActivity: ObserverMaintenanceActivity?
 
     public init(
         generatedAt: Date = Date(),
@@ -3024,7 +3050,8 @@ public struct ObserverStatusSnapshot: Codable, Equatable, Sendable {
         restartRequiredCount: Int,
         recentVerificationCount: Int,
         staleVerificationCount: Int,
-        unverifiedCount: Int
+        unverifiedCount: Int,
+        maintenanceActivity: ObserverMaintenanceActivity? = nil
     ) {
         schemaVersion = 1
         self.generatedAt = generatedAt
@@ -3034,6 +3061,7 @@ public struct ObserverStatusSnapshot: Codable, Equatable, Sendable {
         self.recentVerificationCount = recentVerificationCount
         self.staleVerificationCount = staleVerificationCount
         self.unverifiedCount = unverifiedCount
+        self.maintenanceActivity = maintenanceActivity
     }
 }
 
@@ -3053,6 +3081,45 @@ public struct ObserverStatusFetchOutcome: Equatable, Sendable {
         self.state = state
         self.snapshot = snapshot
         self.detail = detail
+    }
+}
+
+public enum ObserverStatusRefreshPolicy {
+    public static let heartbeatInterval: TimeInterval = 60
+
+    public static func remoteCacheInterval(
+        expectedCount: Int,
+        outcomes: [String: ObserverStatusFetchOutcome],
+        now: Date = Date(),
+        freshnessInterval: TimeInterval
+    ) -> TimeInterval {
+        guard expectedCount > 0, outcomes.count == expectedCount else {
+            return 45
+        }
+
+        let freshnessCutoff = now.addingTimeInterval(-freshnessInterval)
+        let snapshots = outcomes.values.compactMap { outcome -> ObserverStatusSnapshot? in
+            guard outcome.state == .available, let snapshot = outcome.snapshot else {
+                return nil
+            }
+            guard snapshot.generatedAt >= freshnessCutoff, snapshot.maintenanceActivity == nil else {
+                return nil
+            }
+            return snapshot
+        }
+        guard snapshots.count == expectedCount else { return 45 }
+
+        let appVersions = Set(snapshots.map(\.appVersion))
+        let linuxHostCounts = Set(snapshots.map(\.linuxHostCount))
+        let requiredCounts = Set(snapshots.map(\.restartRequiredCount))
+        let coverage = Set(snapshots.map {
+            "\($0.recentVerificationCount):\($0.staleVerificationCount):\($0.unverifiedCount)"
+        })
+        let allObserversAgree = appVersions.count == 1
+            && linuxHostCounts.count == 1
+            && requiredCounts.count == 1
+            && coverage.count == 1
+        return allObserversAgree ? 240 : 45
     }
 }
 
@@ -3131,7 +3198,7 @@ public enum ObserverStatusDiagnosticBuilder {
         ].joined(separator: " · ")
         return ObserverStatusDiagnostic(
             state: .available,
-            statusTitle: "Reporting",
+            statusTitle: snapshot.maintenanceActivity?.statusTitle ?? "Reporting",
             generatedAt: snapshot.generatedAt,
             appVersion: snapshot.appVersion,
             restartDescription: restartDescription,
@@ -3188,6 +3255,7 @@ public enum ObserverStatusParser {
 public enum ObserverConsistencyState: String, Codable, Sendable {
     case insufficient
     case consistent
+    case maintenance
     case disagreement
     case stale
     case unavailable
@@ -3235,6 +3303,24 @@ public enum ObserverConsistencyAnalyzer {
         }
 
         let freshnessCutoff = now.addingTimeInterval(-freshnessInterval)
+        let maintenanceActivities = available.compactMap { snapshot in
+            snapshot.generatedAt >= freshnessCutoff ? snapshot.maintenanceActivity : nil
+        }
+        if !maintenanceActivities.isEmpty {
+            let detail: String
+            if maintenanceActivities.count == 1, let activity = maintenanceActivities.first {
+                detail = "1 observer is \(activity.progressDescription) · comparison resumes automatically"
+            } else {
+                detail = "\(maintenanceActivities.count) observers are running Linux maintenance · comparison resumes automatically"
+            }
+            return ObserverConsistencySummary(
+                state: .maintenance,
+                expectedCount: expectedCount,
+                availableCount: available.count,
+                detail: detail
+            )
+        }
+
         let staleCount = available.filter { $0.generatedAt < freshnessCutoff }.count
         guard staleCount == 0 else {
             return ObserverConsistencySummary(

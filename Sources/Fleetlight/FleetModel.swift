@@ -70,6 +70,7 @@ final class FleetModel: ObservableObject {
 
     private var started = false
     private var pollTask: Task<Void, Never>?
+    private var observerHeartbeatTask: Task<Void, Never>?
     private var routeValidationTask: Task<Void, Never>?
     private var queuedRefreshTask: Task<Void, Never>?
     private var refreshRequestQueue = RefreshRequestQueue()
@@ -132,6 +133,7 @@ final class FleetModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+        observerHeartbeatTask?.cancel()
         routeValidationTask?.cancel()
         queuedRefreshTask?.cancel()
     }
@@ -253,9 +255,14 @@ final class FleetModel: ObservableObject {
     }
 
     var linuxRestartVerificationSummary: LinuxRestartVerificationSummary {
+        linuxRestartVerificationSummary(at: Date())
+    }
+
+    private func linuxRestartVerificationSummary(at now: Date) -> LinuxRestartVerificationSummary {
         LinuxRestartVerificationAnalyzer.summarize(
             hosts: linuxUpdateHosts,
             snapshots: linuxUpdateSnapshots,
+            now: now,
             freshnessInterval: max(5 * 60, refreshInterval * 2.5)
         )
     }
@@ -287,8 +294,20 @@ final class FleetModel: ObservableObject {
         ObserverConsistencyAnalyzer.summarize(
             expectedObserverIDs: observerHosts.map(\.id),
             outcomes: observerStatusOutcomes,
-            freshnessInterval: max(5 * 60, refreshInterval * 2.5)
+            freshnessInterval: observerFreshnessInterval
         )
+    }
+
+    private var observerFreshnessInterval: TimeInterval {
+        max(5 * 60, refreshInterval * 2.5)
+    }
+
+    private var observerMaintenanceActivity: ObserverMaintenanceActivity? {
+        if isUpdatingLinux { return .updatingLinux }
+        if isRestartingLinux { return .restartingLinux }
+        if isCheckingLinuxUpdates { return .checkingLinuxUpdates }
+        if isCheckingLinuxRestartRequirements { return .verifyingLinuxRestarts }
+        return nil
     }
 
     var isAnyUpdateOperationRunning: Bool {
@@ -551,6 +570,7 @@ final class FleetModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        scheduleObserverHeartbeat()
         let startupStartedAt = DispatchTime.now().uptimeNanoseconds
         launchAtLogin = SMAppService.mainApp.status == .enabled
         let historyIndexTask = Task.detached(priority: .utility) {
@@ -944,33 +964,69 @@ final class FleetModel: ObservableObject {
         }
     }
 
-    private func refreshObserverConsistency(forceRemoteFetch: Bool = false) async {
-        guard let localObserver = observerHosts.first(where: \.isLocal) else { return }
-        let verification = linuxRestartVerificationSummary
+    @discardableResult
+    private func publishLocalObserverStatus(at publishedAt: Date = Date()) -> FleetHost? {
+        guard let localObserver = observerHosts.first(where: \.isLocal) else { return nil }
+        let verification = linuxRestartVerificationSummary(at: publishedAt)
         let localSnapshot = ObserverStatusSnapshot(
+            generatedAt: publishedAt,
             appVersion: FleetlightVersion.currentDisplayLabel,
             linuxHostCount: linuxUpdateHosts.count,
             restartRequiredCount: verification.requiredCount,
             recentVerificationCount: verification.recentCount,
             staleVerificationCount: verification.staleCount,
-            unverifiedCount: verification.unverifiedCount
+            unverifiedCount: verification.unverifiedCount,
+            maintenanceActivity: observerMaintenanceActivity
         )
-        ObserverStatusStore.save(localSnapshot)
+        let didSave = ObserverStatusStore.save(localSnapshot)
 
         var outcomes = observerStatusOutcomes
-        outcomes[localObserver.id] = ObserverStatusFetchOutcome(
-            state: .available,
-            snapshot: localSnapshot,
-            detail: "Local observer status published"
-        )
-        let remoteObservers = observerHosts.filter { !$0.isLocal }
-        let allRemoteStatusesAvailable = remoteObservers.allSatisfy {
-            outcomes[$0.id]?.state == .available
+        outcomes[localObserver.id] = didSave
+            ? ObserverStatusFetchOutcome(
+                state: .available,
+                snapshot: localSnapshot,
+                detail: "Local observer status published"
+            )
+            : ObserverStatusFetchOutcome(
+                state: .invalid,
+                detail: "Local observer status could not be saved"
+            )
+        observerStatusOutcomes = outcomes
+        return localObserver
+    }
+
+    private func scheduleObserverHeartbeat() {
+        guard observerHeartbeatTask == nil else { return }
+        publishLocalObserverStatus()
+        observerHeartbeatTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(ObserverStatusRefreshPolicy.heartbeatInterval))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                self.publishLocalObserverStatus()
+            }
         }
-        let observerCacheInterval: TimeInterval = allRemoteStatusesAvailable ? 4 * 60 : 45
+    }
+
+    private func refreshObserverConsistency(forceRemoteFetch: Bool = false) async {
+        guard publishLocalObserverStatus() != nil else { return }
+        let cachedOutcomes = observerStatusOutcomes
+        let remoteObservers = observerHosts.filter { !$0.isLocal }
+        let observerCacheInterval = ObserverStatusRefreshPolicy.remoteCacheInterval(
+            expectedCount: observerHosts.count,
+            outcomes: Dictionary(uniqueKeysWithValues: observerHosts.compactMap { host in
+                cachedOutcomes[host.id].map { (host.id, $0) }
+            }),
+            now: Date(),
+            freshnessInterval: observerFreshnessInterval
+        )
         let remoteStatusIsDue = forceRemoteFetch
             || observerStatusCheckedAt.map { Date().timeIntervalSince($0) >= observerCacheInterval } != false
-            || remoteObservers.contains { outcomes[$0.id] == nil }
+            || remoteObservers.contains { cachedOutcomes[$0.id] == nil }
+        var remoteResults: [String: ObserverStatusFetchOutcome] = [:]
         if remoteStatusIsDue {
             await withTaskGroup(of: (String, ObserverStatusFetchOutcome).self) { group in
                 for host in remoteObservers {
@@ -981,12 +1037,18 @@ final class FleetModel: ObservableObject {
                     }
                 }
                 for await (hostID, outcome) in group {
-                    outcomes[hostID] = outcome
+                    remoteResults[hostID] = outcome
                 }
             }
             observerStatusCheckedAt = Date()
         }
-        observerStatusOutcomes = outcomes
+        if !remoteResults.isEmpty {
+            var mergedOutcomes = observerStatusOutcomes
+            for (hostID, outcome) in remoteResults {
+                mergedOutcomes[hostID] = outcome
+            }
+            observerStatusOutcomes = mergedOutcomes
+        }
 
         let summary = observerConsistencySummary
         if summary.detail != lastObserverConsistencyDetail {
@@ -1091,8 +1153,10 @@ final class FleetModel: ObservableObject {
         pollTask?.cancel()
         beginLinuxRefreshDeferral()
         isCheckingLinuxRestartRequirements = true
+        publishLocalObserverStatus()
         defer {
             isCheckingLinuxRestartRequirements = false
+            publishLocalObserverStatus()
             endLinuxRefreshDeferral()
         }
         notice = "Verifying Linux restart status…"
@@ -1312,8 +1376,10 @@ final class FleetModel: ObservableObject {
         pollTask?.cancel()
         beginLinuxRefreshDeferral()
         isCheckingLinuxUpdates = true
+        publishLocalObserverStatus()
         defer {
             isCheckingLinuxUpdates = false
+            publishLocalObserverStatus()
             endLinuxRefreshDeferral()
         }
         notice = "Checking Linux updates on \(targets.count) machine\(targets.count == 1 ? "" : "s")…"
@@ -1407,8 +1473,10 @@ final class FleetModel: ObservableObject {
         pollTask?.cancel()
         beginLinuxRefreshDeferral()
         isUpdatingLinux = true
+        publishLocalObserverStatus()
         defer {
             isUpdatingLinux = false
+            publishLocalObserverStatus()
             endLinuxRefreshDeferral()
         }
         if resuming, let batch = linuxUpdateBatch {
@@ -1576,8 +1644,10 @@ final class FleetModel: ObservableObject {
         pollTask?.cancel()
         beginLinuxRefreshDeferral()
         isRestartingLinux = true
+        publishLocalObserverStatus()
         defer {
             isRestartingLinux = false
+            publishLocalObserverStatus()
             endLinuxRefreshDeferral()
         }
         if isRefreshing {

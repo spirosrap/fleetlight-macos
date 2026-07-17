@@ -1795,6 +1795,20 @@ guard case let .complete(controlPOST) = MobileControlHTTPRequestParser.parse(con
 }
 test.require(String(decoding: controlPOST.body, as: UTF8.self) == controlBody, "mobile control parser should preserve an exact JSON body")
 
+let checkRequestID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+let checkRequest = MobileControlCheckRequest(requestId: checkRequestID)
+let checkRequestData = try JSONEncoder().encode(checkRequest)
+let checkBody = String(decoding: checkRequestData, as: UTF8.self)
+let checkPOSTText = "POST /control/v1/checks HTTP/1.1\r\nHost: controller\r\nContent-Type: application/json\r\nIdempotency-Key: \(checkRequestID.uuidString)\r\nContent-Length: \(checkBody.utf8.count)\r\n\r\n\(checkBody)"
+guard case let .complete(checkPOST) = MobileControlHTTPRequestParser.parse(Data(checkPOSTText.utf8)) else {
+    fatalError("complete mobile update-check POST should parse")
+}
+test.require(
+    checkPOST.path == "/control/v1/checks"
+        && checkPOST.header("idempotency-key") == checkRequestID.uuidString,
+    "mobile live checks should preserve the authenticated idempotency key"
+)
+
 let duplicateHeaderRequest = Data("GET /control/v1/status HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n".utf8)
 test.require(MobileControlHTTPRequestParser.parse(duplicateHeaderRequest) == .failure(.malformedRequest), "mobile control parser should reject duplicate headers")
 let chunkedRequest = Data("POST /control/v1/jobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
@@ -1822,6 +1836,105 @@ controlDecoder.dateDecodingStrategy = .iso8601
 let controlJobData = try controlEncoder.encode(controlJob)
 let decodedControlJob = try controlDecoder.decode(MobileControlJob.self, from: controlJobData)
 test.require(decodedControlJob == controlJob, "mobile control job schema should round-trip with request ID and host progress")
+
+let controlCheck = MobileControlCheck(
+    id: UUID(uuidString: "00000000-0000-0000-0000-000000000020")!,
+    requestId: checkRequestID,
+    state: .running,
+    phase: "checking-linux-packages",
+    detail: "Checking Linux package sources",
+    startedAt: mobileFeedCheckedAt
+)
+let controlCheckData = try controlEncoder.encode(controlCheck)
+let controlCheckJSON = String(decoding: controlCheckData, as: UTF8.self)
+let decodedControlCheck = try controlDecoder.decode(MobileControlCheck.self, from: controlCheckData)
+test.require(
+    decodedControlCheck == controlCheck
+        && decodedControlCheck.schemaVersion == 1
+        && controlCheckJSON.contains(#""requestId""#)
+        && controlCheckJSON.contains(#""startedAt""#)
+        && controlCheckJSON.contains(#""finishedAt""#) == false,
+    "mobile live checks should round-trip their stable asynchronous wire fields"
+)
+test.require(
+    MobileControlCheckOutcome.state(successfulComponents: 4, failedComponents: 0) == .succeeded
+        && MobileControlCheckOutcome.state(successfulComponents: 3, failedComponents: 1) == .partial
+        && MobileControlCheckOutcome.state(successfulComponents: 0, failedComponents: 2) == .failed
+        && MobileControlCheckOutcome.state(successfulComponents: 0, failedComponents: 0) == .failed,
+    "mobile live checks should distinguish complete, partial, and failed source results"
+)
+let publishedFailure = MobileControlCheckCompletionPlanner.plan(
+    successfulSources: 0,
+    failedSources: 4,
+    feedPublished: true
+)
+let unpublishedPartial = MobileControlCheckCompletionPlanner.plan(
+    successfulSources: 4,
+    failedSources: 0,
+    feedPublished: false
+)
+let publishedPartial = MobileControlCheckCompletionPlanner.plan(
+    successfulSources: 3,
+    failedSources: 1,
+    feedPublished: true
+)
+test.require(
+    publishedFailure.state == .failed
+        && publishedFailure.detail.contains("Failure results published")
+        && unpublishedPartial.state == .partial
+        && unpublishedPartial.detail.contains("could not be published")
+        && !unpublishedPartial.detail.contains("Fresh results published")
+        && publishedPartial.state == .partial
+        && publishedPartial.detail.contains("Fresh results published"),
+    "mobile check completion should keep source success separate from truthful feed publication"
+)
+let refreshOwnerID = UUID(uuidString: "00000000-0000-0000-0000-000000000021")!
+test.require(
+    MobileControlRefreshOwnership.permits(activeCheckId: nil, requestedCheckId: nil)
+        && MobileControlRefreshOwnership.permits(activeCheckId: refreshOwnerID, requestedCheckId: refreshOwnerID)
+        && !MobileControlRefreshOwnership.permits(activeCheckId: refreshOwnerID, requestedCheckId: nil)
+        && !MobileControlRefreshOwnership.permits(activeCheckId: nil, requestedCheckId: refreshOwnerID),
+    "fleet refreshes should run only without an active check or for the owning live check"
+)
+let releaseURL = URL(string: "https://example.invalid/latest")!
+let freshReleaseRequest = MobileControlReleaseRequestPolicy.request(
+    url: releaseURL,
+    accept: "application/json",
+    bypassCaches: true
+)
+let routineReleaseRequest = MobileControlReleaseRequestPolicy.request(
+    url: releaseURL,
+    accept: "application/json",
+    bypassCaches: false
+)
+test.require(
+    freshReleaseRequest.cachePolicy == .reloadIgnoringLocalAndRemoteCacheData
+        && freshReleaseRequest.value(forHTTPHeaderField: "Cache-Control") == "no-cache"
+        && freshReleaseRequest.value(forHTTPHeaderField: "Pragma") == "no-cache"
+        && freshReleaseRequest.value(forHTTPHeaderField: "Accept") == "application/json"
+        && routineReleaseRequest.cachePolicy == .useProtocolCachePolicy
+        && routineReleaseRequest.value(forHTTPHeaderField: "Cache-Control") == nil,
+    "explicit release checks should bypass URL caches while routine polling retains protocol caching"
+)
+let completedChecks = (0..<102).map { index in
+    MobileControlCheck(
+        requestId: UUID(),
+        state: .succeeded,
+        phase: "complete",
+        detail: "Checked",
+        startedAt: Date(timeIntervalSince1970: TimeInterval(index)),
+        finishedAt: Date(timeIntervalSince1970: TimeInterval(index))
+    )
+}
+let activeCheck = MobileControlCheck(requestId: UUID(), state: .running, phase: "publishing")
+let retainedChecks = MobileControlCheckRetention.retained(completedChecks + [activeCheck])
+test.require(
+    retainedChecks.count == 101
+        && retainedChecks.contains(where: { $0.id == activeCheck.id })
+        && retainedChecks.contains(where: { $0.id == completedChecks.last?.id })
+        && !retainedChecks.contains(where: { $0.id == completedChecks.first?.id }),
+    "mobile check journals should retain every active check and only the latest 100 read-only results"
+)
 
 let restartJobRequest = MobileControlJobRequest(
     requestId: UUID(uuidString: "00000000-0000-0000-0000-000000000012")!,
@@ -1944,15 +2057,51 @@ let restartCapability = MobileControlHostCapability(
     codexCliUpdateAvailable: false,
     codexMacAppUpdateAvailable: false,
     linuxUpdateAvailable: false,
-    restartRequired: true
+    restartRequired: true,
+    linuxCheckedAt: mobileFeedCheckedAt
 )
 let restartCapabilityData = try controlEncoder.encode(restartCapability)
 let decodedRestartCapability = try controlDecoder.decode(MobileControlHostCapability.self, from: restartCapabilityData)
 test.require(
     decodedRestartCapability == restartCapability
         && decodedRestartCapability.restartRequired
+        && decodedRestartCapability.linuxCheckedAt == mobileFeedCheckedAt
         && decodedRestartCapability.actions.contains(.restartLinux),
     "mobile capabilities should expose supported actions and restart-required state independently"
+)
+
+let controlStatus = MobileControlStatus(
+    generatedAt: mobileFeedCheckedAt,
+    controllerId: "example-controller",
+    controllerName: "Example Controller",
+    appVersion: "v1.0 (1)",
+    commandAuthorityEnabled: true,
+    jobJournalAvailable: true,
+    pairedDeviceCount: 1,
+    busy: true,
+    activeJobId: nil,
+    checkingUpdates: true,
+    activeCheckId: controlCheck.id,
+    latestCodexCliVersion: "0.145.0",
+    codexCliCheckedAt: mobileFeedCheckedAt,
+    codexCliCheckFailed: false,
+    latestCodexMacAppVersion: "26.708.10000",
+    latestCodexMacAppBuild: "5220",
+    codexMacAppCheckedAt: mobileFeedCheckedAt,
+    codexMacAppCheckFailed: false,
+    capabilities: [restartCapability],
+    recentJobs: []
+)
+let controlStatusJSON = String(decoding: try controlEncoder.encode(controlStatus), as: UTF8.self)
+test.require(
+    controlStatusJSON.contains(#""checkingUpdates":true"#)
+        && controlStatusJSON.contains(#""activeCheckId""#)
+        && controlStatusJSON.contains(#""latestCodexCliVersion":"0.145.0""#)
+        && controlStatusJSON.contains(#""codexCliCheckedAt""#)
+        && controlStatusJSON.contains(#""latestCodexMacAppVersion":"26.708.10000""#)
+        && controlStatusJSON.contains(#""codexMacAppCheckedAt""#)
+        && controlStatusJSON.contains(#""linuxCheckedAt""#),
+    "mobile status should expose live-check activity, latest releases, and per-Linux-host freshness"
 )
 
 let liveRestartProgress = MobileControlProgressMapper.map(

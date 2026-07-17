@@ -100,6 +100,8 @@ final class FleetModel: ObservableObject {
     private var mobileControlPairingChallenge: MobileControlPairingChallenge?
     private var mobileControlJobs: [MobileControlJob] = []
     private var mobileControlActiveJobID: UUID?
+    private var mobileControlChecks: [MobileControlCheck] = []
+    private var mobileControlActiveCheckID: UUID?
 
     private static let codexReleaseCheckInterval: TimeInterval = 15 * 60
     private static let failedCodexReleaseRetryInterval: TimeInterval = 5 * 60
@@ -113,8 +115,12 @@ final class FleetModel: ObservableObject {
         snapshots = Dictionary(uniqueKeysWithValues: resolvedHosts.map { ($0.id, HostSnapshot()) })
         let mobileControlJournal = MobileControlJobStore.load()
         mobileControlJobs = mobileControlJournal.jobs
-        mobileControlJobJournalAvailable = mobileControlJournal.isAvailable
-        if !mobileControlJournal.isAvailable {
+        let mobileControlCheckJournal = MobileControlCheckStore.load()
+        mobileControlChecks = mobileControlCheckJournal.checks
+        let controlJournalsAvailable = mobileControlJournal.isAvailable
+            && mobileControlCheckJournal.isAvailable
+        mobileControlJobJournalAvailable = controlJournalsAvailable
+        if !controlJournalsAvailable {
             mobileControlCommandAuthorityEnabled = false
             UserDefaults.standard.set(false, forKey: "mobileControlCommandAuthorityEnabled")
         }
@@ -148,6 +154,7 @@ final class FleetModel: ObservableObject {
         restoreCodexUpdateBatch()
         restoreLinuxUpdateBatch()
         reconcileInterruptedMobileControlJobs()
+        reconcileInterruptedMobileControlChecks()
     }
 
     deinit {
@@ -335,7 +342,9 @@ final class FleetModel: ObservableObject {
     }
 
     var isAnyUpdateOperationRunning: Bool {
-        mobileControlActiveJobID != nil || isAnyUpdateOperationRunningExceptMobileControl
+        mobileControlActiveJobID != nil
+            || mobileControlActiveCheckID != nil
+            || isAnyUpdateOperationRunningExceptMobileControl
     }
 
     private var isLinuxRefreshBlocked: Bool {
@@ -652,6 +661,10 @@ final class FleetModel: ObservableObject {
     }
 
     func requestRefreshAll() async {
+        guard mobileControlActiveCheckID == nil else {
+            notice = "Wait for the live update check to finish"
+            return
+        }
         if !isLinuxRefreshBlocked, isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty {
             notice = "A fleet refresh is already running"
             return
@@ -701,7 +714,11 @@ final class FleetModel: ObservableObject {
     }
 
     private func runQueuedRefreshIfReady() async {
-        let isBlocked = isLinuxRefreshBlocked || isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty
+        let isBlocked = mobileControlActiveCheckID != nil
+            || isLinuxRefreshBlocked
+            || isRefreshing
+            || isValidatingRoutes
+            || !refreshingHostIDs.isEmpty
         guard refreshRequestQueue.takeIfReady(isBlocked: isBlocked) else {
             isRefreshQueued = refreshRequestQueue.isQueued
             return
@@ -734,8 +751,17 @@ final class FleetModel: ObservableObject {
     }
 
     @discardableResult
-    func refreshAll() async -> Bool {
-        guard !isRefreshing, !isValidatingRoutes, refreshingHostIDs.isEmpty, !isLinuxRefreshBlocked else { return false }
+    func refreshAll(
+        forceReleaseChecks: Bool = false,
+        mobileControlCheckID: UUID? = nil
+    ) async -> Bool {
+        guard MobileControlRefreshOwnership.permits(
+            activeCheckId: mobileControlActiveCheckID,
+            requestedCheckId: mobileControlCheckID
+        ), !isRefreshing,
+           !isValidatingRoutes,
+           refreshingHostIDs.isEmpty,
+           !isLinuxRefreshBlocked else { return false }
         let refreshStartedAt = DispatchTime.now().uptimeNanoseconds
         isRefreshing = true
         notice = nil
@@ -743,13 +769,15 @@ final class FleetModel: ObservableObject {
         let releaseRetryInterval = codexReleaseCheckFailed
             ? Self.failedCodexReleaseRetryInterval
             : Self.codexReleaseCheckInterval
-        let shouldCheckCodexRelease = codexReleaseCheckedAt.map {
+        let shouldCheckCodexRelease = forceReleaseChecks || (codexReleaseCheckedAt.map {
             Date().timeIntervalSince($0) >= releaseRetryInterval
-        } ?? true
+        } ?? true)
         let codexReleaseTask: Task<String?, Never>?
         if shouldCheckCodexRelease {
             isCheckingCodexRelease = true
-            codexReleaseTask = Task { await Self.fetchLatestCodexRelease() }
+            codexReleaseTask = Task {
+                await Self.fetchLatestCodexRelease(bypassCaches: forceReleaseChecks)
+            }
         } else {
             codexReleaseTask = nil
         }
@@ -757,13 +785,15 @@ final class FleetModel: ObservableObject {
         let appReleaseRetryInterval = codexDesktopAppReleaseCheckFailed
             ? Self.failedCodexReleaseRetryInterval
             : Self.codexReleaseCheckInterval
-        let shouldCheckAppRelease = codexDesktopAppReleaseCheckedAt.map {
+        let shouldCheckAppRelease = forceReleaseChecks || (codexDesktopAppReleaseCheckedAt.map {
             Date().timeIntervalSince($0) >= appReleaseRetryInterval
-        } ?? true
+        } ?? true)
         let appReleaseTask: Task<String?, Never>?
         if shouldCheckAppRelease {
             isCheckingCodexDesktopAppRelease = true
-            appReleaseTask = Task { await Self.fetchLatestCodexDesktopAppRelease() }
+            appReleaseTask = Task {
+                await Self.fetchLatestCodexDesktopAppRelease(bypassCaches: forceReleaseChecks)
+            }
         } else {
             appReleaseTask = nil
         }
@@ -1236,7 +1266,8 @@ final class FleetModel: ObservableObject {
             : "Verified current after prior update failure"
     }
 
-    private func publishMobileFeed() {
+    @discardableResult
+    private func publishMobileFeed() -> Bool {
         let feedHosts = visibleHosts
         let hostsByID = Dictionary(uniqueKeysWithValues: feedHosts.map { ($0.id, $0) })
 
@@ -1374,7 +1405,7 @@ final class FleetModel: ObservableObject {
         }
 
         let document = MobileFeedDocument(
-            generatedAt: lastRefresh ?? Date(),
+            generatedAt: Date(),
             observer: MobileFeedObserver(
                 id: FleetObserver.currentDisplayName.lowercased(),
                 name: FleetObserver.currentDisplayName,
@@ -1396,7 +1427,7 @@ final class FleetModel: ObservableObject {
             incidents: recentIncidents,
             metrics: metrics
         )
-        _ = MobileFeedStore.save(document)
+        return MobileFeedStore.save(document)
     }
 
 
@@ -1526,6 +1557,7 @@ final class FleetModel: ObservableObject {
 
     func checkCodexReleaseNow() async {
         guard !isCheckingCodexRelease else { return }
+        guard mobileControlActiveCheckID == nil else { return }
         guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -1533,7 +1565,7 @@ final class FleetModel: ObservableObject {
         }
         isCheckingCodexRelease = true
         notice = nil
-        applyCodexReleaseResult(await Self.fetchLatestCodexRelease())
+        applyCodexReleaseResult(await Self.fetchLatestCodexRelease(bypassCaches: true))
         await reconcileCodexUpdateFailuresVerifiedCurrent()
         await postCodexUpdateAlertsIfNeeded()
         if codexReleaseCheckFailed {
@@ -1564,10 +1596,13 @@ final class FleetModel: ObservableObject {
 
     func checkCodexDesktopAppReleaseNow() async {
         guard !isCheckingCodexDesktopAppRelease else { return }
+        guard mobileControlActiveCheckID == nil else { return }
         guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
         isCheckingCodexDesktopAppRelease = true
         notice = nil
-        applyCodexDesktopAppReleaseResult(await Self.fetchLatestCodexDesktopAppRelease())
+        applyCodexDesktopAppReleaseResult(
+            await Self.fetchLatestCodexDesktopAppRelease(bypassCaches: true)
+        )
         await postCodexUpdateAlertsIfNeeded()
         if codexDesktopAppReleaseCheckFailed {
             notice = "Couldn’t check the latest Codex Mac app release"
@@ -1588,8 +1623,8 @@ final class FleetModel: ObservableObject {
         isCheckingCodexRelease = true
         isCheckingCodexDesktopAppRelease = true
         notice = nil
-        async let registryTask = Self.fetchLatestCodexRelease()
-        async let appcastTask = Self.fetchLatestCodexDesktopAppRelease()
+        async let registryTask = Self.fetchLatestCodexRelease(bypassCaches: true)
+        async let appcastTask = Self.fetchLatestCodexDesktopAppRelease(bypassCaches: true)
         let registryJSON = await registryTask
         let appcastXML = await appcastTask
         applyCodexReleaseResult(registryJSON)
@@ -1653,7 +1688,16 @@ final class FleetModel: ObservableObject {
     }
 
     func checkLinuxUpdates() async {
-        guard !isCheckingLinuxUpdates, !isCheckingLinuxRestartRequirements, !isUpdatingLinux, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
+        await checkLinuxUpdates(forMobileControlCheck: nil)
+    }
+
+    private func checkLinuxUpdates(forMobileControlCheck checkID: UUID?) async {
+        guard mobileControlActiveCheckID == checkID,
+              !isCheckingLinuxUpdates,
+              !isCheckingLinuxRestartRequirements,
+              !isUpdatingLinux,
+              !isRestartingLinux,
+              !isAnyCodexUpdateRunning else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
             return
@@ -1755,7 +1799,11 @@ final class FleetModel: ObservableObject {
     }
 
     private func performLinuxUpdates(on targets: [FleetHost], resuming: Bool = false) async {
-        guard !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux, !isAnyCodexUpdateRunning else { return }
+        guard mobileControlActiveCheckID == nil,
+              !isUpdatingLinux,
+              !isCheckingLinuxUpdates,
+              !isRestartingLinux,
+              !isAnyCodexUpdateRunning else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -1952,6 +2000,7 @@ final class FleetModel: ObservableObject {
 
     private func performLinuxRestarts(on targets: [FleetHost], mobileControlJobID: UUID?) async {
         guard mobileControlActiveJobID == mobileControlJobID,
+              mobileControlActiveCheckID == nil,
               !isAnyUpdateOperationRunningExceptMobileControl,
               !targets.isEmpty else { return }
         pollTask?.cancel()
@@ -2146,7 +2195,12 @@ final class FleetModel: ObservableObject {
     }
 
     private func performCodexDesktopAppUpdates(on targets: [FleetHost]) async {
-        guard !isUpdatingCodexDesktopApps, !isUpdatingCodex, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
+        guard mobileControlActiveCheckID == nil,
+              !isUpdatingCodexDesktopApps,
+              !isUpdatingCodex,
+              !isUpdatingLinux,
+              !isCheckingLinuxUpdates,
+              !isRestartingLinux else { return }
         guard !targets.isEmpty else {
             notice = "No macOS Codex desktop app machines are configured"
             return
@@ -2227,7 +2281,12 @@ final class FleetModel: ObservableObject {
         resuming: Bool = false,
         preservingProgress: Bool = false
     ) async {
-        guard !isUpdatingCodex, !isUpdatingCodexDesktopApps, !isUpdatingLinux, !isCheckingLinuxUpdates, !isRestartingLinux else { return }
+        guard mobileControlActiveCheckID == nil,
+              !isUpdatingCodex,
+              !isUpdatingCodexDesktopApps,
+              !isUpdatingLinux,
+              !isCheckingLinuxUpdates,
+              !isRestartingLinux else { return }
         guard resuming || !targets.isEmpty else { return }
         guard !isRefreshing else {
             notice = "Wait for the current fleet check to finish"
@@ -2571,6 +2630,24 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    private func reconcileInterruptedMobileControlChecks() {
+        guard mobileControlJobJournalAvailable else { return }
+        var changed = false
+        for index in mobileControlChecks.indices where !mobileControlChecks[index].state.isTerminal {
+            mobileControlChecks[index].state = .failed
+            mobileControlChecks[index].phase = "interrupted"
+            mobileControlChecks[index].detail = "Update check interrupted because the controller restarted"
+            mobileControlChecks[index].finishedAt = Date()
+            changed = true
+        }
+        if changed {
+            mobileControlChecks = MobileControlCheckRetention.retained(mobileControlChecks)
+            if !MobileControlCheckStore.save(mobileControlChecks) {
+                markMobileControlJournalUnavailable()
+            }
+        }
+    }
+
     func handleLocalMobilePairingStartRequest(
         _ request: MobileControlHTTPRequest
     ) async -> MobileControlHTTPResponse {
@@ -2618,6 +2695,15 @@ final class FleetModel: ObservableObject {
         switch (request.method, path) {
         case ("GET", "/control/v1/status"):
             return mobileControlJSONResponse(mobileControlStatus(), status: 200, reason: "OK")
+        case ("POST", "/control/v1/checks"):
+            return await handleMobileControlCheckCreation(request, credential: credential)
+        case ("GET", let checkPath) where checkPath.hasPrefix("/control/v1/checks/"):
+            let rawID = String(checkPath.dropFirst("/control/v1/checks/".count))
+            guard let checkID = UUID(uuidString: rawID),
+                  let check = mobileControlChecks.first(where: { $0.id == checkID }) else {
+                return mobileControlError(status: 404, reason: "Not Found", code: "check-not-found", message: "Update check not found")
+            }
+            return mobileControlJSONResponse(mobileControlCheckSnapshot(check), status: 200, reason: "OK")
         case ("POST", "/control/v1/jobs"):
             return await handleMobileControlJobCreation(request, credential: credential)
         case ("GET", let jobPath) where jobPath.hasPrefix("/control/v1/jobs/by-request/"):
@@ -2702,6 +2788,234 @@ final class FleetModel: ObservableObject {
         }
     }
 
+    private func handleMobileControlCheckCreation(
+        _ request: MobileControlHTTPRequest,
+        credential: MobileControlPairedCredential
+    ) async -> MobileControlHTTPResponse {
+        guard mobileControlRequestHasJSONContentType(request) else {
+            return mobileControlError(status: 415, reason: "Unsupported Media Type", code: "json-required", message: "Content-Type must be application/json")
+        }
+        guard let checkRequest = try? mobileControlJSONDecoder().decode(MobileControlCheckRequest.self, from: request.body) else {
+            return mobileControlError(status: 400, reason: "Bad Request", code: "invalid-check-request", message: "The update-check request is invalid")
+        }
+        guard let idempotencyKey = request.header("Idempotency-Key"),
+              UUID(uuidString: idempotencyKey) == checkRequest.requestId else {
+            return mobileControlError(status: 400, reason: "Bad Request", code: "idempotency-key-mismatch", message: "Idempotency-Key must match requestId")
+        }
+
+        if let existing = mobileControlChecks.first(where: { $0.requestId == checkRequest.requestId }) {
+            return mobileControlJSONResponse(mobileControlCheckSnapshot(existing), status: 200, reason: "OK")
+        }
+        guard !mobileControlJobs.contains(where: { $0.requestId == checkRequest.requestId }) else {
+            return mobileControlError(status: 409, reason: "Conflict", code: "request-id-conflict", message: "That request ID was already used with a different operation")
+        }
+
+        guard mobileControlJobJournalAvailable else {
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal is unavailable; no update check was started")
+        }
+        guard mobileControlActiveCheckID == nil,
+              mobileControlActiveJobID == nil,
+              !isRefreshing,
+              !isRefreshQueued,
+              refreshingHostIDs.isEmpty,
+              !isAnyUpdateOperationRunningExceptMobileControl,
+              !isCheckingCodexRelease,
+              !isCheckingCodexDesktopAppRelease else {
+            return mobileControlError(status: 409, reason: "Conflict", code: "controller-busy", message: "Another fleet operation is already running")
+        }
+
+        let check = MobileControlCheck(requestId: checkRequest.requestId)
+        var updatedChecks = mobileControlChecks
+        updatedChecks.append(check)
+        updatedChecks = MobileControlCheckRetention.retained(updatedChecks)
+        do {
+            try MobileControlCheckStore.saveDurably(updatedChecks)
+        } catch {
+            markMobileControlJournalUnavailable()
+            await ActivityLogger.shared.append(
+                event: "mobile-control-check-rejected",
+                detail: "reason=journal-write-failed"
+            )
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal could not be saved; no update check was started")
+        }
+        mobileControlChecks = updatedChecks
+        mobileControlActiveCheckID = check.id
+        pollTask?.cancel()
+        await ActivityLogger.shared.append(
+            event: "mobile-control-check-accepted",
+            detail: "check=\(check.id.uuidString); device=\(MobileFeedSanitizer.redact(credential.deviceName))"
+        )
+        Task { @MainActor [weak self] in
+            await self?.runMobileControlCheck(check.id)
+        }
+        return mobileControlJSONResponse(check, status: 202, reason: "Accepted")
+    }
+
+    private func runMobileControlCheck(_ checkID: UUID) async {
+        guard mobileControlActiveCheckID == checkID else { return }
+        pollTask?.cancel()
+        let checkStartedAt = Date()
+        guard updateMobileControlCheck(checkID, mutation: { check in
+            check.state = .running
+            check.phase = "probing-installed-versions"
+            check.detail = "Checking installed versions on every machine"
+            check.startedAt = checkStartedAt
+        }) else {
+            recoverMobileControlCheckAfterJournalFailure(checkID)
+            return
+        }
+
+        let refreshed = await refreshAll(
+            forceReleaseChecks: true,
+            mobileControlCheckID: checkID
+        )
+        guard mobileControlActiveCheckID == checkID else { return }
+        guard refreshed else {
+            finishMobileControlCheck(
+                checkID,
+                state: .failed,
+                detail: "The fresh fleet probe could not start"
+            )
+            return
+        }
+
+        let linuxTargets = linuxUpdateHosts
+        if !linuxTargets.isEmpty {
+            guard updateMobileControlCheck(checkID, mutation: { check in
+                check.phase = "checking-linux-packages"
+                check.detail = "Checking Linux package sources"
+            }) else {
+                recoverMobileControlCheckAfterJournalFailure(checkID)
+                return
+            }
+            await checkLinuxUpdates(forMobileControlCheck: checkID)
+        }
+
+        guard mobileControlActiveCheckID == checkID else { return }
+        guard updateMobileControlCheck(checkID, mutation: { check in
+            check.phase = "publishing"
+            check.detail = "Publishing fresh fleet status"
+        }) else {
+            recoverMobileControlCheckAfterJournalFailure(checkID)
+            return
+        }
+        let feedPublished = publishMobileFeed()
+
+        var successfulSources = 0
+        var failedSources = 0
+        for host in visibleHosts {
+            if snapshots[host.id]?.state == .online,
+               snapshots[host.id]?.checkedAt.map({ $0 >= checkStartedAt }) == true {
+                successfulSources += 1
+            } else {
+                failedSources += 1
+            }
+        }
+        if codexReleaseCheckFailed || codexReleaseCheckedAt.map({ $0 >= checkStartedAt }) != true {
+            failedSources += 1
+        } else {
+            successfulSources += 1
+        }
+        if codexDesktopAppReleaseCheckFailed
+            || codexDesktopAppReleaseCheckedAt.map({ $0 >= checkStartedAt }) != true {
+            failedSources += 1
+        } else {
+            successfulSources += 1
+        }
+        for host in linuxTargets {
+            let snapshot = linuxUpdateSnapshots[host.id]
+            guard snapshot?.checkedAt.map({ $0 >= checkStartedAt }) == true else {
+                failedSources += 1
+                continue
+            }
+            switch snapshot?.state {
+            case .current, .updateAvailable: successfulSources += 1
+            case .none, .notChecked, .checking, .offline, .unsupported, .failed: failedSources += 1
+            }
+        }
+
+        let completion = MobileControlCheckCompletionPlanner.plan(
+            successfulSources: successfulSources,
+            failedSources: failedSources,
+            feedPublished: feedPublished
+        )
+        finishMobileControlCheck(checkID, state: completion.state, detail: completion.detail)
+    }
+
+    @discardableResult
+    private func updateMobileControlCheck(
+        _ checkID: UUID,
+        mutation: (inout MobileControlCheck) -> Void
+    ) -> Bool {
+        guard let index = mobileControlChecks.firstIndex(where: { $0.id == checkID }) else { return false }
+        mutation(&mobileControlChecks[index])
+        return MobileControlCheckStore.save(mobileControlChecks)
+    }
+
+    private func recoverMobileControlCheckAfterJournalFailure(_ checkID: UUID) {
+        if let index = mobileControlChecks.firstIndex(where: { $0.id == checkID }) {
+            mobileControlChecks[index].state = .failed
+            mobileControlChecks[index].phase = "journal-failed"
+            mobileControlChecks[index].detail = "Update check stopped because its recovery journal became unavailable"
+            mobileControlChecks[index].finishedAt = Date()
+            mobileControlChecks = MobileControlCheckRetention.retained(mobileControlChecks)
+            _ = MobileControlCheckStore.save(mobileControlChecks)
+        }
+        mobileControlActiveCheckID = nil
+        markMobileControlJournalUnavailable()
+        resumeRefreshSchedulingAfterMobileControlCheck()
+        Task {
+            await ActivityLogger.shared.append(
+                event: "mobile-control-check-finished",
+                detail: "check=\(checkID.uuidString); state=failed; reason=journal-write-failed"
+            )
+        }
+    }
+
+    private func resumeRefreshSchedulingAfterMobileControlCheck() {
+        scheduleQueuedRefreshIfNeeded()
+        if started { schedulePolling() }
+    }
+
+    private func finishMobileControlCheck(
+        _ checkID: UUID,
+        state: MobileControlJobState,
+        detail: String
+    ) {
+        guard let index = mobileControlChecks.firstIndex(where: { $0.id == checkID }) else {
+            mobileControlActiveCheckID = nil
+            return
+        }
+        mobileControlChecks[index].state = state
+        mobileControlChecks[index].phase = "complete"
+        mobileControlChecks[index].detail = detail
+        mobileControlChecks[index].finishedAt = Date()
+        mobileControlActiveCheckID = nil
+        mobileControlChecks = MobileControlCheckRetention.retained(mobileControlChecks)
+        if !MobileControlCheckStore.save(mobileControlChecks) {
+            markMobileControlJournalUnavailable()
+        }
+        resumeRefreshSchedulingAfterMobileControlCheck()
+        Task {
+            await ActivityLogger.shared.append(
+                event: "mobile-control-check-finished",
+                detail: "check=\(checkID.uuidString); state=\(state.rawValue)"
+            )
+        }
+    }
+
+    private func mobileControlCheckSnapshot(_ check: MobileControlCheck) -> MobileControlCheck {
+        MobileControlCheck(
+            id: check.id,
+            requestId: check.requestId,
+            state: check.state,
+            phase: check.phase,
+            detail: MobileFeedSanitizer.redact(check.detail),
+            startedAt: check.startedAt,
+            finishedAt: check.finishedAt
+        )
+    }
+
     private func handleMobileControlJobCreation(
         _ request: MobileControlHTTPRequest,
         credential: MobileControlPairedCredential
@@ -2727,6 +3041,9 @@ final class FleetModel: ObservableObject {
                 return mobileControlError(status: 409, reason: "Conflict", code: "request-id-conflict", message: "That request ID was already used with a different operation")
             }
             return mobileControlJSONResponse(mobileControlJobSnapshot(existing), status: 200, reason: "OK")
+        }
+        guard !mobileControlChecks.contains(where: { $0.requestId == jobRequest.requestId }) else {
+            return mobileControlError(status: 409, reason: "Conflict", code: "request-id-conflict", message: "That request ID was already used with a different operation")
         }
 
         guard mobileControlJobJournalAvailable else {
@@ -3036,7 +3353,8 @@ final class FleetModel: ObservableObject {
                 codexCliUpdateAvailable: cliAvailable.contains(host.id),
                 codexMacAppUpdateAvailable: appAvailable.contains(host.id),
                 linuxUpdateAvailable: linuxUpdateAvailable,
-                restartRequired: restartRequired
+                restartRequired: restartRequired,
+                linuxCheckedAt: linuxUpdateSnapshots[host.id]?.checkedAt
             )
         }
         let recentJobs = Array(mobileControlJobs.sorted { $0.createdAt > $1.createdAt }.prefix(20)).map(mobileControlJobSnapshot)
@@ -3047,8 +3365,20 @@ final class FleetModel: ObservableObject {
             commandAuthorityEnabled: mobileControlCommandAuthorityEnabled,
             jobJournalAvailable: mobileControlJobJournalAvailable,
             pairedDeviceCount: mobileControlPairedDeviceCount,
-            busy: mobileControlActiveJobID != nil || isAnyUpdateOperationRunning || isRefreshing,
+            busy: mobileControlActiveJobID != nil
+                || mobileControlActiveCheckID != nil
+                || isAnyUpdateOperationRunning
+                || isRefreshing,
             activeJobId: mobileControlActiveJobID,
+            checkingUpdates: mobileControlActiveCheckID != nil,
+            activeCheckId: mobileControlActiveCheckID,
+            latestCodexCliVersion: latestCodexVersion,
+            codexCliCheckedAt: codexReleaseCheckedAt,
+            codexCliCheckFailed: codexReleaseCheckFailed,
+            latestCodexMacAppVersion: latestCodexDesktopAppRelease?.version,
+            latestCodexMacAppBuild: latestCodexDesktopAppRelease?.build,
+            codexMacAppCheckedAt: codexDesktopAppReleaseCheckedAt,
+            codexMacAppCheckFailed: codexDesktopAppReleaseCheckFailed,
             capabilities: capabilities,
             recentJobs: recentJobs
         )
@@ -3746,7 +4076,9 @@ final class FleetModel: ObservableObject {
     }
 
     private func schedulePolling() {
-        guard linuxRefreshDeferralDepth == 0, !refreshRequestQueue.isQueued else { return }
+        guard mobileControlActiveCheckID == nil,
+              linuxRefreshDeferralDepth == 0,
+              !refreshRequestQueue.isQueued else { return }
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -3754,7 +4086,8 @@ final class FleetModel: ObservableObject {
                 let interval = self.refreshInterval
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { break }
-                await self.refreshAll()
+                guard self.mobileControlActiveCheckID == nil else { continue }
+                await self.refreshAll(mobileControlCheckID: nil)
             }
         }
     }
@@ -3961,10 +4294,13 @@ final class FleetModel: ObservableObject {
         return Int(elapsed / 1_000_000)
     }
 
-    nonisolated private static func fetchLatestCodexRelease() async -> String? {
+    nonisolated private static func fetchLatestCodexRelease(bypassCaches: Bool = false) async -> String? {
         guard let url = URL(string: "https://registry.npmjs.org/@openai%2Fcodex/latest") else { return nil }
-        var request = URLRequest(url: url, timeoutInterval: 8)
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let request = MobileControlReleaseRequestPolicy.request(
+            url: url,
+            accept: "application/json",
+            bypassCaches: bypassCaches
+        )
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
@@ -3975,10 +4311,13 @@ final class FleetModel: ObservableObject {
         }
     }
 
-    nonisolated private static func fetchLatestCodexDesktopAppRelease() async -> String? {
+    nonisolated private static func fetchLatestCodexDesktopAppRelease(bypassCaches: Bool = false) async -> String? {
         guard let url = URL(string: "https://persistent.oaistatic.com/codex-app-prod/appcast.xml") else { return nil }
-        var request = URLRequest(url: url, timeoutInterval: 8)
-        request.setValue("application/xml", forHTTPHeaderField: "Accept")
+        let request = MobileControlReleaseRequestPolicy.request(
+            url: url,
+            accept: "application/xml",
+            bypassCaches: bypassCaches
+        )
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,

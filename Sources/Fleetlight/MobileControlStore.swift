@@ -265,6 +265,77 @@ enum MobileControlJobStore {
     }
 }
 
+private struct PersistedMobileControlChecks: Codable {
+    let schemaVersion: Int
+    let checks: [MobileControlCheck]
+}
+
+struct MobileControlCheckJournalLoad: Sendable {
+    let checks: [MobileControlCheck]
+    let isAvailable: Bool
+}
+
+enum MobileControlCheckStore {
+    private static var fileURL: URL {
+        let bundleID = Bundle.main.bundleIdentifier ?? "app.fleetlight.public"
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Fleetlight", isDirectory: true)
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent("mobile-control-checks.json")
+    }
+
+    static func load() -> MobileControlCheckJournalLoad {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return MobileControlCheckJournalLoad(checks: [], isAvailable: true)
+        }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            return MobileControlCheckJournalLoad(checks: [], isAvailable: false)
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let journal = try? decoder.decode(PersistedMobileControlChecks.self, from: data),
+              journal.schemaVersion == 1 else {
+            return MobileControlCheckJournalLoad(checks: [], isAvailable: false)
+        }
+        return MobileControlCheckJournalLoad(
+            checks: MobileControlCheckRetention.retained(journal.checks),
+            isAvailable: true
+        )
+    }
+
+    @discardableResult
+    static func save(_ checks: [MobileControlCheck]) -> Bool {
+        do {
+            try saveDurably(checks)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func saveDurably(_ checks: [MobileControlCheck]) throws {
+        // Live checks are read-only, so a bounded replay window prevents journal growth
+        // without risking a repeated install or restart after an old entry is evicted.
+        let journal = PersistedMobileControlChecks(
+            schemaVersion: 1,
+            checks: MobileControlCheckRetention.retained(checks)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(journal)
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try data.write(to: fileURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+}
+
 struct MobileControlHTTPResponse: Sendable {
     let statusCode: Int
     let reason: String

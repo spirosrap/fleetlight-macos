@@ -116,6 +116,14 @@ public struct MobileControlJobRequest: Codable, Equatable, Sendable {
     }
 }
 
+public struct MobileControlCheckRequest: Codable, Equatable, Sendable {
+    public let requestId: UUID
+
+    public init(requestId: UUID) {
+        self.requestId = requestId
+    }
+}
+
 public enum MobileControlJobState: String, Codable, Sendable {
     case queued
     case running
@@ -128,6 +136,142 @@ public enum MobileControlJobState: String, Codable, Sendable {
         case .succeeded, .partial, .failed: true
         case .queued, .running: false
         }
+    }
+}
+
+public struct MobileControlCheck: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let id: UUID
+    public let requestId: UUID
+    public var state: MobileControlJobState
+    public var phase: String
+    public var detail: String
+    public var startedAt: Date?
+    public var finishedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        requestId: UUID,
+        state: MobileControlJobState = .queued,
+        phase: String = "queued",
+        detail: String = "Waiting to check for updates",
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil
+    ) {
+        schemaVersion = 1
+        self.id = id
+        self.requestId = requestId
+        self.state = state
+        self.phase = phase
+        self.detail = detail
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+    }
+}
+
+public enum MobileControlCheckOutcome {
+    public static func state(successfulComponents: Int, failedComponents: Int) -> MobileControlJobState {
+        guard successfulComponents > 0 else { return .failed }
+        if failedComponents == 0 { return .succeeded }
+        return successfulComponents > 0 ? .partial : .failed
+    }
+}
+
+public struct MobileControlCheckCompletion: Equatable, Sendable {
+    public let state: MobileControlJobState
+    public let detail: String
+
+    public init(state: MobileControlJobState, detail: String) {
+        self.state = state
+        self.detail = detail
+    }
+}
+
+public enum MobileControlCheckCompletionPlanner {
+    public static func plan(
+        successfulSources: Int,
+        failedSources: Int,
+        feedPublished: Bool
+    ) -> MobileControlCheckCompletion {
+        let state = MobileControlCheckOutcome.state(
+            successfulComponents: successfulSources,
+            failedComponents: failedSources + (feedPublished ? 0 : 1)
+        )
+        let unavailable = max(0, failedSources)
+        let sourceDetail = "\(unavailable) source check\(unavailable == 1 ? "" : "s") unavailable"
+
+        switch state {
+        case .succeeded:
+            return MobileControlCheckCompletion(
+                state: state,
+                detail: "Checked installed versions, release feeds, and Linux packages"
+            )
+        case .partial where feedPublished:
+            return MobileControlCheckCompletion(
+                state: state,
+                detail: "Fresh results published · \(sourceDetail)"
+            )
+        case .partial:
+            let detail = unavailable > 0
+                ? "Check completed with \(sourceDetail) · fresh status could not be published"
+                : "Update sources checked · fresh status could not be published"
+            return MobileControlCheckCompletion(state: state, detail: detail)
+        case .failed where feedPublished:
+            return MobileControlCheckCompletion(
+                state: state,
+                detail: "Failure results published · no update source returned a usable result"
+            )
+        case .failed:
+            return MobileControlCheckCompletion(
+                state: state,
+                detail: "Update check failed · no usable source result and fresh status could not be published"
+            )
+        case .queued, .running:
+            return MobileControlCheckCompletion(state: state, detail: "Update check completed")
+        }
+    }
+}
+
+public enum MobileControlRefreshOwnership {
+    public static func permits(activeCheckId: UUID?, requestedCheckId: UUID?) -> Bool {
+        activeCheckId == requestedCheckId
+    }
+}
+
+public enum MobileControlReleaseRequestPolicy {
+    public static func request(
+        url: URL,
+        accept: String,
+        timeout: TimeInterval = 8,
+        bypassCaches: Bool
+    ) -> URLRequest {
+        var request = URLRequest(
+            url: url,
+            cachePolicy: bypassCaches ? .reloadIgnoringLocalAndRemoteCacheData : .useProtocolCachePolicy,
+            timeoutInterval: timeout
+        )
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        if bypassCaches {
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        }
+        return request
+    }
+}
+
+public enum MobileControlCheckRetention {
+    public static let defaultTerminalLimit = 100
+
+    public static func retained(
+        _ checks: [MobileControlCheck],
+        terminalLimit: Int = defaultTerminalLimit
+    ) -> [MobileControlCheck] {
+        let nonterminal = checks.filter { !$0.state.isTerminal }
+        let terminal = checks
+            .filter(\.state.isTerminal)
+            .sorted { ($0.finishedAt ?? .distantPast) > ($1.finishedAt ?? .distantPast) }
+            .prefix(max(0, terminalLimit))
+        return nonterminal + terminal
     }
 }
 
@@ -241,6 +385,7 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
     public let codexMacAppUpdateAvailable: Bool
     public let linuxUpdateAvailable: Bool
     public let restartRequired: Bool
+    public let linuxCheckedAt: Date?
 
     public init(
         hostId: String,
@@ -250,7 +395,8 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
         codexCliUpdateAvailable: Bool,
         codexMacAppUpdateAvailable: Bool,
         linuxUpdateAvailable: Bool,
-        restartRequired: Bool
+        restartRequired: Bool,
+        linuxCheckedAt: Date? = nil
     ) {
         self.hostId = hostId
         self.hostName = hostName
@@ -260,6 +406,7 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
         self.codexMacAppUpdateAvailable = codexMacAppUpdateAvailable
         self.linuxUpdateAvailable = linuxUpdateAvailable
         self.restartRequired = restartRequired
+        self.linuxCheckedAt = linuxCheckedAt
     }
 }
 
@@ -274,6 +421,15 @@ public struct MobileControlStatus: Codable, Equatable, Sendable {
     public let pairedDeviceCount: Int
     public let busy: Bool
     public let activeJobId: UUID?
+    public let checkingUpdates: Bool
+    public let activeCheckId: UUID?
+    public let latestCodexCliVersion: String?
+    public let codexCliCheckedAt: Date?
+    public let codexCliCheckFailed: Bool
+    public let latestCodexMacAppVersion: String?
+    public let latestCodexMacAppBuild: String?
+    public let codexMacAppCheckedAt: Date?
+    public let codexMacAppCheckFailed: Bool
     public let capabilities: [MobileControlHostCapability]
     public let recentJobs: [MobileControlJob]
 
@@ -287,6 +443,15 @@ public struct MobileControlStatus: Codable, Equatable, Sendable {
         pairedDeviceCount: Int,
         busy: Bool,
         activeJobId: UUID?,
+        checkingUpdates: Bool = false,
+        activeCheckId: UUID? = nil,
+        latestCodexCliVersion: String? = nil,
+        codexCliCheckedAt: Date? = nil,
+        codexCliCheckFailed: Bool = false,
+        latestCodexMacAppVersion: String? = nil,
+        latestCodexMacAppBuild: String? = nil,
+        codexMacAppCheckedAt: Date? = nil,
+        codexMacAppCheckFailed: Bool = false,
         capabilities: [MobileControlHostCapability],
         recentJobs: [MobileControlJob]
     ) {
@@ -300,6 +465,15 @@ public struct MobileControlStatus: Codable, Equatable, Sendable {
         self.pairedDeviceCount = pairedDeviceCount
         self.busy = busy
         self.activeJobId = activeJobId
+        self.checkingUpdates = checkingUpdates
+        self.activeCheckId = activeCheckId
+        self.latestCodexCliVersion = latestCodexCliVersion
+        self.codexCliCheckedAt = codexCliCheckedAt
+        self.codexCliCheckFailed = codexCliCheckFailed
+        self.latestCodexMacAppVersion = latestCodexMacAppVersion
+        self.latestCodexMacAppBuild = latestCodexMacAppBuild
+        self.codexMacAppCheckedAt = codexMacAppCheckedAt
+        self.codexMacAppCheckFailed = codexMacAppCheckFailed
         self.capabilities = capabilities
         self.recentJobs = recentJobs
     }

@@ -50,6 +50,58 @@ public enum MobileControlAction: String, Codable, CaseIterable, Sendable {
     case codexCLI = "codex-cli"
     case codexMacApp = "codex-mac-app"
     case linuxOS = "linux-os"
+    case restartLinux = "restart-linux"
+}
+
+public enum MobileControlActionPolicy {
+    public static func acceptsTargetCount(action: MobileControlAction, count: Int) -> Bool {
+        switch action {
+        case .restartLinux:
+            count == 1
+        case .codexCLI, .codexMacApp, .linuxOS:
+            count > 0
+        }
+    }
+
+    public static func isSupported(
+        action: MobileControlAction,
+        hostIsOnline: Bool,
+        supportsCodexDesktopApp: Bool,
+        supportsLinuxUpdates: Bool
+    ) -> Bool {
+        switch action {
+        case .codexCLI:
+            true
+        case .codexMacApp:
+            supportsCodexDesktopApp
+        case .linuxOS:
+            supportsLinuxUpdates
+        case .restartLinux:
+            supportsLinuxUpdates
+        }
+    }
+
+    public static func isEligible(
+        action: MobileControlAction,
+        hostIsOnline: Bool,
+        supportsCodexDesktopApp: Bool,
+        supportsLinuxUpdates: Bool,
+        codexCliUpdateAvailable: Bool,
+        codexMacAppUpdateAvailable: Bool,
+        linuxUpdateAvailable: Bool,
+        restartRequired: Bool
+    ) -> Bool {
+        switch action {
+        case .codexCLI:
+            codexCliUpdateAvailable
+        case .codexMacApp:
+            supportsCodexDesktopApp && codexMacAppUpdateAvailable
+        case .linuxOS:
+            supportsLinuxUpdates && linuxUpdateAvailable
+        case .restartLinux:
+            hostIsOnline && supportsLinuxUpdates && restartRequired
+        }
+    }
 }
 
 public struct MobileControlJobRequest: Codable, Equatable, Sendable {
@@ -88,6 +140,56 @@ public struct MobileControlHostProgress: Codable, Equatable, Sendable {
         self.hostId = hostId
         self.phase = phase
         self.detail = detail
+    }
+}
+
+public enum MobileControlProgressMapper {
+    public static func map(hostId: String, phase: String?, detail: String?) -> MobileControlHostProgress {
+        MobileControlHostProgress(
+            hostId: hostId,
+            phase: phase ?? "queued",
+            detail: MobileFeedSanitizer.redact(detail ?? "Waiting")
+        )
+    }
+
+    public static func isTerminal(_ progress: MobileControlHostProgress) -> Bool {
+        ["succeeded", "offline", "failed"].contains(progress.phase)
+    }
+}
+
+public enum MobileControlLinuxRestartDecision: Equatable, Sendable {
+    case proceed
+    case skipNoLongerRequired
+    case failOffline
+    case failVerification
+}
+
+public enum MobileControlLinuxRestartPreflight {
+    public static func decision(
+        for status: LinuxRestartRequirementStatus
+    ) -> MobileControlLinuxRestartDecision {
+        switch status {
+        case .required:
+            .proceed
+        case .notRequired:
+            .skipNoLongerRequired
+        case .offline:
+            .failOffline
+        case .unsupported, .failed:
+            .failVerification
+        }
+    }
+
+    public static func postflightIsVerified(_ state: LinuxUpdateState) -> Bool {
+        state == .current || state == .updateAvailable
+    }
+}
+
+public enum MobileControlInterruption {
+    public static func detail(for action: MobileControlAction) -> String {
+        action == .restartLinux
+            ? "Controller restarted; restart outcome unknown — verify before retrying"
+            : "Not completed because the controller restarted"
     }
 }
 
@@ -138,6 +240,7 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
     public let codexCliUpdateAvailable: Bool
     public let codexMacAppUpdateAvailable: Bool
     public let linuxUpdateAvailable: Bool
+    public let restartRequired: Bool
 
     public init(
         hostId: String,
@@ -146,7 +249,8 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
         actions: [MobileControlAction],
         codexCliUpdateAvailable: Bool,
         codexMacAppUpdateAvailable: Bool,
-        linuxUpdateAvailable: Bool
+        linuxUpdateAvailable: Bool,
+        restartRequired: Bool
     ) {
         self.hostId = hostId
         self.hostName = hostName
@@ -155,6 +259,7 @@ public struct MobileControlHostCapability: Codable, Equatable, Sendable {
         self.codexCliUpdateAvailable = codexCliUpdateAvailable
         self.codexMacAppUpdateAvailable = codexMacAppUpdateAvailable
         self.linuxUpdateAvailable = linuxUpdateAvailable
+        self.restartRequired = restartRequired
     }
 }
 

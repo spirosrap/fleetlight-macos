@@ -1822,6 +1822,181 @@ controlDecoder.dateDecodingStrategy = .iso8601
 let controlJobData = try controlEncoder.encode(controlJob)
 let decodedControlJob = try controlDecoder.decode(MobileControlJob.self, from: controlJobData)
 test.require(decodedControlJob == controlJob, "mobile control job schema should round-trip with request ID and host progress")
+
+let restartJobRequest = MobileControlJobRequest(
+    requestId: UUID(uuidString: "00000000-0000-0000-0000-000000000012")!,
+    action: .restartLinux,
+    targetHostIds: ["example-host"]
+)
+let restartJobRequestData = try controlEncoder.encode(restartJobRequest)
+let restartJobRequestJSON = String(decoding: restartJobRequestData, as: UTF8.self)
+let decodedRestartJobRequest = try controlDecoder.decode(MobileControlJobRequest.self, from: restartJobRequestData)
+test.require(
+    restartJobRequestJSON.contains(#""action":"restart-linux""#)
+        && decodedRestartJobRequest == restartJobRequest,
+    "mobile control should round-trip the typed restart-linux wire action"
+)
+test.require(
+    MobileControlAction.allCases.map(\.rawValue) == ["codex-cli", "codex-mac-app", "linux-os", "restart-linux"],
+    "mobile control should publish all four stable action identifiers"
+)
+test.require(
+    MobileControlActionPolicy.acceptsTargetCount(action: .restartLinux, count: 1)
+        && !MobileControlActionPolicy.acceptsTargetCount(action: .restartLinux, count: 0)
+        && !MobileControlActionPolicy.acceptsTargetCount(action: .restartLinux, count: 2),
+    "mobile Linux restarts should require exactly one target and reject restart-all"
+)
+test.require(
+    MobileControlActionPolicy.acceptsTargetCount(action: .codexCLI, count: 2)
+        && MobileControlActionPolicy.acceptsTargetCount(action: .codexMacApp, count: 1)
+        && MobileControlActionPolicy.acceptsTargetCount(action: .linuxOS, count: 3),
+    "existing update actions should continue accepting one or more targets"
+)
+
+func restartEligibility(
+    online: Bool = true,
+    linux: Bool = true,
+    required: Bool = true
+) -> Bool {
+    MobileControlActionPolicy.isEligible(
+        action: .restartLinux,
+        hostIsOnline: online,
+        supportsCodexDesktopApp: false,
+        supportsLinuxUpdates: linux,
+        codexCliUpdateAvailable: false,
+        codexMacAppUpdateAvailable: false,
+        linuxUpdateAvailable: false,
+        restartRequired: required
+    )
+}
+test.require(
+    restartEligibility()
+        && !restartEligibility(online: false)
+        && !restartEligibility(linux: false)
+        && !restartEligibility(required: false),
+    "restart eligibility should require an online Linux host with a live restart requirement"
+)
+test.require(
+    MobileControlActionPolicy.isSupported(
+        action: .restartLinux,
+        hostIsOnline: true,
+        supportsCodexDesktopApp: false,
+        supportsLinuxUpdates: true
+    )
+        && MobileControlActionPolicy.isSupported(
+            action: .restartLinux,
+            hostIsOnline: false,
+            supportsCodexDesktopApp: false,
+            supportsLinuxUpdates: true
+        )
+        && !MobileControlActionPolicy.isSupported(
+            action: .restartLinux,
+            hostIsOnline: true,
+            supportsCodexDesktopApp: false,
+            supportsLinuxUpdates: false
+        ),
+    "restart-linux support should follow Linux maintenance capability rather than transient online state"
+)
+test.require(
+    MobileControlActionPolicy.isSupported(
+        action: .codexCLI,
+        hostIsOnline: true,
+        supportsCodexDesktopApp: false,
+        supportsLinuxUpdates: false
+    )
+        && MobileControlActionPolicy.isSupported(
+            action: .linuxOS,
+            hostIsOnline: true,
+            supportsCodexDesktopApp: false,
+            supportsLinuxUpdates: true
+        ),
+    "supported actions should remain visible even when no update is currently available"
+)
+test.require(
+    MobileControlActionPolicy.isEligible(
+        action: .codexCLI,
+        hostIsOnline: true,
+        supportsCodexDesktopApp: false,
+        supportsLinuxUpdates: true,
+        codexCliUpdateAvailable: true,
+        codexMacAppUpdateAvailable: false,
+        linuxUpdateAvailable: false,
+        restartRequired: false
+    )
+        && !MobileControlActionPolicy.isEligible(
+            action: .linuxOS,
+            hostIsOnline: true,
+            supportsCodexDesktopApp: false,
+            supportsLinuxUpdates: true,
+            codexCliUpdateAvailable: false,
+            codexMacAppUpdateAvailable: false,
+            linuxUpdateAvailable: false,
+            restartRequired: true
+        ),
+    "existing update jobs should remain gated by their per-host availability state"
+)
+
+let restartCapability = MobileControlHostCapability(
+    hostId: "example-host",
+    hostName: "Example Host",
+    state: "online",
+    actions: [.codexCLI, .linuxOS, .restartLinux],
+    codexCliUpdateAvailable: false,
+    codexMacAppUpdateAvailable: false,
+    linuxUpdateAvailable: false,
+    restartRequired: true
+)
+let restartCapabilityData = try controlEncoder.encode(restartCapability)
+let decodedRestartCapability = try controlDecoder.decode(MobileControlHostCapability.self, from: restartCapabilityData)
+test.require(
+    decodedRestartCapability == restartCapability
+        && decodedRestartCapability.restartRequired
+        && decodedRestartCapability.actions.contains(.restartLinux),
+    "mobile capabilities should expose supported actions and restart-required state independently"
+)
+
+let liveRestartProgress = MobileControlProgressMapper.map(
+    hostId: "example-host",
+    phase: "waitingForOnline",
+    detail: "Waiting for admin@example.net at 192.0.2.10"
+)
+test.require(
+    liveRestartProgress.phase == "waitingForOnline"
+        && liveRestartProgress.detail == "Waiting for [account] at [address]"
+        && !MobileControlProgressMapper.isTerminal(liveRestartProgress),
+    "restart progress mapping should preserve intermediate phases and redact transport details"
+)
+let finishedRestartProgress = MobileControlProgressMapper.map(
+    hostId: "example-host",
+    phase: "succeeded",
+    detail: "Restart verified"
+)
+test.require(
+    MobileControlProgressMapper.isTerminal(finishedRestartProgress)
+        && MobileControlProgressMapper.map(hostId: "example-host", phase: nil, detail: nil).phase == "queued",
+    "restart progress mapping should distinguish terminal results and provide a safe queued fallback"
+)
+
+test.require(
+    MobileControlLinuxRestartPreflight.decision(for: .required) == .proceed
+        && MobileControlLinuxRestartPreflight.decision(for: .notRequired) == .skipNoLongerRequired
+        && MobileControlLinuxRestartPreflight.decision(for: .offline) == .failOffline
+        && MobileControlLinuxRestartPreflight.decision(for: .unsupported) == .failVerification
+        && MobileControlLinuxRestartPreflight.decision(for: .failed) == .failVerification,
+    "mobile restart preflight should proceed only after an unambiguous live required result"
+)
+test.require(
+    MobileControlLinuxRestartPreflight.postflightIsVerified(.current)
+        && MobileControlLinuxRestartPreflight.postflightIsVerified(.updateAvailable)
+        && !MobileControlLinuxRestartPreflight.postflightIsVerified(.failed)
+        && !MobileControlLinuxRestartPreflight.postflightIsVerified(.offline),
+    "mobile restart jobs should report success only after a conclusive post-reboot Linux status check"
+)
+test.require(
+    MobileControlInterruption.detail(for: .restartLinux).contains("outcome unknown")
+        && !MobileControlInterruption.detail(for: .codexCLI).contains("outcome unknown"),
+    "interrupted restart jobs should preserve an explicit indeterminate result without replaying the reboot"
+)
 let controlErrorData = try controlEncoder.encode(MobileControlAPIErrorBody(code: "controller-busy", message: "Another operation is running"))
 let decodedControlError = try controlDecoder.decode(MobileControlAPIErrorBody.self, from: controlErrorData)
 test.require(decodedControlError.error.code == "controller-busy" && decodedControlError.error.message == "Another operation is running", "mobile control errors should use the documented nested error schema")

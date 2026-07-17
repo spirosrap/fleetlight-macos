@@ -330,8 +330,12 @@ final class FleetModel: ObservableObject {
         return nil
     }
 
+    private var isAnyUpdateOperationRunningExceptMobileControl: Bool {
+        isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+    }
+
     var isAnyUpdateOperationRunning: Bool {
-        mobileControlActiveJobID != nil || isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+        mobileControlActiveJobID != nil || isAnyUpdateOperationRunningExceptMobileControl
     }
 
     private var isLinuxRefreshBlocked: Bool {
@@ -1926,11 +1930,15 @@ final class FleetModel: ObservableObject {
     }
 
     func restartLinux(on host: FleetHost) async {
+        await restartLinux(on: host, mobileControlJobID: nil)
+    }
+
+    private func restartLinux(on host: FleetHost, mobileControlJobID: UUID?) async {
         guard linuxUpdateSnapshots[host.id]?.rebootRequired == true else {
             notice = "Linux does not currently report a required restart for \(host.displayName)"
             return
         }
-        await performLinuxRestarts(on: [host])
+        await performLinuxRestarts(on: [host], mobileControlJobID: mobileControlJobID)
     }
 
     func restartLinuxOnRequiredHosts() async {
@@ -1939,11 +1947,13 @@ final class FleetModel: ObservableObject {
             notice = "No Linux machines currently require a restart"
             return
         }
-        await performLinuxRestarts(on: targets)
+        await performLinuxRestarts(on: targets, mobileControlJobID: nil)
     }
 
-    private func performLinuxRestarts(on targets: [FleetHost]) async {
-        guard !isAnyUpdateOperationRunning, !targets.isEmpty else { return }
+    private func performLinuxRestarts(on targets: [FleetHost], mobileControlJobID: UUID?) async {
+        guard mobileControlActiveJobID == mobileControlJobID,
+              !isAnyUpdateOperationRunningExceptMobileControl,
+              !targets.isEmpty else { return }
         pollTask?.cancel()
         beginLinuxRefreshDeferral()
         isRestartingLinux = true
@@ -2034,19 +2044,21 @@ final class FleetModel: ObservableObject {
                     )
                     let verificationResult = await Self.runLinuxUpdateCheck(host: host, routeAlias: restartedSnapshot.routeAlias ?? routeAlias)
                     let verified = LinuxUpdateCheckParser.snapshot(from: verificationResult)
-                    if verified.state == .current || verified.state == .updateAvailable {
+                    if MobileControlLinuxRestartPreflight.postflightIsVerified(verified.state) {
                         linuxUpdateSnapshots[host.id] = verified
                         LinuxUpdateStore.saveSnapshots(linuxUpdateSnapshots)
                         finalDetail = verified.rebootRequired
                             ? "Restart verified · Linux still requests another restart"
                             : "Restart verified · machine is back online"
+                        finalPhase = .succeeded
+                        event = verified.rebootRequired
+                            ? "linux-restart-still-required"
+                            : "linux-restart-verified"
                     } else {
-                        finalDetail = "Restart verified · update status recheck failed"
+                        finalPhase = .failed
+                        finalDetail = "Restart occurred, but Linux status verification failed"
+                        event = "linux-restart-status-check-failed"
                     }
-                    finalPhase = .succeeded
-                    event = verified.rebootRequired
-                        ? "linux-restart-still-required"
-                        : "linux-restart-verified"
                 } else if sawOffline {
                     finalPhase = .offline
                     finalDetail = "Restart issued, but the machine did not return within 5 minutes"
@@ -2547,7 +2559,7 @@ final class FleetModel: ObservableObject {
                 MobileControlHostProgress(
                     hostId: hostID,
                     phase: "failed",
-                    detail: "Not completed because the controller restarted"
+                    detail: MobileControlInterruption.detail(for: job.action)
                 )
             }
             job.completed = job.total
@@ -2778,6 +2790,15 @@ final class FleetModel: ObservableObject {
     private func mobileControlTargets(
         for request: MobileControlJobRequest
     ) -> Result<[FleetHost], MobileControlTargetError> {
+        guard MobileControlActionPolicy.acceptsTargetCount(
+            action: request.action,
+            count: request.targetHostIds.count
+        ) else {
+            let detail = request.action == .restartLinux
+                ? "Choose exactly one Linux machine to restart"
+                : "Choose one or more fleet machines"
+            return .failure(MobileControlTargetError(errorDescription: detail))
+        }
         guard !request.targetHostIds.isEmpty,
               request.targetHostIds.count <= visibleHosts.count,
               Set(request.targetHostIds).count == request.targetHostIds.count else {
@@ -2790,16 +2811,18 @@ final class FleetModel: ObservableObject {
         }
 
         for host in targets {
-            let eligible: Bool
-            switch request.action {
-            case .codexCLI:
-                eligible = codexFleetVersionState(for: host) == .updateAvailable
-            case .codexMacApp:
-                eligible = codexDesktopAppUpdateAvailableHosts.contains(where: { $0.id == host.id })
-            case .linuxOS:
-                eligible = linuxUpdateHosts.contains(where: { $0.id == host.id })
-                    && linuxUpdateSnapshots[host.id]?.state == .updateAvailable
-            }
+            let supportsLinuxMaintenance = linuxUpdateHosts.contains(where: { $0.id == host.id })
+            let eligible = MobileControlActionPolicy.isEligible(
+                action: request.action,
+                hostIsOnline: snapshots[host.id]?.state == .online,
+                supportsCodexDesktopApp: host.supportsCodexDesktopApp,
+                supportsLinuxUpdates: supportsLinuxMaintenance,
+                codexCliUpdateAvailable: codexFleetVersionState(for: host) == .updateAvailable,
+                codexMacAppUpdateAvailable: codexDesktopAppUpdateAvailableHosts.contains(where: { $0.id == host.id }),
+                linuxUpdateAvailable: linuxUpdateHosts.contains(where: { $0.id == host.id })
+                    && linuxUpdateSnapshots[host.id]?.state == .updateAvailable,
+                restartRequired: linuxUpdateSnapshots[host.id]?.rebootRequired == true
+            )
             guard eligible else {
                 return .failure(MobileControlTargetError(
                     errorDescription: "\(host.displayName) is not currently eligible for \(request.action.rawValue)"
@@ -2835,11 +2858,75 @@ final class FleetModel: ObservableObject {
             await performCodexDesktopAppUpdates(on: targets)
         case .linuxOS:
             await performLinuxUpdates(on: targets)
+        case .restartLinux:
+            if let target = targets.first {
+                await restartLinuxFromMobileControl(on: target, jobID: jobID)
+            }
         }
 
         monitor.cancel()
         _ = await monitor.result
         finishMobileControlJob(jobID)
+    }
+
+    private func restartLinuxFromMobileControl(on host: FleetHost, jobID: UUID) async {
+        linuxRestarts[host.id] = HostLinuxRestartProgress(
+            phase: .verifying,
+            detail: "Verifying live restart requirement…"
+        )
+        guard snapshots[host.id]?.state == .online else {
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .offline,
+                detail: "Restart not issued — machine is no longer online"
+            )
+            return
+        }
+
+        let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
+        let result = await Self.runLinuxRestartRequirementCheck(host: host, routeAlias: routeAlias)
+        let outcome = LinuxRestartRequirementParser.outcome(from: result)
+        let checkedAt = Date()
+
+        switch MobileControlLinuxRestartPreflight.decision(for: outcome.status) {
+        case .proceed:
+            await applyLinuxRestartRequirements([(host.id, true, checkedAt)])
+            guard snapshots[host.id]?.state == .online else {
+                linuxRestarts[host.id] = HostLinuxRestartProgress(
+                    phase: .offline,
+                    detail: "Restart not issued — machine went offline during verification"
+                )
+                return
+            }
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .issuing,
+                detail: "Live requirement verified · preparing confirmed restart…"
+            )
+            syncMobileControlJobProgress(jobID)
+            guard mobileControlJobJournalAvailable else {
+                linuxRestarts[host.id] = HostLinuxRestartProgress(
+                    phase: .failed,
+                    detail: "Restart not issued — request journal is unavailable"
+                )
+                return
+            }
+            await restartLinux(on: host, mobileControlJobID: jobID)
+        case .skipNoLongerRequired:
+            await applyLinuxRestartRequirements([(host.id, false, checkedAt)])
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .succeeded,
+                detail: "Restart skipped — live check confirms it is no longer required"
+            )
+        case .failOffline:
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .offline,
+                detail: "Restart not issued — machine is offline"
+            )
+        case .failVerification:
+            linuxRestarts[host.id] = HostLinuxRestartProgress(
+                phase: .failed,
+                detail: "Restart not issued — \(outcome.detail)"
+            )
+        }
     }
 
     private func syncMobileControlJobProgress(_ jobID: UUID) {
@@ -2850,30 +2937,19 @@ final class FleetModel: ObservableObject {
             switch job.action {
             case .codexCLI:
                 let value = codexUpdates[hostID]
-                return MobileControlHostProgress(
-                    hostId: hostID,
-                    phase: value?.phase.rawValue ?? "queued",
-                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
-                )
+                return MobileControlProgressMapper.map(hostId: hostID, phase: value?.phase.rawValue, detail: value?.detail)
             case .codexMacApp:
                 let value = codexDesktopAppUpdates[hostID]
-                return MobileControlHostProgress(
-                    hostId: hostID,
-                    phase: value?.phase.rawValue ?? "queued",
-                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
-                )
+                return MobileControlProgressMapper.map(hostId: hostID, phase: value?.phase.rawValue, detail: value?.detail)
             case .linuxOS:
                 let value = linuxUpdates[hostID]
-                return MobileControlHostProgress(
-                    hostId: hostID,
-                    phase: value?.phase.rawValue ?? "queued",
-                    detail: MobileFeedSanitizer.redact(value?.detail ?? "Waiting")
-                )
+                return MobileControlProgressMapper.map(hostId: hostID, phase: value?.phase.rawValue, detail: value?.detail)
+            case .restartLinux:
+                let value = linuxRestarts[hostID]
+                return MobileControlProgressMapper.map(hostId: hostID, phase: value?.phase.rawValue, detail: value?.detail)
             }
         }
-        let completed = progress.filter {
-            ["succeeded", "offline", "failed"].contains($0.phase)
-        }.count
+        let completed = progress.filter(MobileControlProgressMapper.isTerminal).count
         guard progress != mobileControlJobs[index].progress
                 || completed != mobileControlJobs[index].completed else { return }
         mobileControlJobs[index].progress = progress
@@ -2886,7 +2962,7 @@ final class FleetModel: ObservableObject {
         guard let index = mobileControlJobs.firstIndex(where: { $0.id == jobID }) else { return }
         var job = mobileControlJobs[index]
         job.progress = job.progress.map { value in
-            guard !["queued", "notAttempted", "updating"].contains(value.phase) else {
+            guard MobileControlProgressMapper.isTerminal(value) else {
                 return MobileControlHostProgress(
                     hostId: value.hostId,
                     phase: "failed",
@@ -2937,12 +3013,21 @@ final class FleetModel: ObservableObject {
         let cliAvailable = Set(codexUpdateAvailableHosts.map(\.id))
         let appAvailable = Set(codexDesktopAppUpdateAvailableHosts.map(\.id))
         let linuxAvailable = Set(linuxUpdateAvailableHosts.map(\.id))
+        let linuxMaintenanceHosts = Set(linuxUpdateHosts.map(\.id))
         let capabilities = visibleHosts.map { host -> MobileControlHostCapability in
             let snapshot = snapshots[host.id] ?? HostSnapshot()
-            var actions: [MobileControlAction] = []
-            if cliAvailable.contains(host.id) { actions.append(.codexCLI) }
-            if appAvailable.contains(host.id) { actions.append(.codexMacApp) }
-            if linuxAvailable.contains(host.id) { actions.append(.linuxOS) }
+            let supportsLinuxMaintenance = linuxMaintenanceHosts.contains(host.id)
+            let linuxUpdateAvailable = supportsLinuxMaintenance && linuxAvailable.contains(host.id)
+            let restartRequired = supportsLinuxMaintenance
+                && linuxUpdateSnapshots[host.id]?.rebootRequired == true
+            let actions = MobileControlAction.allCases.filter {
+                MobileControlActionPolicy.isSupported(
+                    action: $0,
+                    hostIsOnline: snapshot.state == .online,
+                    supportsCodexDesktopApp: host.supportsCodexDesktopApp,
+                    supportsLinuxUpdates: supportsLinuxMaintenance
+                )
+            }
             return MobileControlHostCapability(
                 hostId: host.id,
                 hostName: host.displayName,
@@ -2950,7 +3035,8 @@ final class FleetModel: ObservableObject {
                 actions: actions,
                 codexCliUpdateAvailable: cliAvailable.contains(host.id),
                 codexMacAppUpdateAvailable: appAvailable.contains(host.id),
-                linuxUpdateAvailable: linuxAvailable.contains(host.id)
+                linuxUpdateAvailable: linuxUpdateAvailable,
+                restartRequired: restartRequired
             )
         }
         let recentJobs = Array(mobileControlJobs.sorted { $0.createdAt > $1.createdAt }.prefix(20)).map(mobileControlJobSnapshot)

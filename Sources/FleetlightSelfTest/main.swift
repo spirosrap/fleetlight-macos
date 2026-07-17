@@ -1717,4 +1717,66 @@ activeState.apply(recoveredDown)
 test.require(activeState.hostDownHostIDs.isEmpty, "recovery should clear persisted active outage state")
 test.require(activeState.activeEvents == [activePerformance], "unrelated active warnings should remain after host recovery")
 
+let mobileFeedCheckedAt = Date(timeIntervalSince1970: 1_720_000_000)
+let mobileFeed = MobileFeedDocument(
+    generatedAt: mobileFeedCheckedAt,
+    observer: MobileFeedObserver(
+        id: "observer-one",
+        name: "Observer One",
+        appVersion: "v1.0 (1)",
+        lastRefreshDurationMilliseconds: 640
+    ),
+    summary: MobileFeedSummary(
+        total: 2,
+        online: 1,
+        offline: 1,
+        accessIssues: 0,
+        slowConnections: 1,
+        alerts: 1,
+        updatesAvailable: 1,
+        restartRequired: 1
+    ),
+    hosts: [
+        MobileFeedHost(
+            id: "example-host",
+            name: "Example Host",
+            platform: "Linux",
+            state: "slow",
+            status: "slow",
+            detail: "Online with a timing warning",
+            checkedAt: mobileFeedCheckedAt,
+            issueTypes: ["slow", "alerts"],
+            health: 91,
+            pingMs: 42,
+            jitterMs: 7,
+            services: [
+                MobileFeedService(kind: "example", name: "Example Service", state: "healthy", detail: "Active")
+            ],
+            warnings: [
+                MobileFeedWarning(kind: "ping", title: "High ping", detail: "Example threshold exceeded")
+            ]
+        )
+    ],
+    linuxUpdates: [
+        MobileFeedLinuxUpdate(
+            hostId: "example-host",
+            hostName: "Example Host",
+            state: "updateAvailable",
+            detail: "1 update available",
+            packageManager: "apt",
+            availableCount: 1,
+            restartRequired: true,
+            checkedAt: mobileFeedCheckedAt
+        )
+    ]
+)
+let mobileFeedData = try MobileFeedCodec.encode(mobileFeed)
+let decodedMobileFeed = try MobileFeedCodec.decode(mobileFeedData)
+let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
+test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1, "mobile feed schema should round-trip without losing status details")
+test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
+test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")
+let redactedMobileDetail = MobileFeedSanitizer.redact("ssh failed for admin@example.net at 100.64.12.34; see /Users/example/.ssh/config and https://private.example/path")
+test.require(!redactedMobileDetail.contains("admin@example.net") && !redactedMobileDetail.contains("100.64.12.34") && !redactedMobileDetail.contains("/Users/example") && !redactedMobileDetail.contains("https://"), "mobile feed details should redact addresses, accounts, private paths, and URLs")
+
 print("Fleetlight self-test: \(test.count) checks passed")

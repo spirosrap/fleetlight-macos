@@ -99,6 +99,7 @@ Supported machine fields:
 - Bidirectional live restart verification during every normal fleet refresh, so multiple Fleetlight observers detect new restart requirements, clear stale badges and completed-operation wording, and show when each restart status was verified
 - A lightweight **Verify Now** action and restart freshness summary that separates recently verified, stale, unverified, and restart-required Linux machines without refreshing package metadata
 - Privacy-safe observer snapshots, one-minute heartbeats, and a visible agreement check, so two Macs running Fleetlight expose genuinely stale or contradictory restart summaries instead of silently showing different answers
+- An atomic, versioned mobile feed for the Fleetlight Android companion, designed for tailnet-only delivery without placing fleet SSH keys or sudo credentials on the phone
 - Neutral live maintenance reporting during long Linux operations, with prompt recovery checks when work finishes instead of a persistent stale-observer warning
 - Expandable per-observer diagnostics with Fleetlight version, report age, restart count, verification coverage, and an on-demand **Fetch Reports** action
 - Automatic lightweight package revalidation after a previously offline Linux machine is reachable again, replacing stale red warnings with current package status while respecting a retry cooldown
@@ -124,6 +125,18 @@ Supported machine fields:
 - Generic Wake-on-LAN followed by verified SSH recovery checks
 - CSV history export and copyable fleet diagnostics
 - Optional launch at login
+
+## Android companion feed
+
+After each reconciled refresh, Fleetlight atomically writes a read-only mobile snapshot to `~/Library/Application Support/Fleetlight/mobile/mobile-feed.json`. A loopback-only server exposes that file at `http://127.0.0.1:8787/mobile-feed.json`; it contains display-ready fleet health but no SSH keys, credentials, commands, usernames, or IP addresses.
+
+To expose that directory only to devices already authorized on the same Tailscale network:
+
+```sh
+./Scripts/configure_mobile_feed.sh
+```
+
+The script health-checks the local feed, preserves existing Tailscale Serve routes, proxies it under `/fleetlight`, and prints the HTTPS endpoint to enter in the Android app. Configure both Mac observers in Android for automatic freshest-report failover.
 
 ## Privacy
 

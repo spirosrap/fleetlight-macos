@@ -571,6 +571,7 @@ final class FleetModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        MobileFeedHTTPServer.shared.start()
         scheduleObserverHeartbeat()
         let startupStartedAt = DispatchTime.now().uptimeNanoseconds
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -787,6 +788,7 @@ final class FleetModel: ObservableObject {
         appendHistoryBatch(historyBatch)
         lastRefresh = Date()
         lastRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
+        publishMobileFeed()
         isRefreshing = false
         let coldValidationStarted = shouldValidateFreshSSH && startFreshSSHValidation()
         await ActivityLogger.shared.append(
@@ -1189,6 +1191,170 @@ final class FleetModel: ObservableObject {
             ? "Verified current after prior update failure · restart required"
             : "Verified current after prior update failure"
     }
+
+    private func publishMobileFeed() {
+        let feedHosts = visibleHosts
+        let hostsByID = Dictionary(uniqueKeysWithValues: feedHosts.map { ($0.id, $0) })
+
+        let mobileHosts = feedHosts.map { host -> MobileFeedHost in
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            let connection = FleetConnectionClassifier.status(for: snapshot)
+            let warnings = PerformanceEvaluator.warnings(
+                snapshot: snapshot,
+                thresholds: performanceThresholds
+            )
+            let hasAlerts = (snapshot.diskPercent ?? 0) >= 90
+                || snapshot.services.contains(where: { $0.state.needsAttention })
+            var issueTypes: [String] = []
+            switch connection {
+            case .offline: issueTypes.append("offline")
+            case .accessIssue: issueTypes.append("access")
+            case .pending, .online: break
+            }
+            if !warnings.isEmpty { issueTypes.append("slow") }
+            if hasAlerts { issueTypes.append("alerts") }
+            if linuxUpdateSnapshots[host.id]?.rebootRequired == true { issueTypes.append("restart") }
+            if linuxUpdateSnapshots[host.id]?.state == .updateAvailable { issueTypes.append("updates") }
+
+            let state: String
+            switch connection {
+            case .offline: state = "offline"
+            case .accessIssue: state = "access"
+            case .pending: state = "unknown"
+            case .online where hasAlerts: state = "attention"
+            case .online where !warnings.isEmpty: state = "slow"
+            case .online: state = "online"
+            }
+
+            let availability = historySummary(for: host.id).availabilityPercent
+            return MobileFeedHost(
+                id: host.id,
+                name: host.displayName,
+                platform: snapshot.operatingSystem ?? (host.supportsCodexDesktopApp ? "macOS" : "Unknown"),
+                state: state,
+                status: state,
+                detail: MobileFeedSanitizer.redact(snapshot.detail),
+                checkedAt: snapshot.checkedAt,
+                issueTypes: issueTypes,
+                health: HealthScorer.score(
+                    snapshot: snapshot,
+                    availability: availability,
+                    thresholds: performanceThresholds
+                ),
+                pingMs: snapshot.pingMilliseconds,
+                jitterMs: snapshot.pingJitterMilliseconds,
+                packetLossPercent: snapshot.packetLossPercent,
+                sshReadyMs: snapshot.connectionReadyMilliseconds,
+                fullProbeMs: snapshot.probeDurationMilliseconds,
+                operatingSystem: snapshot.operatingSystem,
+                bootDescription: snapshot.bootDescription,
+                diskPercent: snapshot.diskPercent,
+                memoryPercent: snapshot.memoryPercent,
+                loadAverage: snapshot.loadAverage,
+                codexCliVersion: snapshot.codexVersion,
+                codexMacAppVersion: snapshot.codexDesktopAppVersion,
+                codexMacAppBuild: snapshot.codexDesktopAppBuild,
+                restartRequired: linuxUpdateSnapshots[host.id]?.rebootRequired ?? snapshot.linuxRestartRequired,
+                services: snapshot.services.map {
+                    MobileFeedService(
+                        kind: $0.kind.rawValue,
+                        name: $0.kind.displayName,
+                        state: $0.state.rawValue,
+                        detail: MobileFeedSanitizer.redact($0.detail)
+                    )
+                },
+                warnings: warnings.map {
+                    MobileFeedWarning(
+                        kind: $0.kind.rawValue,
+                        title: $0.kind.displayName,
+                        detail: MobileFeedSanitizer.redact($0.detail)
+                    )
+                }
+            )
+        }
+
+        let linuxUpdates = feedHosts.compactMap { host -> MobileFeedLinuxUpdate? in
+            guard host.supportsLinuxUpdates else { return nil }
+            let snapshot = linuxUpdateSnapshots[host.id] ?? LinuxUpdateSnapshot()
+            return MobileFeedLinuxUpdate(
+                hostId: host.id,
+                hostName: host.displayName,
+                state: snapshot.state.rawValue,
+                detail: MobileFeedSanitizer.redact(snapshot.detail),
+                packageManager: snapshot.packageManager,
+                availableCount: snapshot.totalUpdateCount,
+                securityCount: snapshot.securityUpdateCount,
+                snapCount: snapshot.snapUpdateCount,
+                flatpakCount: snapshot.flatpakUpdateCount,
+                restartRequired: snapshot.rebootRequired,
+                checkedAt: snapshot.checkedAt
+            )
+        }
+
+        let recentIncidents = incidents.prefix(30).map { incident in
+            let severity: String
+            switch incident.kind {
+            case .hostDown, .serviceAttention, .diskWarning, .wakeUnverified, .performanceAttention:
+                severity = "warning"
+            case .hostRecovered, .serviceRecovered, .routeChanged, .wakeVerified, .performanceRecovered:
+                severity = "info"
+            }
+            return MobileFeedIncident(
+                id: incident.id.uuidString,
+                hostId: incident.hostID,
+                hostName: hostsByID[incident.hostID]?.displayName ?? incident.hostID,
+                kind: incident.kind.rawValue,
+                severity: severity,
+                title: incident.title,
+                detail: MobileFeedSanitizer.redact(incident.detail),
+                startedAt: incident.timestamp
+            )
+        }
+
+        let metrics = feedHosts.flatMap { host in
+            chartSamples(for: host.id, hours: 24, maxPoints: 48).map { sample in
+                MobileFeedMetric(
+                    hostId: host.id,
+                    capturedAt: sample.timestamp,
+                    state: sample.state.rawValue,
+                    pingMs: sample.pingMilliseconds,
+                    jitterMs: sample.pingJitterMilliseconds,
+                    packetLossPercent: sample.packetLossPercent,
+                    sshReadyMs: sample.connectionReadyMilliseconds,
+                    fullProbeMs: sample.effectiveProbeDurationMilliseconds,
+                    diskPercent: sample.diskPercent,
+                    memoryPercent: sample.memoryPercent,
+                    loadAverage: sample.loadAverage
+                )
+            }
+        }
+
+        let document = MobileFeedDocument(
+            generatedAt: lastRefresh ?? Date(),
+            observer: MobileFeedObserver(
+                id: FleetObserver.currentDisplayName.lowercased(),
+                name: FleetObserver.currentDisplayName,
+                appVersion: FleetlightVersion.currentDisplayLabel,
+                lastRefreshDurationMilliseconds: lastRefreshDurationMilliseconds
+            ),
+            summary: MobileFeedSummary(
+                total: feedHosts.count,
+                online: onlineCount,
+                offline: unreachableCount,
+                accessIssues: accessIssueCount,
+                slowConnections: slowConnectionCount,
+                alerts: serviceOrResourceAlertCount,
+                updatesAvailable: linuxUpdates.filter { $0.availableCount > 0 }.count,
+                restartRequired: linuxUpdates.filter(\.restartRequired).count
+            ),
+            hosts: mobileHosts,
+            linuxUpdates: linuxUpdates,
+            incidents: recentIncidents,
+            metrics: metrics
+        )
+        _ = MobileFeedStore.save(document)
+    }
+
 
     func checkObserverConsistencyNow() async {
         guard !isAnyUpdateOperationRunning, !isRefreshing else {

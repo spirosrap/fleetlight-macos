@@ -1520,31 +1520,59 @@ private struct CodexView: View {
                 }
 
                 if selectedSubview != .linux {
-                    HStack(spacing: 10) {
-                        Image(systemName: updateCenterIcon)
-                            .font(.title3)
-                            .foregroundStyle(updateCenterColor)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Codex Update Center")
-                                .font(.subheadline.weight(.semibold))
-                            Text(model.codexUpdateCenterStatusText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if model.codexUpdateCenterSummary.totalUpdateCount > 0 {
-                            Button(model.isUpdatingAllCodex ? "Updating…" : "Update All \(model.codexUpdateCenterSummary.totalUpdateCount)") {
-                                isConfirmingUpdateCenter = true
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Image(systemName: updateCenterIcon)
+                                .font(.title3)
+                                .foregroundStyle(updateCenterColor)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Codex Update Center")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(model.codexUpdateCenterStatusText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                        } else {
-                            Button("Check Both") {
-                                Task { await model.checkAllCodexReleasesNow() }
+                            Spacer()
+                            if model.codexUpdateCenterSummary.totalUpdateCount > 0 {
+                                Button(model.isUpdatingAllCodex ? "Updating…" : "Update All \(model.codexUpdateCenterSummary.totalUpdateCount)") {
+                                    isConfirmingUpdateCenter = true
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+                            Button(model.isRunningReadOnlyUpdateCheck ? "Checking…" : "Check All") {
+                                Task { await model.checkAllUpdatesNow() }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .help("Read-only: refresh installed versions, release sources, Linux packages, and the mobile feed without installing or restarting")
                         }
+
+                        if let check = model.readOnlyUpdateCheck,
+                           let status = model.readOnlyUpdateCheckStatusText {
+                            HStack(spacing: 7) {
+                                Image(systemName: readOnlyCheckIcon(for: check.state))
+                                    .foregroundStyle(readOnlyCheckColor(for: check.state))
+                                Text("\(readOnlyCheckLabel(for: check.state)) · \(status)")
+                                    .font(.caption)
+                                    .foregroundStyle(check.state == .failed ? Color.red : Color.secondary)
+                                    .lineLimit(2)
+                                Spacer()
+                                if let finishedAt = check.finishedAt {
+                                    Text(finishedAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                } else if let completed = check.completed, let total = check.total {
+                                    Text("\(completed)/\(total)")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        Text("Check All is read-only — it never installs updates or restarts a machine.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .padding(10)
                     .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
@@ -1851,6 +1879,34 @@ private struct CodexView: View {
         return model.codexUpdateCenterSummary.totalUpdateCount > 0
             ? "arrow.down.circle.fill"
             : "checkmark.circle.fill"
+    }
+
+    private func readOnlyCheckIcon(for state: MobileControlJobState) -> String {
+        switch state {
+        case .queued, .running: "arrow.triangle.2.circlepath"
+        case .succeeded: "checkmark.circle.fill"
+        case .partial: "exclamationmark.triangle.fill"
+        case .failed: "xmark.octagon.fill"
+        }
+    }
+
+    private func readOnlyCheckLabel(for state: MobileControlJobState) -> String {
+        switch state {
+        case .queued: "Queued"
+        case .running: "Checking"
+        case .succeeded: "Succeeded"
+        case .partial: "Partial"
+        case .failed: "Failed"
+        }
+    }
+
+    private func readOnlyCheckColor(for state: MobileControlJobState) -> Color {
+        switch state {
+        case .queued, .running: .blue
+        case .succeeded: .green
+        case .partial: .orange
+        case .failed: .red
+        }
     }
 
     private var cliResultImage: String {

@@ -2848,6 +2848,15 @@ public enum LinuxUpdateState: String, Codable, Sendable {
     case failed
 }
 
+public enum LinuxUpdateCheckRetryPolicy {
+    public static let maximumRetryCount = 1
+
+    public static func shouldRetry(state: LinuxUpdateState, completedRetryCount: Int) -> Bool {
+        guard completedRetryCount < maximumRetryCount else { return false }
+        return state == .offline || state == .failed
+    }
+}
+
 public struct LinuxUpdateSnapshot: Codable, Equatable, Sendable {
     public let state: LinuxUpdateState
     public let distribution: String?

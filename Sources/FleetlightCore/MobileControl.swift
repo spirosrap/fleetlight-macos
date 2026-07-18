@@ -139,6 +139,126 @@ public enum MobileControlJobState: String, Codable, Sendable {
     }
 }
 
+public struct MobileControlCheckProgressItem: Codable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let category: String
+    public let state: String
+    public let detail: String
+
+    public init(id: String, name: String, category: String, state: String, detail: String) {
+        self.id = MobileControlCheckProgressPlan.boundedSanitized(id)
+        self.name = MobileControlCheckProgressPlan.boundedSanitized(name)
+        self.category = MobileControlCheckProgressPlan.boundedSanitized(category)
+        self.state = MobileControlCheckProgressPlan.boundedSanitized(state)
+        self.detail = MobileControlCheckProgressPlan.boundedSanitized(detail)
+    }
+}
+
+public enum MobileControlCheckProgressPlan {
+    public static let total = 3
+    public static let stepIDs = ["fleet", "linux", "publishing"]
+    public static let validStates: Set<String> = ["queued", "running", "succeeded", "partial", "failed"]
+    private static let terminalStates: Set<String> = ["succeeded", "partial", "failed"]
+
+    private static let definitions: [(id: String, name: String, category: String)] = [
+        ("fleet", "Installed versions", "fleet"),
+        ("linux", "Linux packages", "linux"),
+        ("publishing", "Publish results", "publishing"),
+    ]
+
+    public static func initial() -> [MobileControlCheckProgressItem] {
+        definitions.map {
+            MobileControlCheckProgressItem(
+                id: $0.id,
+                name: $0.name,
+                category: $0.category,
+                state: "queued",
+                detail: "Waiting"
+            )
+        }
+    }
+
+    public static func normalized(_ items: [MobileControlCheckProgressItem]) -> [MobileControlCheckProgressItem] {
+        let itemsByID = Dictionary(
+            items.prefix(12).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return definitions.map { definition in
+            guard let item = itemsByID[definition.id] else {
+                return MobileControlCheckProgressItem(
+                    id: definition.id,
+                    name: definition.name,
+                    category: definition.category,
+                    state: "queued",
+                    detail: "Waiting"
+                )
+            }
+            return MobileControlCheckProgressItem(
+                id: definition.id,
+                name: definition.name,
+                category: definition.category,
+                state: validStates.contains(item.state) ? item.state : "queued",
+                detail: sanitizedDetail(item.detail)
+            )
+        }
+    }
+
+    public static func updating(
+        _ items: [MobileControlCheckProgressItem]?,
+        id: String,
+        state: MobileControlJobState,
+        detail: String
+    ) -> [MobileControlCheckProgressItem] {
+        normalized(items ?? initial()).map { item in
+            guard item.id == id else { return item }
+            return MobileControlCheckProgressItem(
+                id: item.id,
+                name: item.name,
+                category: item.category,
+                state: state.rawValue,
+                detail: sanitizedDetail(detail)
+            )
+        }
+    }
+
+    public static func completedCount(_ items: [MobileControlCheckProgressItem]?) -> Int {
+        items.map { normalized($0) }?.filter { terminalStates.contains($0.state) }.count ?? 0
+    }
+
+    public static func failingIncomplete(
+        _ items: [MobileControlCheckProgressItem]?,
+        detail: String
+    ) -> [MobileControlCheckProgressItem] {
+        var result = normalized(items ?? initial())
+        for stepID in stepIDs {
+            guard let item = result.first(where: { $0.id == stepID }),
+                  !terminalStates.contains(item.state) else { continue }
+            result = updating(
+                result,
+                id: stepID,
+                state: .failed,
+                detail: detail
+            )
+        }
+        return result
+    }
+
+    public static func boundedCompleted(_ value: Int?) -> Int? {
+        value.map { min(total, max(0, $0)) }
+    }
+
+    static func boundedSanitized(_ value: String) -> String {
+        let flattened = value.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return String(MobileFeedSanitizer.redact(flattened).prefix(240))
+    }
+
+    private static func sanitizedDetail(_ detail: String) -> String {
+        boundedSanitized(detail)
+    }
+}
+
 public struct MobileControlCheck: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let id: UUID
@@ -148,6 +268,9 @@ public struct MobileControlCheck: Codable, Equatable, Sendable {
     public var detail: String
     public var startedAt: Date?
     public var finishedAt: Date?
+    public var completed: Int?
+    public var total: Int?
+    public var progress: [MobileControlCheckProgressItem]?
 
     public init(
         id: UUID = UUID(),
@@ -156,16 +279,68 @@ public struct MobileControlCheck: Codable, Equatable, Sendable {
         phase: String = "queued",
         detail: String = "Waiting to check for updates",
         startedAt: Date? = nil,
-        finishedAt: Date? = nil
+        finishedAt: Date? = nil,
+        completed: Int? = 0,
+        total: Int? = MobileControlCheckProgressPlan.total,
+        progress: [MobileControlCheckProgressItem]? = MobileControlCheckProgressPlan.initial()
     ) {
         schemaVersion = 1
         self.id = id
         self.requestId = requestId
         self.state = state
         self.phase = phase
-        self.detail = detail
+        self.detail = MobileFeedSanitizer.redact(detail)
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        self.completed = MobileControlCheckProgressPlan.boundedCompleted(completed)
+        self.total = total == nil ? nil : MobileControlCheckProgressPlan.total
+        self.progress = progress.map(MobileControlCheckProgressPlan.normalized)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, id, requestId, state, phase, detail, startedAt, finishedAt
+        case completed, total, progress
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedSchemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        guard decodedSchemaVersion == 1 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .schemaVersion,
+                in: values,
+                debugDescription: "Unsupported mobile control check schema"
+            )
+        }
+        schemaVersion = 1
+        id = try values.decode(UUID.self, forKey: .id)
+        requestId = try values.decode(UUID.self, forKey: .requestId)
+        state = try values.decode(MobileControlJobState.self, forKey: .state)
+        phase = try values.decode(String.self, forKey: .phase)
+        detail = MobileFeedSanitizer.redact(try values.decode(String.self, forKey: .detail))
+        startedAt = try values.decodeIfPresent(Date.self, forKey: .startedAt)
+        finishedAt = try values.decodeIfPresent(Date.self, forKey: .finishedAt)
+        let decodedCompleted = try values.decodeIfPresent(Int.self, forKey: .completed)
+        let decodedTotal = try values.decodeIfPresent(Int.self, forKey: .total)
+        let decodedProgress = try values.decodeIfPresent([MobileControlCheckProgressItem].self, forKey: .progress)
+        completed = MobileControlCheckProgressPlan.boundedCompleted(decodedCompleted)
+        total = decodedTotal == nil ? nil : MobileControlCheckProgressPlan.total
+        progress = decodedProgress.map(MobileControlCheckProgressPlan.normalized)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(id, forKey: .id)
+        try values.encode(requestId, forKey: .requestId)
+        try values.encode(state, forKey: .state)
+        try values.encode(phase, forKey: .phase)
+        try values.encode(MobileFeedSanitizer.redact(detail), forKey: .detail)
+        try values.encodeIfPresent(startedAt, forKey: .startedAt)
+        try values.encodeIfPresent(finishedAt, forKey: .finishedAt)
+        try values.encodeIfPresent(MobileControlCheckProgressPlan.boundedCompleted(completed), forKey: .completed)
+        try values.encodeIfPresent(total == nil ? nil : MobileControlCheckProgressPlan.total, forKey: .total)
+        try values.encodeIfPresent(progress.map(MobileControlCheckProgressPlan.normalized), forKey: .progress)
     }
 }
 

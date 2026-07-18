@@ -632,6 +632,15 @@ let offlineLinuxCheck = CommandResult(
 )
 let offlineLinuxSnapshot = LinuxUpdateCheckParser.snapshot(from: offlineLinuxCheck)
 test.require(offlineLinuxSnapshot.state == .offline, "SSH failures should remain distinct from Linux package failures")
+test.require(
+    LinuxUpdateCheckRetryPolicy.maximumRetryCount == 1
+        && LinuxUpdateCheckRetryPolicy.shouldRetry(state: .offline, completedRetryCount: 0)
+        && LinuxUpdateCheckRetryPolicy.shouldRetry(state: .failed, completedRetryCount: 0)
+        && !LinuxUpdateCheckRetryPolicy.shouldRetry(state: .offline, completedRetryCount: 1)
+        && !LinuxUpdateCheckRetryPolicy.shouldRetry(state: .current, completedRetryCount: 0)
+        && !LinuxUpdateCheckRetryPolicy.shouldRetry(state: .updateAvailable, completedRetryCount: 0),
+    "full Linux package checks should retry only one transient failed or offline result"
+)
 
 let privilegeLinuxCheck = CommandResult(
     exitCode: 4,
@@ -1851,10 +1860,97 @@ let decodedControlCheck = try controlDecoder.decode(MobileControlCheck.self, fro
 test.require(
     decodedControlCheck == controlCheck
         && decodedControlCheck.schemaVersion == 1
+        && decodedControlCheck.completed == 0
+        && decodedControlCheck.total == 3
+        && decodedControlCheck.progress?.map(\.id) == ["fleet", "linux", "publishing"]
         && controlCheckJSON.contains(#""requestId""#)
         && controlCheckJSON.contains(#""startedAt""#)
         && controlCheckJSON.contains(#""finishedAt""#) == false,
     "mobile live checks should round-trip their stable asynchronous wire fields"
+)
+let progressItemData = try JSONEncoder().encode(MobileControlCheckProgressPlan.initial()[0])
+let progressItemObject = try JSONSerialization.jsonObject(with: progressItemData) as? [String: Any]
+test.require(
+    Set(progressItemObject?.keys.map { $0 } ?? []) == Set(["id", "name", "category", "state", "detail"]),
+    "mobile check progress items should expose exactly the five additive wire fields"
+)
+test.require(
+    MobileControlCheckProgressPlan.stepIDs == ["fleet", "linux", "publishing"]
+        && MobileControlCheckProgressPlan.initial().map(\.id) == MobileControlCheckProgressPlan.stepIDs
+        && MobileControlCheckProgressPlan.initial().map(\.name) == ["Installed versions", "Linux packages", "Publish results"]
+        && MobileControlCheckProgressPlan.initial().map(\.category) == ["fleet", "linux", "publishing"]
+        && MobileControlCheckProgressPlan.initial().allSatisfy { $0.state == "queued" },
+    "mobile checks should use three stable ordered progress stages"
+)
+let unsafeProgress = [
+    MobileControlCheckProgressItem(
+        id: "fleet",
+        name: "Private machine",
+        category: "secret",
+        state: "unknown",
+        detail: "Contact admin@example.net at https://private.invalid/\nnow"
+    ),
+    MobileControlCheckProgressItem(id: "extra", name: "Extra", category: "extra", state: "running", detail: "Extra"),
+]
+let normalizedProgress = MobileControlCheckProgressPlan.normalized(unsafeProgress)
+test.require(
+    normalizedProgress.count == 3
+        && normalizedProgress[0].name == "Installed versions"
+        && normalizedProgress[0].category == "fleet"
+        && normalizedProgress[0].state == "queued"
+        && !normalizedProgress[0].detail.contains("admin@example.net")
+        && !normalizedProgress[0].detail.contains("https://")
+        && !normalizedProgress[0].detail.contains("\n")
+        && !normalizedProgress.contains(where: { $0.id == "extra" }),
+    "mobile check progress should be canonical, bounded, and privacy-sanitized"
+)
+let completedFleetProgress = MobileControlCheckProgressPlan.updating(
+    MobileControlCheckProgressPlan.initial(),
+    id: "fleet",
+    state: .succeeded,
+    detail: "Installed versions checked"
+)
+let failedIncompleteProgress = MobileControlCheckProgressPlan.failingIncomplete(
+    completedFleetProgress,
+    detail: "Controller stopped at admin@example.net\nbefore completion"
+)
+test.require(
+    failedIncompleteProgress.map(\.state) == ["succeeded", "failed", "failed"]
+        && MobileControlCheckProgressPlan.completedCount(failedIncompleteProgress) == 3
+        && failedIncompleteProgress[1].detail == "Controller stopped at [account] before completion",
+    "terminal recovery should preserve completed work and fail every unfinished canonical stage"
+)
+let legacyControlCheckData = Data(#"{"schemaVersion":1,"id":"00000000-0000-0000-0000-000000000022","requestId":"00000000-0000-0000-0000-000000000002","state":"succeeded","phase":"complete","detail":"Checked"}"#.utf8)
+let legacyControlCheck = try controlDecoder.decode(MobileControlCheck.self, from: legacyControlCheckData)
+test.require(
+    legacyControlCheck.completed == nil && legacyControlCheck.total == nil && legacyControlCheck.progress == nil,
+    "mobile check journals written before additive progress fields should still decode"
+)
+let futureControlCheckData = Data(#"{"schemaVersion":2,"id":"00000000-0000-0000-0000-000000000022","requestId":"00000000-0000-0000-0000-000000000002","state":"succeeded","phase":"complete","detail":"Checked"}"#.utf8)
+test.require(
+    (try? controlDecoder.decode(MobileControlCheck.self, from: futureControlCheckData)) == nil,
+    "mobile checks should reject unsupported record schemas instead of changing their wire meaning"
+)
+let oversizedControlCheckData = Data(#"{"schemaVersion":1,"id":"00000000-0000-0000-0000-000000000023","requestId":"00000000-0000-0000-0000-000000000002","state":"running","phase":"fleet","detail":"Checking","completed":99,"total":99,"progress":[{"id":"fleet","name":"Wrong","category":"wrong","state":"running","detail":"Checking"},{"id":"extra","name":"Extra","category":"extra","state":"running","detail":"Extra"}]}"#.utf8)
+let boundedControlCheck = try controlDecoder.decode(MobileControlCheck.self, from: oversizedControlCheckData)
+test.require(
+    boundedControlCheck.completed == 3
+        && boundedControlCheck.total == 3
+        && boundedControlCheck.progress?.count == 3
+        && boundedControlCheck.progress?.map(\.id) == ["fleet", "linux", "publishing"],
+    "decoded mobile check progress should be bounded to the canonical three stages"
+)
+let canonicalTotalCheck = MobileControlCheck(
+    requestId: checkRequestID,
+    completed: 99,
+    total: 1,
+    progress: unsafeProgress
+)
+test.require(
+    canonicalTotalCheck.completed == 3
+        && canonicalTotalCheck.total == 3
+        && canonicalTotalCheck.progress?.first?.state == "queued",
+    "any present mobile check total should canonicalize to the shared three-stage contract"
 )
 test.require(
     MobileControlCheckOutcome.state(successfulComponents: 4, failedComponents: 0) == .succeeded

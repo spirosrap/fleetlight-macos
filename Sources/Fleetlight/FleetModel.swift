@@ -16,6 +16,26 @@ private struct TrendSampleCacheKey: Hashable {
     let maxPoints: Int
 }
 
+private struct ReadOnlyUpdateProgressChange {
+    let id: String
+    let state: MobileControlJobState
+    let detail: String
+}
+
+private struct ReadOnlyUpdateSourceCounts {
+    let successful: Int
+    let failed: Int
+
+    var total: Int { successful + failed }
+
+    var state: MobileControlJobState {
+        MobileControlCheckOutcome.state(
+            successfulComponents: successful,
+            failedComponents: failed
+        )
+    }
+}
+
 @MainActor
 final class FleetModel: ObservableObject {
     @Published private(set) var snapshots: [String: HostSnapshot]
@@ -55,6 +75,7 @@ final class FleetModel: ObservableObject {
     @Published private(set) var latestCodexDesktopAppRelease: CodexDesktopAppRelease?
     @Published private(set) var isCheckingCodexDesktopAppRelease = false
     @Published private(set) var codexDesktopAppReleaseCheckFailed = false
+    @Published private(set) var readOnlyUpdateCheck: MobileControlCheck?
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var hiddenHostIDs: Set<String>
     @Published private(set) var hosts: [FleetHost]
@@ -338,7 +359,20 @@ final class FleetModel: ObservableObject {
     }
 
     private var isAnyUpdateOperationRunningExceptMobileControl: Bool {
-        isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+        isRunningReadOnlyUpdateCheck || isValidatingRoutes || isAnyCodexUpdateRunning || isCheckingLinuxUpdates || isCheckingLinuxRestartRequirements || isCheckingObserverConsistency || isUpdatingLinux || isRestartingLinux
+    }
+
+    var isRunningReadOnlyUpdateCheck: Bool {
+        readOnlyUpdateCheck?.state.isTerminal == false
+    }
+
+    var readOnlyUpdateCheckStatusText: String? {
+        guard let check = readOnlyUpdateCheck else { return nil }
+        if check.state == .running,
+           let item = check.progress?.first(where: { $0.state == MobileControlJobState.running.rawValue }) {
+            return "\(item.name) · \(item.detail)"
+        }
+        return check.detail
     }
 
     var isAnyUpdateOperationRunning: Bool {
@@ -352,7 +386,7 @@ final class FleetModel: ObservableObject {
     }
 
     var isManualRefreshDisabled: Bool {
-        isRefreshQueued || (!isLinuxRefreshBlocked && (isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty))
+        isRunningReadOnlyUpdateCheck || isRefreshQueued || (!isLinuxRefreshBlocked && (isRefreshing || isValidatingRoutes || !refreshingHostIDs.isEmpty))
     }
 
     var codexUpdateCenterStatusText: String {
@@ -661,6 +695,10 @@ final class FleetModel: ObservableObject {
     }
 
     func requestRefreshAll() async {
+        guard !isRunningReadOnlyUpdateCheck else {
+            notice = "Wait for the read-only update check to finish"
+            return
+        }
         guard mobileControlActiveCheckID == nil else {
             notice = "Wait for the live update check to finish"
             return
@@ -714,7 +752,8 @@ final class FleetModel: ObservableObject {
     }
 
     private func runQueuedRefreshIfReady() async {
-        let isBlocked = mobileControlActiveCheckID != nil
+        let isBlocked = isRunningReadOnlyUpdateCheck
+            || mobileControlActiveCheckID != nil
             || isLinuxRefreshBlocked
             || isRefreshing
             || isValidatingRoutes
@@ -753,12 +792,14 @@ final class FleetModel: ObservableObject {
     @discardableResult
     func refreshAll(
         forceReleaseChecks: Bool = false,
-        mobileControlCheckID: UUID? = nil
+        mobileControlCheckID: UUID? = nil,
+        publishFeed: Bool = true
     ) async -> Bool {
         guard MobileControlRefreshOwnership.permits(
             activeCheckId: mobileControlActiveCheckID,
             requestedCheckId: mobileControlCheckID
-        ), !isRefreshing,
+        ), (!isRunningReadOnlyUpdateCheck || !publishFeed),
+           !isRefreshing,
            !isValidatingRoutes,
            refreshingHostIDs.isEmpty,
            !isLinuxRefreshBlocked else { return false }
@@ -862,7 +903,7 @@ final class FleetModel: ObservableObject {
         appendHistoryBatch(historyBatch)
         lastRefresh = Date()
         lastRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
-        publishMobileFeed()
+        if publishFeed { publishMobileFeed() }
         isRefreshing = false
         let coldValidationStarted = shouldValidateFreshSSH && startFreshSSHValidation()
         await ActivityLogger.shared.append(
@@ -1205,8 +1246,11 @@ final class FleetModel: ObservableObject {
             for host in targets {
                 let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
                 group.addTask {
-                    let result = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
-                    return (host.id, LinuxUpdateCheckParser.snapshot(from: result))
+                    let snapshot = await Self.runLinuxUpdateCheckWithRetry(
+                        host: host,
+                        routeAlias: routeAlias
+                    )
+                    return (host.id, snapshot)
                 }
             }
             for await (hostID, snapshot) in group {
@@ -1613,35 +1657,219 @@ final class FleetModel: ObservableObject {
         }
     }
 
-    func checkAllCodexReleasesNow() async {
-        guard !isCheckingCodexRelease, !isCheckingCodexDesktopAppRelease else { return }
-        guard !isRefreshing, !isAnyUpdateOperationRunning else {
+    func checkAllUpdatesNow() async {
+        guard !isRunningReadOnlyUpdateCheck else { return }
+        guard !isRefreshQueued, !isRefreshing, !isAnyUpdateOperationRunning else {
             notice = "Wait for the current fleet operation to finish"
             return
         }
 
-        isCheckingCodexRelease = true
-        isCheckingCodexDesktopAppRelease = true
         notice = nil
-        async let registryTask = Self.fetchLatestCodexRelease(bypassCaches: true)
-        async let appcastTask = Self.fetchLatestCodexDesktopAppRelease(bypassCaches: true)
-        let registryJSON = await registryTask
-        let appcastXML = await appcastTask
-        applyCodexReleaseResult(registryJSON)
-        applyCodexDesktopAppReleaseResult(appcastXML)
-        await reconcileCodexUpdateFailuresVerifiedCurrent()
-        await postCodexUpdateAlertsIfNeeded()
+        let startedAt = Date()
+        readOnlyUpdateCheck = MobileControlCheck(
+            requestId: UUID(),
+            state: .queued,
+            phase: "queued",
+            detail: "Waiting to run the read-only update check"
+        )
+        await ActivityLogger.shared.append(
+            event: "read-only-update-check-started",
+            detail: "source=local"
+        )
 
-        let failedChecks = (codexReleaseCheckFailed ? 1 : 0) + (codexDesktopAppReleaseCheckFailed ? 1 : 0)
-        if failedChecks == 2 {
-            notice = "Couldn’t check the Codex release feeds"
-        } else if failedChecks == 1 {
-            notice = "Checked Codex releases · one feed is unavailable"
-        } else if codexUpdateCenterSummary.totalUpdateCount > 0 {
-            notice = "Found \(codexUpdateCenterSummary.totalUpdateCount) available Codex update\(codexUpdateCenterSummary.totalUpdateCount == 1 ? "" : "s")"
-        } else {
-            notice = "No Codex updates are available on online machines"
+        let completion = await runReadOnlyUpdateCheck(
+            startedAt: startedAt,
+            mobileControlCheckID: nil
+        ) { [weak self] phase, detail, completed, changes in
+            guard let self, var check = self.readOnlyUpdateCheck else { return false }
+            self.applyReadOnlyUpdateProgress(
+                to: &check,
+                phase: phase,
+                detail: detail,
+                completed: completed,
+                changes: changes,
+                startedAt: check.startedAt == nil ? startedAt : nil
+            )
+            self.readOnlyUpdateCheck = check
+            return true
         }
+
+        let finishedAt = Date()
+        if var check = readOnlyUpdateCheck {
+            check.state = completion?.state ?? .failed
+            check.phase = "complete"
+            check.detail = completion?.detail ?? "The read-only update check could not finish"
+            check.finishedAt = finishedAt
+            readOnlyUpdateCheck = check
+        }
+        let finalState = completion?.state ?? .failed
+        notice = completion?.detail ?? "The read-only update check could not finish"
+        await ActivityLogger.shared.append(
+            event: "read-only-update-check-finished",
+            detail: "source=local; state=\(finalState.rawValue)"
+        )
+        scheduleQueuedRefreshIfNeeded()
+        if started { schedulePolling() }
+    }
+
+    private func runReadOnlyUpdateCheck(
+        startedAt: Date,
+        mobileControlCheckID: UUID?,
+        onProgress: (_ phase: String, _ detail: String, _ completed: Int, _ changes: [ReadOnlyUpdateProgressChange]) -> Bool
+    ) async -> MobileControlCheckCompletion? {
+        guard onProgress(
+            "fleet",
+            "Refreshing installed versions and release sources",
+            0,
+            [ReadOnlyUpdateProgressChange(id: "fleet", state: .running, detail: "Refreshing installed versions and release sources")]
+        ) else { return nil }
+
+        let refreshed = await refreshAll(
+            forceReleaseChecks: true,
+            mobileControlCheckID: mobileControlCheckID,
+            publishFeed: false
+        )
+        guard refreshed else {
+            let failureDetail = "The fresh fleet probe could not start"
+            _ = onProgress(
+                "publishing",
+                failureDetail,
+                MobileControlCheckProgressPlan.total,
+                [
+                    ReadOnlyUpdateProgressChange(id: "fleet", state: .failed, detail: failureDetail),
+                    ReadOnlyUpdateProgressChange(id: "linux", state: .failed, detail: "Not run because the fleet probe failed"),
+                    ReadOnlyUpdateProgressChange(id: "publishing", state: .failed, detail: "No fresh result was available to publish"),
+                ]
+            )
+            return MobileControlCheckCompletionPlanner.plan(
+                successfulSources: 0,
+                failedSources: max(1, visibleHosts.count + 2),
+                feedPublished: false
+            )
+        }
+
+        let fleetCounts = readOnlyFleetSourceCounts(startedAt: startedAt)
+        let fleetDetail = "\(fleetCounts.successful)/\(fleetCounts.total) installed and release sources checked"
+        guard onProgress(
+            "linux",
+            "Refreshing Linux package metadata",
+            1,
+            [
+                ReadOnlyUpdateProgressChange(id: "fleet", state: fleetCounts.state, detail: fleetDetail),
+                ReadOnlyUpdateProgressChange(id: "linux", state: .running, detail: "Refreshing Linux package metadata"),
+            ]
+        ) else { return nil }
+
+        let linuxTargets = linuxUpdateHosts
+        if !linuxTargets.isEmpty {
+            await checkLinuxUpdates(forMobileControlCheck: mobileControlCheckID)
+        }
+        let linuxCounts = readOnlyLinuxSourceCounts(startedAt: startedAt)
+        let linuxState: MobileControlJobState = linuxTargets.isEmpty ? .succeeded : linuxCounts.state
+        let linuxDetail = linuxTargets.isEmpty
+            ? "No Linux machines are configured"
+            : "\(linuxCounts.successful)/\(linuxCounts.total) Linux package sources checked"
+        guard onProgress(
+            "publishing",
+            "Publishing the refreshed mobile feed",
+            2,
+            [
+                ReadOnlyUpdateProgressChange(id: "linux", state: linuxState, detail: linuxDetail),
+                ReadOnlyUpdateProgressChange(id: "publishing", state: .running, detail: "Publishing the refreshed mobile feed"),
+            ]
+        ) else { return nil }
+
+        let feedPublished = publishMobileFeed()
+        let publishingState: MobileControlJobState = feedPublished ? .succeeded : .failed
+        let publishingDetail = feedPublished
+            ? "Fresh status published"
+            : "Fresh status could not be published"
+        guard onProgress(
+            "publishing",
+            publishingDetail,
+            3,
+            [ReadOnlyUpdateProgressChange(id: "publishing", state: publishingState, detail: publishingDetail)]
+        ) else { return nil }
+
+        return MobileControlCheckCompletionPlanner.plan(
+            successfulSources: fleetCounts.successful + linuxCounts.successful,
+            failedSources: fleetCounts.failed + linuxCounts.failed,
+            feedPublished: feedPublished
+        )
+    }
+
+    private func readOnlyFleetSourceCounts(startedAt: Date) -> ReadOnlyUpdateSourceCounts {
+        var successful = visibleHosts.filter { host in
+            snapshots[host.id]?.state == .online
+                && snapshots[host.id]?.checkedAt.map { $0 >= startedAt } == true
+        }.count
+        var failed = max(0, visibleHosts.count - successful)
+        if codexReleaseCheckFailed || codexReleaseCheckedAt.map({ $0 >= startedAt }) != true {
+            failed += 1
+        } else {
+            successful += 1
+        }
+        if codexDesktopAppReleaseCheckFailed
+            || codexDesktopAppReleaseCheckedAt.map({ $0 >= startedAt }) != true {
+            failed += 1
+        } else {
+            successful += 1
+        }
+        return ReadOnlyUpdateSourceCounts(successful: successful, failed: failed)
+    }
+
+    private func readOnlyLinuxSourceCounts(startedAt: Date) -> ReadOnlyUpdateSourceCounts {
+        var successful = 0
+        var failed = 0
+        for host in linuxUpdateHosts {
+            let snapshot = linuxUpdateSnapshots[host.id]
+            guard snapshot?.checkedAt.map({ $0 >= startedAt }) == true else {
+                failed += 1
+                continue
+            }
+            switch snapshot?.state {
+            case .current, .updateAvailable: successful += 1
+            case .none, .notChecked, .checking, .offline, .unsupported, .failed: failed += 1
+            }
+        }
+        return ReadOnlyUpdateSourceCounts(successful: successful, failed: failed)
+    }
+
+    private func applyReadOnlyUpdateProgress(
+        to check: inout MobileControlCheck,
+        phase: String,
+        detail: String,
+        completed: Int,
+        changes: [ReadOnlyUpdateProgressChange],
+        startedAt: Date? = nil
+    ) {
+        check.state = .running
+        check.phase = phase
+        check.detail = MobileFeedSanitizer.redact(detail)
+        if let startedAt { check.startedAt = startedAt }
+        check.completed = MobileControlCheckProgressPlan.boundedCompleted(completed)
+        check.total = MobileControlCheckProgressPlan.total
+        for change in changes {
+            check.progress = MobileControlCheckProgressPlan.updating(
+                check.progress,
+                id: change.id,
+                state: change.state,
+                detail: change.detail
+            )
+        }
+    }
+
+    private func failIncompleteReadOnlyUpdateProgress(
+        to check: inout MobileControlCheck,
+        detail: String
+    ) {
+        let items = MobileControlCheckProgressPlan.failingIncomplete(
+            check.progress,
+            detail: detail
+        )
+        check.progress = items
+        check.total = MobileControlCheckProgressPlan.total
+        check.completed = MobileControlCheckProgressPlan.completedCount(items)
     }
 
     func updateAllAvailableCodex() async {
@@ -1741,8 +1969,11 @@ final class FleetModel: ObservableObject {
             for host in targets {
                 let routeAlias = snapshots[host.id]?.routeAlias ?? host.routes.first?.alias
                 group.addTask {
-                    let result = await Self.runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
-                    return (host.id, LinuxUpdateCheckParser.snapshot(from: result))
+                    let snapshot = await Self.runLinuxUpdateCheckWithRetry(
+                        host: host,
+                        routeAlias: routeAlias
+                    )
+                    return (host.id, snapshot)
                 }
             }
             for await (hostID, snapshot) in group {
@@ -2635,8 +2866,13 @@ final class FleetModel: ObservableObject {
         var changed = false
         for index in mobileControlChecks.indices where !mobileControlChecks[index].state.isTerminal {
             mobileControlChecks[index].state = .failed
-            mobileControlChecks[index].phase = "interrupted"
-            mobileControlChecks[index].detail = "Update check interrupted because the controller restarted"
+            let detail = "Update check interrupted because the controller restarted"
+            failIncompleteReadOnlyUpdateProgress(
+                to: &mobileControlChecks[index],
+                detail: detail
+            )
+            mobileControlChecks[index].phase = "complete"
+            mobileControlChecks[index].detail = detail
             mobileControlChecks[index].finishedAt = Date()
             changed = true
         }
@@ -2854,91 +3090,28 @@ final class FleetModel: ObservableObject {
     private func runMobileControlCheck(_ checkID: UUID) async {
         guard mobileControlActiveCheckID == checkID else { return }
         pollTask?.cancel()
-        let checkStartedAt = Date()
-        guard updateMobileControlCheck(checkID, mutation: { check in
-            check.state = .running
-            check.phase = "probing-installed-versions"
-            check.detail = "Checking installed versions on every machine"
-            check.startedAt = checkStartedAt
-        }) else {
-            recoverMobileControlCheckAfterJournalFailure(checkID)
-            return
-        }
-
-        let refreshed = await refreshAll(
-            forceReleaseChecks: true,
+        let startedAt = Date()
+        let completion = await runReadOnlyUpdateCheck(
+            startedAt: startedAt,
             mobileControlCheckID: checkID
-        )
-        guard mobileControlActiveCheckID == checkID else { return }
-        guard refreshed else {
-            finishMobileControlCheck(
-                checkID,
-                state: .failed,
-                detail: "The fresh fleet probe could not start"
-            )
-            return
+        ) { [weak self] phase, detail, completed, changes in
+            guard let self, self.mobileControlActiveCheckID == checkID else { return false }
+            return self.updateMobileControlCheck(checkID, mutation: { check in
+                self.applyReadOnlyUpdateProgress(
+                    to: &check,
+                    phase: phase,
+                    detail: detail,
+                    completed: completed,
+                    changes: changes,
+                    startedAt: check.startedAt == nil ? startedAt : nil
+                )
+            })
         }
-
-        let linuxTargets = linuxUpdateHosts
-        if !linuxTargets.isEmpty {
-            guard updateMobileControlCheck(checkID, mutation: { check in
-                check.phase = "checking-linux-packages"
-                check.detail = "Checking Linux package sources"
-            }) else {
-                recoverMobileControlCheckAfterJournalFailure(checkID)
-                return
-            }
-            await checkLinuxUpdates(forMobileControlCheck: checkID)
-        }
-
         guard mobileControlActiveCheckID == checkID else { return }
-        guard updateMobileControlCheck(checkID, mutation: { check in
-            check.phase = "publishing"
-            check.detail = "Publishing fresh fleet status"
-        }) else {
+        guard let completion else {
             recoverMobileControlCheckAfterJournalFailure(checkID)
             return
         }
-        let feedPublished = publishMobileFeed()
-
-        var successfulSources = 0
-        var failedSources = 0
-        for host in visibleHosts {
-            if snapshots[host.id]?.state == .online,
-               snapshots[host.id]?.checkedAt.map({ $0 >= checkStartedAt }) == true {
-                successfulSources += 1
-            } else {
-                failedSources += 1
-            }
-        }
-        if codexReleaseCheckFailed || codexReleaseCheckedAt.map({ $0 >= checkStartedAt }) != true {
-            failedSources += 1
-        } else {
-            successfulSources += 1
-        }
-        if codexDesktopAppReleaseCheckFailed
-            || codexDesktopAppReleaseCheckedAt.map({ $0 >= checkStartedAt }) != true {
-            failedSources += 1
-        } else {
-            successfulSources += 1
-        }
-        for host in linuxTargets {
-            let snapshot = linuxUpdateSnapshots[host.id]
-            guard snapshot?.checkedAt.map({ $0 >= checkStartedAt }) == true else {
-                failedSources += 1
-                continue
-            }
-            switch snapshot?.state {
-            case .current, .updateAvailable: successfulSources += 1
-            case .none, .notChecked, .checking, .offline, .unsupported, .failed: failedSources += 1
-            }
-        }
-
-        let completion = MobileControlCheckCompletionPlanner.plan(
-            successfulSources: successfulSources,
-            failedSources: failedSources,
-            feedPublished: feedPublished
-        )
         finishMobileControlCheck(checkID, state: completion.state, detail: completion.detail)
     }
 
@@ -2954,9 +3127,14 @@ final class FleetModel: ObservableObject {
 
     private func recoverMobileControlCheckAfterJournalFailure(_ checkID: UUID) {
         if let index = mobileControlChecks.firstIndex(where: { $0.id == checkID }) {
+            let detail = "Update check stopped because its recovery journal became unavailable"
             mobileControlChecks[index].state = .failed
-            mobileControlChecks[index].phase = "journal-failed"
-            mobileControlChecks[index].detail = "Update check stopped because its recovery journal became unavailable"
+            failIncompleteReadOnlyUpdateProgress(
+                to: &mobileControlChecks[index],
+                detail: detail
+            )
+            mobileControlChecks[index].phase = "complete"
+            mobileControlChecks[index].detail = detail
             mobileControlChecks[index].finishedAt = Date()
             mobileControlChecks = MobileControlCheckRetention.retained(mobileControlChecks)
             _ = MobileControlCheckStore.save(mobileControlChecks)
@@ -2990,6 +3168,9 @@ final class FleetModel: ObservableObject {
         mobileControlChecks[index].phase = "complete"
         mobileControlChecks[index].detail = detail
         mobileControlChecks[index].finishedAt = Date()
+        mobileControlChecks[index].completed = MobileControlCheckProgressPlan.completedCount(
+            mobileControlChecks[index].progress
+        )
         mobileControlActiveCheckID = nil
         mobileControlChecks = MobileControlCheckRetention.retained(mobileControlChecks)
         if !MobileControlCheckStore.save(mobileControlChecks) {
@@ -3012,7 +3193,10 @@ final class FleetModel: ObservableObject {
             phase: check.phase,
             detail: MobileFeedSanitizer.redact(check.detail),
             startedAt: check.startedAt,
-            finishedAt: check.finishedAt
+            finishedAt: check.finishedAt,
+            completed: check.completed,
+            total: check.total,
+            progress: check.progress
         )
     }
 
@@ -4076,7 +4260,8 @@ final class FleetModel: ObservableObject {
     }
 
     private func schedulePolling() {
-        guard mobileControlActiveCheckID == nil,
+        guard !isRunningReadOnlyUpdateCheck,
+              mobileControlActiveCheckID == nil,
               linuxRefreshDeferralDepth == 0,
               !refreshRequestQueue.isQueued else { return }
         pollTask?.cancel()
@@ -4086,7 +4271,8 @@ final class FleetModel: ObservableObject {
                 let interval = self.refreshInterval
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { break }
-                guard self.mobileControlActiveCheckID == nil else { continue }
+                guard !self.isRunningReadOnlyUpdateCheck,
+                      self.mobileControlActiveCheckID == nil else { continue }
                 await self.refreshAll(mobileControlCheckID: nil)
             }
         }
@@ -4339,6 +4525,23 @@ final class FleetModel: ObservableObject {
             timeout: 180,
             multiplex: false
         )
+    }
+
+    nonisolated private static func runLinuxUpdateCheckWithRetry(
+        host: FleetHost,
+        routeAlias: String?
+    ) async -> LinuxUpdateSnapshot {
+        let firstResult = await runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+        let firstSnapshot = LinuxUpdateCheckParser.snapshot(from: firstResult)
+        guard LinuxUpdateCheckRetryPolicy.shouldRetry(
+            state: firstSnapshot.state,
+            completedRetryCount: 0
+        ) else { return firstSnapshot }
+
+        try? await Task.sleep(for: .milliseconds(350))
+        guard !Task.isCancelled else { return firstSnapshot }
+        let retryResult = await runLinuxUpdateCheck(host: host, routeAlias: routeAlias)
+        return LinuxUpdateCheckParser.snapshot(from: retryResult)
     }
 
     nonisolated private static func runLinuxUpdateRecoveryCheck(

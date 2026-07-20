@@ -4533,121 +4533,103 @@ public enum CodexDesktopAppUpdateCommandBuilder {
           exit 2
         fi
 
-        read_version() { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null; }
-        read_build() { /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist" 2>/dev/null; }
-        before_version=$(read_version)
-        before_build=$(read_build)
+        read_version() { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null; }
+        read_build() { /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$1/Contents/Info.plist" 2>/dev/null; }
+        before_version=$(read_version "$app")
+        before_build=$(read_build "$app")
         printf 'BEFORE_VERSION:%s\nBEFORE_BUILD:%s\n' "$before_version" "$before_build"
 
-        if ! pgrep ChatGPT >/dev/null 2>&1; then
-          /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
-          launch_attempt=0
-          while ! pgrep ChatGPT >/dev/null 2>&1 && [ "$launch_attempt" -lt 20 ]; do
-            sleep 1
-            launch_attempt=$((launch_attempt + 1))
-          done
-        fi
-        if ! pgrep ChatGPT >/dev/null 2>&1; then
-          printf 'UPDATE:not-running\nVERIFY:failed\n'
+        feed=https://persistent.oaistatic.com/codex-app-prod/appcast.xml
+        work=$(/usr/bin/mktemp -d /tmp/fleetlight-codex-update.XXXXXX) || {
+          printf 'UPDATE:staging-failed\nVERIFY:failed\n'
           exit 3
-        fi
-
-        click_result=$(/usr/bin/osascript 2>&1 <<'APPLESCRIPT'
-        tell application "System Events"
-          if not (exists process "ChatGPT") then error "ChatGPT process is unavailable"
-          tell process "ChatGPT"
-            click menu item "Check for Updates…" of menu 1 of menu bar item "ChatGPT" of menu bar 1
-          end tell
-        end tell
-        APPLESCRIPT
-        )
-        click_status=$?
-        if [ "$click_status" -ne 0 ]; then
-          printf 'ERROR:%s\nUPDATE:permission\nVERIFY:failed\n' "$(printf '%s' "$click_result" | tail -n 1 | tr '\n' ' ')"
-          exit 3
-        fi
-
-        inspect_update_dialog() {
-          /usr/bin/osascript 2>&1 <<'APPLESCRIPT'
-        set updateButtonNames to {"Install and Relaunch", "Update and Relaunch", "Restart to Update", "Install Update", "Download and Install", "Update Now", "Relaunch", "Download", "Update"}
-        tell application "System Events"
-          if not (exists process "ChatGPT") then return "restarting"
-          tell process "ChatGPT"
-            repeat with updateWindow in windows
-              set dialogText to ""
-              try
-                set dialogText to (value of every static text of updateWindow) as text
-              end try
-              ignoring case
-                if dialogText contains "up to date" or dialogText contains "newest version available" then
-                  try
-                    click button "OK" of updateWindow
-                  end try
-                  return "current"
-                end if
-              end ignoring
-              repeat with buttonName in updateButtonNames
-                set candidateName to buttonName as text
-                if exists button candidateName of updateWindow then
-                  click button candidateName of updateWindow
-                  return "acted:" & candidateName
-                end if
-              end repeat
-            end repeat
-          end tell
-        end tell
-        return "waiting"
-        APPLESCRIPT
         }
+        archive="$work/ChatGPT.zip"
+        staged="$work/ChatGPT.app"
+        feed_file="$work/appcast.xml"
+        cleanup() { /bin/rm -rf "$work"; }
+        trap cleanup EXIT HUP INT TERM
 
-        elapsed=0
-        acted=0
-        saw_restart=0
-        while [ "$elapsed" -lt 360 ]; do
-          after_version=$(read_version)
-          after_build=$(read_build)
-          if { [ "$after_version" != "$before_version" ] || [ "$after_build" != "$before_build" ]; } && pgrep ChatGPT >/dev/null 2>&1; then
-            printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:ok\nVERIFY:updated\n' "$after_version" "$after_build"
-            exit 0
-          fi
+        if ! /usr/bin/curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 "$feed" -o "$feed_file"; then
+          printf 'UPDATE:feed-failed\nVERIFY:failed\n'
+          exit 3
+        fi
 
-          if ! pgrep ChatGPT >/dev/null 2>&1; then
-            saw_restart=1
-            sleep 2
-            elapsed=$((elapsed + 2))
-            continue
-          fi
+        target_version=$(/usr/bin/xmllint --xpath 'string((//*[local-name()="item"])[1]/*[local-name()="shortVersionString"])' "$feed_file" 2>/dev/null)
+        target_build=$(/usr/bin/xmllint --xpath 'string((//*[local-name()="item"])[1]/*[local-name()="version"])' "$feed_file" 2>/dev/null)
+        target_url=$(/usr/bin/xmllint --xpath 'string((//*[local-name()="item"])[1]/*[local-name()="enclosure" and not(ancestor::*[local-name()="deltas"])][1]/@url)' "$feed_file" 2>/dev/null)
+        case "$target_version:$target_build" in
+          *[!0-9.:]*|:*|*:) printf 'UPDATE:feed-invalid\nVERIFY:failed\n'; exit 3 ;;
+        esac
+        case "$target_url" in
+          https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-*.zip) ;;
+          *) printf 'UPDATE:feed-invalid\nVERIFY:failed\n'; exit 3 ;;
+        esac
+        printf 'TARGET_VERSION:%s\nTARGET_BUILD:%s\n' "$target_version" "$target_build"
 
-          dialog_result=$(inspect_update_dialog)
-          dialog_status=$?
-          if [ "$dialog_status" -ne 0 ]; then
-            printf 'ERROR:%s\nUPDATE:permission\nVERIFY:failed\n' "$(printf '%s' "$dialog_result" | tail -n 1 | tr '\n' ' ')"
-            exit 3
-          fi
-          case "$dialog_result" in
-            current)
-              printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:current\nVERIFY:current\n' "$after_version" "$after_build"
-              exit 0
-              ;;
-            acted:*) acted=1 ;;
-            restarting) saw_restart=1 ;;
-          esac
+        if [ "$before_build" = "$target_build" ] && [ "$before_version" = "$target_version" ]; then
+          printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:current\nVERIFY:current\n' "$before_version" "$before_build"
+          exit 0
+        fi
+        case "$before_build:$target_build" in
+          *[!0-9:]*|:*|*:) printf 'UPDATE:feed-invalid\nVERIFY:failed\n'; exit 3 ;;
+        esac
+        if [ "$before_build" -gt "$target_build" ]; then
+          printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:current\nVERIFY:current\n' "$before_version" "$before_build"
+          exit 0
+        fi
 
-          if [ "$saw_restart" -eq 1 ] && [ "$elapsed" -ge 45 ]; then
-            /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
-          fi
-          if [ "$acted" -eq 0 ] && [ "$elapsed" -ge 45 ]; then
-            printf 'UPDATE:no-result\nVERIFY:failed\n'
-            exit 4
-          fi
-          sleep 2
-          elapsed=$((elapsed + 2))
+        if ! /usr/bin/curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "$target_url" -o "$archive"; then
+          printf 'UPDATE:download-failed\nVERIFY:failed\n'
+          exit 3
+        fi
+        if ! /usr/bin/ditto -x -k "$archive" "$work" || [ ! -d "$staged" ]; then
+          printf 'UPDATE:archive-invalid\nVERIFY:failed\n'
+          exit 3
+        fi
+        staged_plist="$staged/Contents/Info.plist"
+        staged_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$staged_plist" 2>/dev/null)
+        staged_version=$(read_version "$staged")
+        staged_build=$(read_build "$staged")
+        staged_team=$(/usr/bin/codesign -dv --verbose=4 "$staged" 2>&1 | /usr/bin/sed -n 's/^TeamIdentifier=//p')
+        if [ "$staged_id" != com.openai.codex ] || [ "$staged_version" != "$target_version" ] || [ "$staged_build" != "$target_build" ] || [ "$staged_team" != 2DC432GLL2 ] || ! /usr/bin/codesign --verify --deep --strict "$staged" >/dev/null 2>&1; then
+          printf 'UPDATE:signature-invalid\nVERIFY:failed\n'
+          exit 3
+        fi
+
+        /usr/bin/pkill -TERM -x ChatGPT >/dev/null 2>&1 || true
+        stop_attempt=0
+        while /usr/bin/pgrep -x ChatGPT >/dev/null 2>&1 && [ "$stop_attempt" -lt 20 ]; do
+          sleep 1
+          stop_attempt=$((stop_attempt + 1))
         done
+        if /usr/bin/pgrep -x ChatGPT >/dev/null 2>&1; then
+          printf 'UPDATE:app-busy\nVERIFY:failed\n'
+          exit 3
+        fi
 
-        after_version=$(read_version)
-        after_build=$(read_build)
-        printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:timeout\nVERIFY:failed\n' "$after_version" "$after_build"
-        exit 4
+        backup=/Applications/.Fleetlight-ChatGPT-backup.$$
+        if ! /bin/mv "$app" "$backup"; then
+          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+          exit 3
+        fi
+        if ! /usr/bin/ditto "$staged" "$app"; then
+          /bin/rm -rf "$app"
+          /bin/mv "$backup" "$app" >/dev/null 2>&1 || true
+          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+          exit 3
+        fi
+        after_version=$(read_version "$app")
+        after_build=$(read_build "$app")
+        if [ "$after_version" != "$target_version" ] || [ "$after_build" != "$target_build" ] || ! /usr/bin/codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+          /bin/rm -rf "$app"
+          /bin/mv "$backup" "$app" >/dev/null 2>&1 || true
+          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+          exit 3
+        fi
+        /bin/rm -rf "$backup"
+        /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
+        printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:ok\nVERIFY:updated\n' "$after_version" "$after_build"
         """
     }
 }
@@ -4681,11 +4663,20 @@ public enum CodexDesktopAppUpdateParser {
         if lines.contains("UPDATE:unsupported") {
             return outcome(.failed, nil, nil, "Codex desktop app updates require macOS")
         }
-        if lines.contains("UPDATE:permission") {
-            return outcome(.failed, activeVersion, activeBuild, "Allow Fleetlight to control System Events in macOS Privacy & Security")
+        if lines.contains("UPDATE:feed-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "Could not check the official Codex app update feed")
         }
-        if lines.contains("UPDATE:not-running") {
-            return outcome(.failed, activeVersion, activeBuild, "Codex desktop app could not be opened")
+        if lines.contains("UPDATE:download-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "Could not download the Codex app update")
+        }
+        if lines.contains("UPDATE:signature-invalid") || lines.contains("UPDATE:archive-invalid") || lines.contains("UPDATE:feed-invalid") {
+            return outcome(.failed, activeVersion, activeBuild, "The Codex app update could not be verified")
+        }
+        if lines.contains("UPDATE:app-busy") {
+            return outcome(.failed, activeVersion, activeBuild, "Close Codex and try the update again")
+        }
+        if lines.contains("UPDATE:install-failed") || lines.contains("UPDATE:staging-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "The Codex app update could not be installed; the previous version was preserved")
         }
 
         let error = value(after: "ERROR:", in: lines)

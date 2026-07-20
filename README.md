@@ -146,7 +146,7 @@ Android update control is disabled by default. In Fleetlight Settings, enable **
 
 Fleetlight has no analytics, telemetry, account system, or hosted backend. Configuration and monitoring history remain under `~/Library/Application Support/Fleetlight/`. Routine refreshes cache HTTPS requests to npm's public `@openai/codex` metadata and OpenAI’s public Codex Mac appcast for up to 15 minutes; a local or authenticated Android **Check All** intentionally refreshes both public sources immediately, checks configured machines, and republishes the local mobile feed. It never installs or restarts anything. Fleetlight sends no fleet configuration or machine measurements to either public release source. Exported diagnostics can contain your machine labels and network measurements, so review them before sharing.
 
-The first desktop app update may ask for permission to control System Events. Approve Fleetlight under **System Settings → Privacy & Security → Automation** (and Accessibility if macOS requests it). Fleetlight uses that access only to choose ChatGPT/Codex’s **Check for Updates…** command and its signed install/relaunch action.
+Codex desktop app updates use OpenAI's official appcast and download. Fleetlight verifies the bundle identifier, version, OpenAI Developer ID team, and complete code signature before installation, keeps the previous app until the replacement verifies successfully, and then relaunches Codex. No Automation or Accessibility permission is required.
 
 ## License
 

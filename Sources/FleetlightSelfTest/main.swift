@@ -1142,8 +1142,11 @@ test.require(LinuxRestartParser.outcome(from: unauthorizedLinuxRestart).detail =
 let codexDesktopAppCommand = CodexDesktopAppUpdateCommandBuilder.build()
 test.require(codexDesktopAppCommand.hasPrefix("printf 'FLEETLIGHT_CODEX_APP_UPDATE"), "Codex app updater should emit a verification marker")
 test.require(codexDesktopAppCommand.contains("com.openai.codex"), "Codex app updater should verify the OpenAI bundle identifier")
-test.require(codexDesktopAppCommand.contains("Check for Updates…"), "Codex app updater should delegate to the app’s own update menu")
-test.require(codexDesktopAppCommand.contains("Install and Relaunch"), "Codex app updater should accept Sparkle’s relaunch action")
+test.require(codexDesktopAppCommand.contains("persistent.oaistatic.com/codex-app-prod/appcast.xml"), "Codex app updater should use the official update feed")
+test.require(codexDesktopAppCommand.contains("TeamIdentifier") && codexDesktopAppCommand.contains("2DC432GLL2"), "Codex app updater should verify OpenAI's signing team")
+test.require(codexDesktopAppCommand.contains("codesign --verify --deep --strict"), "Codex app updater should verify the downloaded app before installation")
+test.require(codexDesktopAppCommand.contains("Fleetlight-ChatGPT-backup"), "Codex app updater should preserve a rollback copy during installation")
+test.require(!codexDesktopAppCommand.contains("System Events"), "Codex app updater should not require macOS UI automation permission")
 test.require(codexDesktopAppCommand.contains("AFTER_BUILD:"), "Codex app updater should verify the installed build after relaunch")
 
 let currentCodexDesktopApp = CommandResult(
@@ -1168,16 +1171,16 @@ let updatedCodexDesktopOutcome = CodexDesktopAppUpdateParser.outcome(from: updat
 test.require(updatedCodexDesktopOutcome.status == .updated, "a changed signed app build should be reported as updated")
 test.require(updatedCodexDesktopOutcome.detail.contains("26.708.10000"), "updated Codex app results should name the installed version")
 
-let permissionDeniedCodexDesktopApp = CommandResult(
+let invalidSignatureCodexDesktopApp = CommandResult(
     exitCode: 3,
-    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nUPDATE:permission\nVERIFY:failed\n",
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nUPDATE:signature-invalid\nVERIFY:failed\n",
     stderr: "",
     elapsedMilliseconds: 400,
     timedOut: false
 )
 test.require(
-    CodexDesktopAppUpdateParser.outcome(from: permissionDeniedCodexDesktopApp).detail.contains("Privacy & Security"),
-    "macOS automation denials should explain where to grant permission"
+    CodexDesktopAppUpdateParser.outcome(from: invalidSignatureCodexDesktopApp).detail.contains("verified"),
+    "invalid Codex app downloads should report a verification failure"
 )
 
 let defaultHost = FleetHost.defaults.first!

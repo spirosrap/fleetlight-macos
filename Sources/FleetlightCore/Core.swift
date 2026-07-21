@@ -4609,27 +4609,62 @@ public enum CodexDesktopAppUpdateCommandBuilder {
         fi
 
         backup=/Applications/.Fleetlight-ChatGPT-backup.$$
+        restore_previous_app() {
+          /bin/rm -rf "$app"
+          /bin/mv "$backup" "$app" >/dev/null 2>&1
+        }
         if ! /bin/mv "$app" "$backup"; then
-          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+          printf 'UPDATE:backup-failed\nVERIFY:failed\n'
           exit 3
         fi
-        if ! /usr/bin/ditto "$staged" "$app"; then
-          /bin/rm -rf "$app"
-          /bin/mv "$backup" "$app" >/dev/null 2>&1 || true
-          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+        # The staged app and /Applications live on the macOS data volume, so
+        # moving the verified bundle makes the replacement nearly instant.
+        # This avoids a long partial-copy window for large Electron releases.
+        if ! /bin/mv "$staged" "$app"; then
+          if restore_previous_app; then
+            printf 'UPDATE:replace-failed\nVERIFY:failed\n'
+          else
+            printf 'UPDATE:rollback-failed\nVERIFY:failed\n'
+          fi
           exit 3
         fi
         after_version=$(read_version "$app")
         after_build=$(read_build "$app")
-        if [ "$after_version" != "$target_version" ] || [ "$after_build" != "$target_build" ] || ! /usr/bin/codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
-          /bin/rm -rf "$app"
-          /bin/mv "$backup" "$app" >/dev/null 2>&1 || true
-          printf 'UPDATE:install-failed\nVERIFY:failed\n'
+        after_team=$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1 | /usr/bin/sed -n 's/^TeamIdentifier=//p')
+        if [ "$after_version" != "$target_version" ] || [ "$after_build" != "$target_build" ] || [ "$after_team" != 2DC432GLL2 ] || ! /usr/bin/codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+          if restore_previous_app; then
+            printf 'UPDATE:post-install-invalid\nVERIFY:failed\n'
+          else
+            printf 'UPDATE:rollback-failed\nVERIFY:failed\n'
+          fi
           exit 3
         fi
         /bin/rm -rf "$backup"
-        /usr/bin/open -gj "$app" >/dev/null 2>&1 || true
-        printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nUPDATE:ok\nVERIFY:updated\n' "$after_version" "$after_build"
+        relaunch_ok=0
+        launch_attempt=1
+        while [ "$launch_attempt" -le 3 ] && [ "$relaunch_ok" -eq 0 ]; do
+          case "$launch_attempt" in
+            1) /usr/bin/open -gj "$app" >/dev/null 2>&1 || true ;;
+            2) /bin/launchctl asuser "$(id -u)" /usr/bin/open -gj "$app" >/dev/null 2>&1 || true ;;
+            3) /usr/bin/open -gj -b com.openai.codex >/dev/null 2>&1 || true ;;
+          esac
+          launch_wait=0
+          while [ "$launch_wait" -lt 10 ]; do
+            if /usr/bin/pgrep -x ChatGPT >/dev/null 2>&1; then
+              relaunch_ok=1
+              break
+            fi
+            sleep 1
+            launch_wait=$((launch_wait + 1))
+          done
+          launch_attempt=$((launch_attempt + 1))
+        done
+        if [ "$relaunch_ok" -eq 1 ]; then
+          relaunch=ok
+        else
+          relaunch=failed
+        fi
+        printf 'AFTER_VERSION:%s\nAFTER_BUILD:%s\nRELAUNCH:%s\nUPDATE:ok\nVERIFY:updated\n' "$after_version" "$after_build" "$relaunch"
         """
     }
 }
@@ -4652,7 +4687,11 @@ public enum CodexDesktopAppUpdateParser {
             return outcome(.offline, activeVersion, activeBuild, "Offline — SSH connection unavailable")
         }
         if lines.contains("VERIFY:updated") {
-            return outcome(.updated, activeVersion, activeBuild, versionDetail(prefix: "Updated Codex app to", version: activeVersion, build: activeBuild))
+            var detail = versionDetail(prefix: "Updated Codex app to", version: activeVersion, build: activeBuild)
+            if lines.contains("RELAUNCH:failed") {
+                detail += " · installed, but Codex did not reopen"
+            }
+            return outcome(.updated, activeVersion, activeBuild, detail)
         }
         if lines.contains("VERIFY:current") {
             return outcome(.current, activeVersion, activeBuild, versionDetail(prefix: "Codex app is current at", version: activeVersion, build: activeBuild))
@@ -4675,8 +4714,20 @@ public enum CodexDesktopAppUpdateParser {
         if lines.contains("UPDATE:app-busy") {
             return outcome(.failed, activeVersion, activeBuild, "Close Codex and try the update again")
         }
-        if lines.contains("UPDATE:install-failed") || lines.contains("UPDATE:staging-failed") {
+        if lines.contains("UPDATE:backup-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "Could not prepare the Codex app for replacement; the installed version was left unchanged")
+        }
+        if lines.contains("UPDATE:replace-failed") {
             return outcome(.failed, activeVersion, activeBuild, "The Codex app update could not be installed; the previous version was preserved")
+        }
+        if lines.contains("UPDATE:post-install-invalid") {
+            return outcome(.failed, activeVersion, activeBuild, "The installed Codex app did not pass verification; the previous version was restored")
+        }
+        if lines.contains("UPDATE:rollback-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "The Codex app update and automatic rollback both failed; reinstall Codex manually")
+        }
+        if lines.contains("UPDATE:staging-failed") {
+            return outcome(.failed, activeVersion, activeBuild, "Could not create a secure staging area for the Codex app update")
         }
 
         let error = value(after: "ERROR:", in: lines)

@@ -1146,6 +1146,10 @@ test.require(codexDesktopAppCommand.contains("persistent.oaistatic.com/codex-app
 test.require(codexDesktopAppCommand.contains("TeamIdentifier") && codexDesktopAppCommand.contains("2DC432GLL2"), "Codex app updater should verify OpenAI's signing team")
 test.require(codexDesktopAppCommand.contains("codesign --verify --deep --strict"), "Codex app updater should verify the downloaded app before installation")
 test.require(codexDesktopAppCommand.contains("Fleetlight-ChatGPT-backup"), "Codex app updater should preserve a rollback copy during installation")
+test.require(codexDesktopAppCommand.contains("/bin/mv \"$staged\" \"$app\""), "Codex app updater should replace the verified bundle with a fast same-volume move")
+test.require(!codexDesktopAppCommand.contains("/usr/bin/ditto \"$staged\" \"$app\""), "Codex app updater should avoid a long partial copy into Applications")
+test.require(codexDesktopAppCommand.contains("after_team=") && codexDesktopAppCommand.contains("UPDATE:rollback-failed"), "Codex app updater should recheck the signing team and report rollback failures precisely")
+test.require(codexDesktopAppCommand.contains("launch_attempt") && codexDesktopAppCommand.contains("launchctl asuser") && codexDesktopAppCommand.contains("RELAUNCH:%s"), "Codex app updater should retry and verify that the app reopened")
 test.require(!codexDesktopAppCommand.contains("System Events"), "Codex app updater should not require macOS UI automation permission")
 test.require(codexDesktopAppCommand.contains("AFTER_BUILD:"), "Codex app updater should verify the installed build after relaunch")
 
@@ -1162,7 +1166,7 @@ test.require(currentCodexDesktopOutcome.activeBuild == "5211", "current Codex ap
 
 let updatedCodexDesktopApp = CommandResult(
     exitCode: 0,
-    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nAFTER_VERSION:26.708.10000\nAFTER_BUILD:5220\nUPDATE:ok\nVERIFY:updated\n",
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nAFTER_VERSION:26.708.10000\nAFTER_BUILD:5220\nRELAUNCH:ok\nUPDATE:ok\nVERIFY:updated\n",
     stderr: "",
     elapsedMilliseconds: 48_000,
     timedOut: false
@@ -1170,6 +1174,17 @@ let updatedCodexDesktopApp = CommandResult(
 let updatedCodexDesktopOutcome = CodexDesktopAppUpdateParser.outcome(from: updatedCodexDesktopApp)
 test.require(updatedCodexDesktopOutcome.status == .updated, "a changed signed app build should be reported as updated")
 test.require(updatedCodexDesktopOutcome.detail.contains("26.708.10000"), "updated Codex app results should name the installed version")
+
+let updatedWithoutRelaunch = CommandResult(
+    exitCode: 0,
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nAFTER_VERSION:26.708.10000\nAFTER_BUILD:5220\nRELAUNCH:failed\nUPDATE:ok\nVERIFY:updated\n",
+    stderr: "",
+    elapsedMilliseconds: 78_000,
+    timedOut: false
+)
+let updatedWithoutRelaunchOutcome = CodexDesktopAppUpdateParser.outcome(from: updatedWithoutRelaunch)
+test.require(updatedWithoutRelaunchOutcome.status == .updated, "a verified install should remain successful when only relaunch fails")
+test.require(updatedWithoutRelaunchOutcome.detail.contains("did not reopen"), "a relaunch failure should be visible instead of silently reported as complete")
 
 let invalidSignatureCodexDesktopApp = CommandResult(
     exitCode: 3,
@@ -1181,6 +1196,18 @@ let invalidSignatureCodexDesktopApp = CommandResult(
 test.require(
     CodexDesktopAppUpdateParser.outcome(from: invalidSignatureCodexDesktopApp).detail.contains("verified"),
     "invalid Codex app downloads should report a verification failure"
+)
+
+let restoredCodexDesktopApp = CommandResult(
+    exitCode: 3,
+    stdout: "FLEETLIGHT_CODEX_APP_UPDATE\nBEFORE_VERSION:26.707.62119\nBEFORE_BUILD:5211\nUPDATE:post-install-invalid\nVERIFY:failed\n",
+    stderr: "",
+    elapsedMilliseconds: 400,
+    timedOut: false
+)
+test.require(
+    CodexDesktopAppUpdateParser.outcome(from: restoredCodexDesktopApp).detail.contains("previous version was restored"),
+    "post-install verification failures should explain that rollback succeeded"
 )
 
 let defaultHost = FleetHost.defaults.first!

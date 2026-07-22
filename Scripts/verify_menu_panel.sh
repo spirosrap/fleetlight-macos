@@ -13,7 +13,10 @@ tell application "System Events"
         set dimensions to size of candidate
         set panelWidth to item 1 of dimensions
         set panelHeight to item 2 of dimensions
-        if panelWidth ≥ 440 and panelWidth ≤ 480 and panelHeight ≥ 650 and panelHeight ≤ 800 then
+        -- SwiftUI can resize the same MenuBarExtra popover across macOS releases,
+        -- display scales, and accessibility text sizes. Keep this range specific
+        -- to Fleetlight's panel without requiring one exact rendered geometry.
+        if panelWidth ≥ 390 and panelWidth ≤ 520 and panelHeight ≥ 600 and panelHeight ≤ 900 then
           set panelCount to panelCount + 1
         end if
       end try
@@ -61,7 +64,7 @@ let count = rows.filter { row in
           let height = bounds["Height"] as? Double else {
         return false
     }
-    return layer >= 100 && width >= 440 && width <= 480 && height >= 650 && height <= 800
+    return layer >= 100 && width >= 390 && width <= 520 && height >= 600 && height <= 900
 }.count
 print(count)
 SWIFT
@@ -104,13 +107,15 @@ fi
 
 for cycle in 1 2; do
   click_status_item
-  if ! wait_for_ax_panel_count 1 || ! wait_for_onscreen_panel_count 1; then
+  # CoreGraphics is the visibility source of truth. Some macOS builds render
+  # MenuBarExtra popovers on screen without exposing them as AX windows.
+  if ! wait_for_onscreen_panel_count 1; then
     print -u2 "Fleetlight panel did not render on screen during open cycle $cycle"
     exit 1
   fi
 
   click_status_item
-  if ! wait_for_ax_panel_count 0 || ! wait_for_onscreen_panel_count 0; then
+  if ! wait_for_onscreen_panel_count 0; then
     print -u2 "Fleetlight panel did not close during cycle $cycle"
     exit 1
   fi

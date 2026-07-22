@@ -1346,6 +1346,9 @@ final class FleetModel: ObservableObject {
             }
 
             let availability = historySummary(for: host.id).availabilityPercent
+            let fleetlightVersion = host.isLocal && host.supportsCodexDesktopApp
+                ? FleetlightVersion.currentDisplayLabel
+                : observerStatusOutcomes[host.id]?.snapshot?.appVersion
             return MobileFeedHost(
                 id: host.id,
                 name: host.displayName,
@@ -1373,6 +1376,8 @@ final class FleetModel: ObservableObject {
                 codexCliVersion: snapshot.codexVersion,
                 codexMacAppVersion: snapshot.codexDesktopAppVersion,
                 codexMacAppBuild: snapshot.codexDesktopAppBuild,
+                fleetlightVersion: fleetlightVersion,
+                isPinned: pinnedHostIDs.contains(host.id),
                 restartRequired: linuxUpdateSnapshots[host.id]?.rebootRequired ?? snapshot.linuxRestartRequired,
                 services: snapshot.services.map {
                     MobileFeedService(
@@ -3231,10 +3236,12 @@ final class FleetModel: ObservableObject {
         }
 
         guard mobileControlJobJournalAvailable else {
-            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal is unavailable; no update was started")
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal is unavailable; no operation was started")
         }
         guard mobileControlActiveJobID == nil,
               !isRefreshing,
+              !isValidatingRoutes,
+              refreshingHostIDs.isEmpty,
               !isAnyUpdateOperationRunning,
               !isCheckingCodexRelease,
               !isCheckingCodexDesktopAppRelease else {
@@ -3270,7 +3277,7 @@ final class FleetModel: ObservableObject {
                 event: "mobile-control-job-rejected",
                 detail: "action=\(job.action.rawValue); reason=journal-write-failed"
             )
-            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal could not be saved; no update was started")
+            return mobileControlError(status: 503, reason: "Service Unavailable", code: "job-journal-unavailable", message: "The request journal could not be saved; no operation was started")
         }
         mobileControlJobs = updatedJobs
         mobileControlActiveJobID = job.id
@@ -3337,7 +3344,8 @@ final class FleetModel: ObservableObject {
         guard let index = mobileControlJobs.firstIndex(where: { $0.id == jobID }),
               mobileControlActiveJobID == jobID else { return }
         mobileControlJobs[index].state = .running
-        mobileControlJobs[index].startedAt = Date()
+        let startedAt = Date()
+        mobileControlJobs[index].startedAt = startedAt
         mobileControlJobs[index].progress = targets.map {
             MobileControlHostProgress(hostId: $0.id, phase: "queued", detail: "Waiting")
         }
@@ -3353,6 +3361,8 @@ final class FleetModel: ObservableObject {
         }
 
         switch action {
+        case .refreshHosts:
+            await refreshHostsFromMobileControl(targets, jobID: jobID, startedAt: startedAt)
         case .codexCLI:
             await performCodexUpdates(on: targets)
         case .codexMacApp:
@@ -3368,6 +3378,107 @@ final class FleetModel: ObservableObject {
         monitor.cancel()
         _ = await monitor.result
         finishMobileControlJob(jobID)
+    }
+
+    private func refreshHostsFromMobileControl(
+        _ targets: [FleetHost],
+        jobID: UUID,
+        startedAt: Date
+    ) async {
+        pollTask?.cancel()
+        pollTask = nil
+        let targetIDs = Set(targets.map(\.id))
+        let hostsByID = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, $0) })
+        let previousSnapshots = snapshots
+        var refreshedSnapshots: [String: HostSnapshot] = [:]
+
+        refreshingHostIDs.formUnion(targetIDs)
+        defer {
+            refreshingHostIDs.subtract(targetIDs)
+            scheduleQueuedRefreshIfNeeded()
+            if started { schedulePolling() }
+        }
+        for host in targets {
+            updateMobileControlRefreshProgress(
+                jobID,
+                MobileControlHostProgress(hostId: host.id, phase: "running", detail: "Running fresh health probe")
+            )
+        }
+
+        await withTaskGroup(of: (String, HostSnapshot).self) { group in
+            for host in targets {
+                group.addTask {
+                    (host.id, await Self.probe(host: host))
+                }
+            }
+
+            for await (hostID, snapshot) in group {
+                guard mobileControlActiveJobID == jobID,
+                      let host = hostsByID[hostID] else { continue }
+                refreshedSnapshots[hostID] = snapshot
+                snapshots[hostID] = snapshot
+                refreshingHostIDs.remove(hostID)
+                await handleTransitions(
+                    host: host,
+                    previous: previousSnapshots[hostID],
+                    current: snapshot,
+                    isInitialRefresh: false
+                )
+                if host.supportsLinuxUpdates,
+                   snapshot.state == .online,
+                   let rebootRequired = snapshot.linuxRestartRequired {
+                    await applyLinuxRestartRequirements([
+                        (host.id, rebootRequired, snapshot.checkedAt ?? Date())
+                    ])
+                }
+                await logProbe(hostID: hostID, snapshot: snapshot)
+                updateMobileControlRefreshProgress(
+                    jobID,
+                    MobileControlRefreshProgress.completed(
+                        hostId: hostID,
+                        state: snapshot.state,
+                        checkedAt: snapshot.checkedAt,
+                        startedAt: startedAt
+                    )
+                )
+            }
+        }
+
+        if !refreshedSnapshots.isEmpty {
+            let historyBatch = await MetricHistoryStore.shared.append(snapshots: refreshedSnapshots)
+            appendHistoryBatch(historyBatch)
+        }
+        let feedPublished = refreshedSnapshots.count == targets.count && publishMobileFeed()
+        if !feedPublished {
+            for host in targets {
+                updateMobileControlRefreshProgress(
+                    jobID,
+                    MobileControlRefreshProgress.publicationFailed(hostId: host.id)
+                )
+            }
+            notice = "Fresh probes completed, but the mobile feed could not be published"
+        } else {
+            notice = "Rechecked \(targets.count) machine\(targets.count == 1 ? "" : "s") from Android"
+        }
+    }
+
+    private func updateMobileControlRefreshProgress(
+        _ jobID: UUID,
+        _ progress: MobileControlHostProgress
+    ) {
+        guard let jobIndex = mobileControlJobs.firstIndex(where: { $0.id == jobID }),
+              mobileControlJobs[jobIndex].action == .refreshHosts,
+              let progressIndex = mobileControlJobs[jobIndex].progress.firstIndex(where: {
+                  $0.hostId == progress.hostId
+              }) else { return }
+        mobileControlJobs[jobIndex].progress[progressIndex] = MobileControlProgressMapper.map(
+            hostId: progress.hostId,
+            phase: progress.phase,
+            detail: progress.detail
+        )
+        mobileControlJobs[jobIndex].completed = mobileControlJobs[jobIndex].progress
+            .filter(MobileControlProgressMapper.isTerminal).count
+        if !MobileControlJobStore.save(mobileControlJobs) { markMobileControlJournalUnavailable() }
     }
 
     private func restartLinuxFromMobileControl(on host: FleetHost, jobID: UUID) async {
@@ -3436,6 +3547,13 @@ final class FleetModel: ObservableObject {
         guard !job.state.isTerminal else { return }
         let progress = job.targetHostIds.map { hostID -> MobileControlHostProgress in
             switch job.action {
+            case .refreshHosts:
+                let value = job.progress.first(where: { $0.hostId == hostID })
+                return MobileControlProgressMapper.map(
+                    hostId: hostID,
+                    phase: value?.phase,
+                    detail: value?.detail
+                )
             case .codexCLI:
                 let value = codexUpdates[hostID]
                 return MobileControlProgressMapper.map(hostId: hostID, phase: value?.phase.rawValue, detail: value?.detail)
@@ -3552,7 +3670,9 @@ final class FleetModel: ObservableObject {
             busy: mobileControlActiveJobID != nil
                 || mobileControlActiveCheckID != nil
                 || isAnyUpdateOperationRunning
-                || isRefreshing,
+                || isRefreshing
+                || isValidatingRoutes
+                || !refreshingHostIDs.isEmpty,
             activeJobId: mobileControlActiveJobID,
             checkingUpdates: mobileControlActiveCheckID != nil,
             activeCheckId: mobileControlActiveCheckID,

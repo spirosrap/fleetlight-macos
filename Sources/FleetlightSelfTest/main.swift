@@ -1788,6 +1788,8 @@ let mobileFeed = MobileFeedDocument(
             health: 91,
             pingMs: 42,
             jitterMs: 7,
+            fleetlightVersion: "v1.0 (1)",
+            isPinned: true,
             services: [
                 MobileFeedService(kind: "example", name: "Example Service", state: "healthy", detail: "Active")
             ],
@@ -1814,7 +1816,11 @@ let decodedMobileFeed = try MobileFeedCodec.decode(mobileFeedData)
 let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
 test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1, "mobile feed schema should round-trip without losing status details")
 test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
+test.require(decodedMobileFeed.hosts.first?.fleetlightVersion == "v1.0 (1)" && decodedMobileFeed.hosts.first?.isPinned == true, "mobile feeds should expose observer versions and pinned-machine priority")
 test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")
+let legacyMobileHostData = Data(#"{"id":"legacy","name":"Legacy Host","platform":"Linux","state":"online","status":"online","detail":"Online","issueTypes":[],"services":[],"warnings":[]}"#.utf8)
+let legacyMobileHost = try decoder.decode(MobileFeedHost.self, from: legacyMobileHostData)
+test.require(legacyMobileHost.fleetlightVersion == nil && legacyMobileHost.isPinned == nil, "older mobile feeds should decode without observer-version or pinned-priority fields")
 let redactedMobileDetail = MobileFeedSanitizer.redact("ssh failed for admin@example.net at 192.0.2.34; see /Users/example/.ssh/config and https://private.example/path")
 test.require(!redactedMobileDetail.contains("admin@example.net") && !redactedMobileDetail.contains("192.0.2.34") && !redactedMobileDetail.contains("/Users/example") && !redactedMobileDetail.contains("https://"), "mobile feed details should redact addresses, accounts, private paths, and URLs")
 
@@ -2076,8 +2082,8 @@ test.require(
     "mobile control should round-trip the typed restart-linux wire action"
 )
 test.require(
-    MobileControlAction.allCases.map(\.rawValue) == ["codex-cli", "codex-mac-app", "linux-os", "restart-linux"],
-    "mobile control should publish all four stable action identifiers"
+    MobileControlAction.allCases.map(\.rawValue) == ["refresh-hosts", "codex-cli", "codex-mac-app", "linux-os", "restart-linux"],
+    "mobile control should publish the read-only refresh action and four maintenance actions"
 )
 test.require(
     MobileControlActionPolicy.acceptsTargetCount(action: .restartLinux, count: 1)
@@ -2086,10 +2092,70 @@ test.require(
     "mobile Linux restarts should require exactly one target and reject restart-all"
 )
 test.require(
-    MobileControlActionPolicy.acceptsTargetCount(action: .codexCLI, count: 2)
+    MobileControlActionPolicy.acceptsTargetCount(action: .refreshHosts, count: 1)
+        && MobileControlActionPolicy.acceptsTargetCount(action: .refreshHosts, count: 8)
+        && !MobileControlActionPolicy.acceptsTargetCount(action: .refreshHosts, count: 0)
+        && MobileControlActionPolicy.acceptsTargetCount(action: .codexCLI, count: 2)
         && MobileControlActionPolicy.acceptsTargetCount(action: .codexMacApp, count: 1)
         && MobileControlActionPolicy.acceptsTargetCount(action: .linuxOS, count: 3),
-    "existing update actions should continue accepting one or more targets"
+    "read-only refresh and existing update actions should accept one or more targets"
+)
+
+func refreshEligibility(online: Bool) -> Bool {
+    MobileControlActionPolicy.isEligible(
+        action: .refreshHosts,
+        hostIsOnline: online,
+        supportsCodexDesktopApp: false,
+        supportsLinuxUpdates: false,
+        codexCliUpdateAvailable: false,
+        codexMacAppUpdateAvailable: false,
+        linuxUpdateAvailable: false,
+        restartRequired: false
+    )
+}
+test.require(
+    refreshEligibility(online: true)
+        && refreshEligibility(online: false)
+        && MobileControlActionPolicy.isSupported(
+            action: .refreshHosts,
+            hostIsOnline: false,
+            supportsCodexDesktopApp: false,
+            supportsLinuxUpdates: false
+        ),
+    "every configured host should support a read-only refresh even when its last result was offline"
+)
+
+let refreshStartedAt = mobileFeedCheckedAt
+let onlineRefreshProgress = MobileControlRefreshProgress.completed(
+    hostId: "online-host",
+    state: .online,
+    checkedAt: refreshStartedAt.addingTimeInterval(1),
+    startedAt: refreshStartedAt
+)
+let offlineRefreshProgress = MobileControlRefreshProgress.completed(
+    hostId: "offline-host",
+    state: .unreachable,
+    checkedAt: refreshStartedAt.addingTimeInterval(2),
+    startedAt: refreshStartedAt
+)
+let staleRefreshProgress = MobileControlRefreshProgress.completed(
+    hostId: "stale-host",
+    state: .online,
+    checkedAt: refreshStartedAt.addingTimeInterval(-1),
+    startedAt: refreshStartedAt
+)
+test.require(
+    onlineRefreshProgress.phase == "succeeded"
+        && onlineRefreshProgress.detail.contains("Online")
+        && offlineRefreshProgress.phase == "succeeded"
+        && offlineRefreshProgress.detail.contains("Offline")
+        && staleRefreshProgress.phase == "failed"
+        && MobileControlRefreshProgress.publicationFailed(hostId: "example-host").phase == "failed",
+    "refresh jobs should accept fresh offline results while rejecting stale or unpublished results"
+)
+test.require(
+    MobileControlInterruption.detail(for: .refreshHosts).contains("fresh results"),
+    "interrupted refresh jobs should retain truthful read-only recovery wording"
 )
 
 func restartEligibility(
@@ -2179,7 +2245,7 @@ let restartCapability = MobileControlHostCapability(
     hostId: "example-host",
     hostName: "Example Host",
     state: "online",
-    actions: [.codexCLI, .linuxOS, .restartLinux],
+    actions: [.refreshHosts, .codexCLI, .linuxOS, .restartLinux],
     codexCliUpdateAvailable: false,
     codexMacAppUpdateAvailable: false,
     linuxUpdateAvailable: false,
@@ -2192,6 +2258,7 @@ test.require(
     decodedRestartCapability == restartCapability
         && decodedRestartCapability.restartRequired
         && decodedRestartCapability.linuxCheckedAt == mobileFeedCheckedAt
+        && decodedRestartCapability.actions.contains(.refreshHosts)
         && decodedRestartCapability.actions.contains(.restartLinux),
     "mobile capabilities should expose supported actions and restart-required state independently"
 )

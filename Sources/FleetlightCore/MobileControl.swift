@@ -47,6 +47,7 @@ public struct MobileControlPairResponse: Codable, Equatable, Sendable {
 }
 
 public enum MobileControlAction: String, Codable, CaseIterable, Sendable {
+    case refreshHosts = "refresh-hosts"
     case codexCLI = "codex-cli"
     case codexMacApp = "codex-mac-app"
     case linuxOS = "linux-os"
@@ -58,7 +59,7 @@ public enum MobileControlActionPolicy {
         switch action {
         case .restartLinux:
             count == 1
-        case .codexCLI, .codexMacApp, .linuxOS:
+        case .refreshHosts, .codexCLI, .codexMacApp, .linuxOS:
             count > 0
         }
     }
@@ -70,6 +71,8 @@ public enum MobileControlActionPolicy {
         supportsLinuxUpdates: Bool
     ) -> Bool {
         switch action {
+        case .refreshHosts:
+            true
         case .codexCLI:
             true
         case .codexMacApp:
@@ -92,6 +95,8 @@ public enum MobileControlActionPolicy {
         restartRequired: Bool
     ) -> Bool {
         switch action {
+        case .refreshHosts:
+            true
         case .codexCLI:
             codexCliUpdateAvailable
         case .codexMacApp:
@@ -476,6 +481,44 @@ public enum MobileControlProgressMapper {
     }
 }
 
+public enum MobileControlRefreshProgress {
+    public static func completed(
+        hostId: String,
+        state: HostState,
+        checkedAt: Date?,
+        startedAt: Date
+    ) -> MobileControlHostProgress {
+        guard let checkedAt, checkedAt >= startedAt else {
+            return MobileControlHostProgress(
+                hostId: hostId,
+                phase: "failed",
+                detail: "A fresh probe result was not recorded"
+            )
+        }
+
+        let stateLabel: String
+        switch state {
+        case .online: stateLabel = "Online"
+        case .unreachable: stateLabel = "Offline"
+        case .checking: stateLabel = "Checking"
+        case .waking: stateLabel = "Waking"
+        }
+        return MobileControlHostProgress(
+            hostId: hostId,
+            phase: "succeeded",
+            detail: "Fresh result · \(stateLabel)"
+        )
+    }
+
+    public static func publicationFailed(hostId: String) -> MobileControlHostProgress {
+        MobileControlHostProgress(
+            hostId: hostId,
+            phase: "failed",
+            detail: "Fresh probe completed, but the mobile feed could not be published"
+        )
+    }
+}
+
 public enum MobileControlLinuxRestartDecision: Equatable, Sendable {
     case proceed
     case skipNoLongerRequired
@@ -506,9 +549,14 @@ public enum MobileControlLinuxRestartPreflight {
 
 public enum MobileControlInterruption {
     public static func detail(for action: MobileControlAction) -> String {
-        action == .restartLinux
-            ? "Controller restarted; restart outcome unknown — verify before retrying"
-            : "Not completed because the controller restarted"
+        switch action {
+        case .refreshHosts:
+            "Controller restarted before fresh results were published"
+        case .restartLinux:
+            "Controller restarted; restart outcome unknown — verify before retrying"
+        case .codexCLI, .codexMacApp, .linuxOS:
+            "Not completed because the controller restarted"
+        }
     }
 }
 

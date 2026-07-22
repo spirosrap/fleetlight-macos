@@ -101,6 +101,8 @@ public struct MobileFeedHost: Codable, Equatable, Sendable {
     public let codexCliVersion: String?
     public let codexMacAppVersion: String?
     public let codexMacAppBuild: String?
+    public let fleetlightVersion: String?
+    public let isPinned: Bool?
     public let restartRequired: Bool?
     public let services: [MobileFeedService]
     public let warnings: [MobileFeedWarning]
@@ -128,6 +130,8 @@ public struct MobileFeedHost: Codable, Equatable, Sendable {
         codexCliVersion: String? = nil,
         codexMacAppVersion: String? = nil,
         codexMacAppBuild: String? = nil,
+        fleetlightVersion: String? = nil,
+        isPinned: Bool? = nil,
         restartRequired: Bool? = nil,
         services: [MobileFeedService] = [],
         warnings: [MobileFeedWarning] = []
@@ -154,6 +158,8 @@ public struct MobileFeedHost: Codable, Equatable, Sendable {
         self.codexCliVersion = codexCliVersion
         self.codexMacAppVersion = codexMacAppVersion
         self.codexMacAppBuild = codexMacAppBuild
+        self.fleetlightVersion = fleetlightVersion
+        self.isPinned = isPinned
         self.restartRequired = restartRequired
         self.services = services
         self.warnings = warnings

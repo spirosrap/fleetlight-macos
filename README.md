@@ -36,6 +36,15 @@ To use a Developer ID or local development certificate:
 APP_IDENTITY="Your Signing Identity" ./Scripts/build_app.sh
 ```
 
+Install or replace the app with a clean menu-scene handoff, then verify that its panel is genuinely rendered on screen:
+
+```sh
+./Scripts/install_and_launch.sh
+./Scripts/verify_menu_panel.sh
+```
+
+The optional panel smoke test uses System Events and therefore needs Accessibility permission for the terminal running it; Fleetlight itself does not.
+
 ## Configure your fleet
 
 On first launch Fleetlight creates:

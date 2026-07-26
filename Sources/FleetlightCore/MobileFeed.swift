@@ -280,6 +280,7 @@ public struct MobileFeedMetric: Codable, Equatable, Sendable {
 public struct MobileFeedDocument: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let generatedAt: Date
+    public let metricsWindowHours: Int?
     public let observer: MobileFeedObserver
     public let summary: MobileFeedSummary
     public let hosts: [MobileFeedHost]
@@ -289,6 +290,7 @@ public struct MobileFeedDocument: Codable, Equatable, Sendable {
 
     public init(
         generatedAt: Date = Date(),
+        metricsWindowHours: Int? = nil,
         observer: MobileFeedObserver,
         summary: MobileFeedSummary,
         hosts: [MobileFeedHost],
@@ -298,6 +300,7 @@ public struct MobileFeedDocument: Codable, Equatable, Sendable {
     ) {
         schemaVersion = 1
         self.generatedAt = generatedAt
+        self.metricsWindowHours = metricsWindowHours
         self.observer = observer
         self.summary = summary
         self.hosts = hosts

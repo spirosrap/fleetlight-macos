@@ -1456,6 +1456,7 @@ final class FleetModel: ObservableObject {
         let document = MobileFeedDocument(
             generatedAt: Date(),
             metricsWindowHours: 24,
+            metricsSampleIntervalSeconds: max(Int(refreshInterval.rounded()), 30 * 60),
             observer: MobileFeedObserver(
                 id: FleetObserver.currentDisplayName.lowercased(),
                 name: FleetObserver.currentDisplayName,

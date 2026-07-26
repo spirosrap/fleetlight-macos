@@ -110,7 +110,7 @@ Supported machine fields:
 - Privacy-safe observer snapshots, one-minute heartbeats, and a visible agreement check, so two Macs running Fleetlight expose genuinely stale or contradictory restart summaries instead of silently showing different answers
 - An atomic, versioned mobile feed for the Fleetlight Android companion, designed for tailnet-only delivery without placing fleet SSH keys or sudo credentials on the phone
 - Per-Mac Fleetlight versions and pinned-machine priority in the mobile feed, so Android mirrors the observer identity and ordering chosen on macOS
-- Explicit 24-hour metric coverage metadata for mobile Trends, keeping shorter Android windows honest without stretching or reordering samples
+- Explicit 24-hour metric coverage and effective published sampling cadence for mobile Trends, enabling truthful freshness measurement and gap-safe charts after downsampling
 - Optional Android maintenance control through one designated Mac observer, with short-lived pairing, per-device credentials, explicit target confirmation, idempotent jobs, sequential Codex CLI/Codex Mac app/Linux OS execution, confirmed individual Linux restarts, and live per-machine results
 - Authenticated read-only Android rechecks for one machine or the visible fleet, with fresh Online or Offline results and one atomic feed publication without package or release audits
 - Shared local and authenticated Android read-only update checks that asynchronously force fresh installed-version probes, npm and official Mac app release lookups, Linux package checks with one retry for transient connection failures, and mobile-feed publication without installing, updating, or restarting anything

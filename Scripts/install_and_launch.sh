@@ -137,9 +137,9 @@ fi
 
 launched_pid=""
 health_ready=0
-# Slower observers can need more than eight seconds after a cold bundle swap.
-# Keep polling quickly, but allow enough headroom before a protective rollback.
-for (( attempt = 1; attempt <= 200; attempt++ )); do
+# Large metric journals can make an observer need more than 20 seconds after a
+# cold bundle swap. Keep polling quickly, but retain a bounded rollback window.
+for (( attempt = 1; attempt <= 600; attempt++ )); do
   launched_pid="$(pgrep -x Fleetlight | head -1 || true)"
   if [[ -n "$launched_pid" ]] && curl --silent --fail --max-time 0.5 http://127.0.0.1:8787/health \
       | grep -Fq '"status":"ok"'; then

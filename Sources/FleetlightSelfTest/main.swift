@@ -1760,6 +1760,7 @@ let mobileFeedCheckedAt = Date(timeIntervalSince1970: 1_720_000_000)
 let mobileFeed = MobileFeedDocument(
     generatedAt: mobileFeedCheckedAt,
     metricsWindowHours: 24,
+    metricsSampleIntervalSeconds: 1_800,
     observer: MobileFeedObserver(
         id: "observer-one",
         name: "Observer One",
@@ -1815,7 +1816,7 @@ let mobileFeed = MobileFeedDocument(
 let mobileFeedData = try MobileFeedCodec.encode(mobileFeed)
 let decodedMobileFeed = try MobileFeedCodec.decode(mobileFeedData)
 let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
-test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1 && decodedMobileFeed.metricsWindowHours == 24, "mobile feed schema should round-trip status details and explicit metric coverage")
+test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1 && decodedMobileFeed.metricsWindowHours == 24 && decodedMobileFeed.metricsSampleIntervalSeconds == 1_800, "mobile feed schema should round-trip explicit metric coverage and effective published cadence")
 test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
 test.require(decodedMobileFeed.hosts.first?.fleetlightVersion == "v1.0 (1)" && decodedMobileFeed.hosts.first?.isPinned == true, "mobile feeds should expose observer versions and pinned-machine priority")
 test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")

@@ -2566,6 +2566,19 @@ private struct TrendsView: View {
         return model.chartSamples(for: host.id, hours: selectedRange.hours, maxPoints: 360)
     }
 
+    private var maximumTrendLineGap: TimeInterval {
+        max(90, model.refreshInterval * 3)
+    }
+
+    private func lineSegments(where isRenderable: (MetricSample) -> Bool) -> [[MetricSample]] {
+        TrendLineSegmenter.segments(
+            source: samples,
+            rendered: chartSamples,
+            maximumGap: maximumTrendLineGap,
+            isRenderable: isRenderable
+        )
+    }
+
     private var statistics: HistorySummary {
         guard let host else { return HistoryAnalyzer.summary(samples: []) }
         return model.historySummary(for: host.id, hours: selectedRange.hours)
@@ -2765,7 +2778,9 @@ private struct TrendsView: View {
     }
 
     private var pingChart: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let pingSegments = lineSegments { $0.state == .online && $0.pingMilliseconds != nil }
+        let jitterSegments = lineSegments { $0.state == .online && $0.pingJitterMilliseconds != nil }
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Network quality")
                     .font(.caption.weight(.semibold))
@@ -2778,27 +2793,33 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(chartSamples.filter { $0.pingMilliseconds != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Milliseconds", sample.pingMilliseconds ?? 0),
-                        series: .value("Network metric", "Ping RTT")
-                    )
-                    .interpolationMethod(.linear)
-                    .foregroundStyle(.green)
-                    .lineStyle(StrokeStyle(lineWidth: 2))
-                    .symbol(.circle)
-                    .symbolSize(28)
+                ForEach(Array(pingSegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Milliseconds", sample.pingMilliseconds ?? 0),
+                            series: .value("Network metric", "Ping RTT \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.green)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                        .symbol(.circle)
+                        .symbolSize(28)
+                    }
                 }
-                ForEach(chartSamples.filter { $0.pingJitterMilliseconds != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Milliseconds", sample.pingJitterMilliseconds ?? 0),
-                        series: .value("Network metric", "Jitter")
-                    )
-                    .interpolationMethod(.linear)
-                    .foregroundStyle(.cyan)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+                ForEach(Array(jitterSegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Milliseconds", sample.pingJitterMilliseconds ?? 0),
+                            series: .value("Network metric", "Jitter \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.cyan)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
                 ForEach(chartSamples.filter { ($0.packetLossPercent ?? 0) > 0 }) { sample in
                     RuleMark(x: .value("Packet loss", sample.timestamp))
@@ -2823,7 +2844,7 @@ private struct TrendsView: View {
             .chartXSelection(value: $selectedTimestamp)
             .frame(height: 155)
 
-            Label("Left to right is time. Solid = ping, dashed = jitter, red = packet loss.", systemImage: "info.circle")
+            Label("Left to right is time. Blank spans mean no verified samples; red marks packet loss.", systemImage: "info.circle")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             coverageNotice(
@@ -2840,7 +2861,8 @@ private struct TrendsView: View {
     }
 
     private var connectionReadyChart: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let readySegments = lineSegments { $0.state == .online && $0.connectionReadyMilliseconds != nil }
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(host?.isLocal == true ? "Process ready time" : "SSH ready time")
                     .font(.caption.weight(.semibold))
@@ -2852,14 +2874,18 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(chartSamples.filter { $0.state == .online && $0.connectionReadyMilliseconds != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Milliseconds", sample.connectionReadyMilliseconds ?? 0),
-                        series: .value("Timing", "Ready")
-                    )
-                    .interpolationMethod(.catmullRom)
-                    .foregroundStyle(.blue)
+                ForEach(Array(readySegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Milliseconds", sample.connectionReadyMilliseconds ?? 0),
+                            series: .value("Timing", "Ready \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.blue)
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
                 ForEach(chartSamples.filter { $0.state == .unreachable }) { sample in
                     RuleMark(x: .value("Unreachable", sample.timestamp))
@@ -2897,7 +2923,9 @@ private struct TrendsView: View {
     }
 
     private var probeDurationChart: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let probeSegments = lineSegments { $0.state == .online && $0.effectiveProbeDurationMilliseconds != nil }
+        let workSegments = lineSegments { $0.state == .online && $0.probeWorkMilliseconds != nil }
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Full probe and checks")
                     .font(.caption.weight(.semibold))
@@ -2909,23 +2937,31 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(chartSamples.filter { $0.state == .online && $0.effectiveProbeDurationMilliseconds != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Milliseconds", sample.effectiveProbeDurationMilliseconds ?? 0),
-                        series: .value("Timing", "Full probe")
-                    )
-                    .interpolationMethod(.catmullRom)
-                    .foregroundStyle(.orange)
+                ForEach(Array(probeSegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Milliseconds", sample.effectiveProbeDurationMilliseconds ?? 0),
+                            series: .value("Timing", "Full probe \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.orange)
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
-                ForEach(chartSamples.filter { $0.state == .online && $0.probeWorkMilliseconds != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Milliseconds", sample.probeWorkMilliseconds ?? 0),
-                        series: .value("Timing", "Checks")
-                    )
-                    .interpolationMethod(.catmullRom)
-                    .foregroundStyle(.purple)
+                ForEach(Array(workSegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Milliseconds", sample.probeWorkMilliseconds ?? 0),
+                            series: .value("Timing", "Checks \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.purple)
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
                 if let selectedSample {
                     RuleMark(x: .value("Selected time", selectedSample.timestamp))
@@ -2960,7 +2996,9 @@ private struct TrendsView: View {
     }
 
     private var resourceChart: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let diskSegments = lineSegments { $0.state == .online && $0.diskPercent != nil }
+        let memorySegments = lineSegments { $0.state == .online && $0.memoryPercent != nil }
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Resource usage")
                     .font(.caption.weight(.semibold))
@@ -2974,21 +3012,31 @@ private struct TrendsView: View {
                 .font(.caption2)
             }
             Chart {
-                ForEach(chartSamples.filter { $0.diskPercent != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Percent", sample.diskPercent ?? 0),
-                        series: .value("Resource", "Disk")
-                    )
-                    .foregroundStyle(.orange)
+                ForEach(Array(diskSegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Percent", sample.diskPercent ?? 0),
+                            series: .value("Resource", "Disk \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.orange)
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
-                ForEach(chartSamples.filter { $0.memoryPercent != nil }) { sample in
-                    LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value("Percent", sample.memoryPercent ?? 0),
-                        series: .value("Resource", "Memory")
-                    )
-                    .foregroundStyle(.purple)
+                ForEach(Array(memorySegments.enumerated()), id: \.offset) { segmentIndex, segment in
+                    ForEach(segment) { sample in
+                        LineMark(
+                            x: .value("Time", sample.timestamp),
+                            y: .value("Percent", sample.memoryPercent ?? 0),
+                            series: .value("Resource", "Memory \(segmentIndex)")
+                        )
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(.purple)
+                        .symbol(.circle)
+                        .symbolSize(18)
+                    }
                 }
                 if let selectedSample {
                     RuleMark(x: .value("Selected time", selectedSample.timestamp))

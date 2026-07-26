@@ -1882,6 +1882,42 @@ public enum TrendSampleDownsampler {
     }
 }
 
+public enum TrendLineSegmenter {
+    public static func segments(
+        source: [MetricSample],
+        rendered: [MetricSample],
+        maximumGap: TimeInterval,
+        isRenderable: (MetricSample) -> Bool
+    ) -> [[MetricSample]] {
+        guard maximumGap > 0, !source.isEmpty, !rendered.isEmpty else { return [] }
+        let renderedIDs = Set(rendered.map(\.id))
+        var result: [[MetricSample]] = []
+        var current: [MetricSample] = []
+        var previousTimestamp: Date?
+
+        func finishCurrent() {
+            if !current.isEmpty { result.append(current) }
+            current.removeAll(keepingCapacity: true)
+        }
+
+        for sample in source {
+            guard isRenderable(sample) else {
+                finishCurrent()
+                previousTimestamp = nil
+                continue
+            }
+            if let previousTimestamp {
+                let gap = sample.timestamp.timeIntervalSince(previousTimestamp)
+                if gap <= 0 || gap > maximumGap { finishCurrent() }
+            }
+            if renderedIDs.contains(sample.id) { current.append(sample) }
+            previousTimestamp = sample.timestamp
+        }
+        finishCurrent()
+        return result
+    }
+}
+
 public enum IncidentKind: String, Codable, Sendable {
     case hostDown
     case hostRecovered

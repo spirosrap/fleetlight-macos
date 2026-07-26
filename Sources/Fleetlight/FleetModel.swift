@@ -87,7 +87,7 @@ final class FleetModel: ObservableObject {
     @Published var notificationsEnabled: Bool
     @Published var codexUpdateAlertsEnabled: Bool
     @Published private(set) var performanceThresholds: PerformanceThresholds
-    @Published private(set) var mobileControlPairedDeviceCount = MobileControlCredentialStore.shared.count()
+    @Published private(set) var mobileControlPairedDeviceCount = 0
     @Published private(set) var mobileControlCommandAuthorityEnabled = UserDefaults.standard.bool(
         forKey: "mobileControlCommandAuthorityEnabled"
     )
@@ -101,6 +101,7 @@ final class FleetModel: ObservableObject {
     private var routeValidationTask: Task<Void, Never>?
     private var queuedRefreshTask: Task<Void, Never>?
     private var mobileControlPairingExpiryTask: Task<Void, Never>?
+    private var mobileControlCredentialCountTask: Task<Void, Never>?
     private var refreshRequestQueue = RefreshRequestQueue()
     private var linuxRefreshDeferralDepth = 0
     private var failureCounts: [String: Int] = [:]
@@ -184,6 +185,7 @@ final class FleetModel: ObservableObject {
         routeValidationTask?.cancel()
         queuedRefreshTask?.cancel()
         mobileControlPairingExpiryTask?.cancel()
+        mobileControlCredentialCountTask?.cancel()
     }
 
     var attentionSummary: FleetAttentionSummary {
@@ -659,6 +661,13 @@ final class FleetModel: ObservableObject {
                 return await self.handleLocalMobilePairingStartRequest(request)
             }
         )
+        mobileControlCredentialCountTask = Task { @MainActor [weak self] in
+            let count = await Task.detached(priority: .utility) {
+                MobileControlCredentialStore.shared.count()
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.mobileControlPairedDeviceCount = count
+        }
         scheduleObserverHeartbeat()
         let startupStartedAt = DispatchTime.now().uptimeNanoseconds
         launchAtLogin = SMAppService.mainApp.status == .enabled

@@ -1324,6 +1324,32 @@ test.require(downsampledTrendHistory.contains(where: { $0.pingMilliseconds == 9_
 test.require(downsampledTrendHistory.contains(where: { $0.state == .unreachable }), "trend downsampling should preserve outages")
 test.require(downsampledTrendHistory.contains(where: { ($0.packetLossPercent ?? 0) > 0 }), "trend downsampling should preserve packet loss")
 test.require(TrendSampleDownsampler.downsample(Array(largeTrendHistory.prefix(50)), maxPoints: 600) == Array(largeTrendHistory.prefix(50)), "small trend sets should remain unchanged")
+let segmentStart = windowNow.addingTimeInterval(-1_000)
+let segmentSource = [
+    MetricSample(timestamp: segmentStart, hostID: "example", state: .online, pingMilliseconds: 20),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(60), hostID: "example", state: .online, pingMilliseconds: 21),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(120), hostID: "example", state: .unreachable),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(180), hostID: "example", state: .online, pingMilliseconds: 22),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(240), hostID: "example", state: .online),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(300), hostID: "example", state: .online, pingMilliseconds: 23),
+    MetricSample(timestamp: segmentStart.addingTimeInterval(700), hostID: "example", state: .online, pingMilliseconds: 24),
+]
+let segmentRendered = [segmentSource[0], segmentSource[1], segmentSource[3], segmentSource[5], segmentSource[6]]
+let gapSafeSegments = TrendLineSegmenter.segments(
+    source: segmentSource,
+    rendered: segmentRendered,
+    maximumGap: 180,
+    isRenderable: { $0.state == .online && $0.pingMilliseconds != nil }
+)
+test.require(gapSafeSegments.map(\.count) == [2, 1, 1, 1], "trend lines should split at outages, missing metric values, and excessive time gaps")
+test.require(gapSafeSegments.flatMap { $0 }.map(\.id) == segmentRendered.map(\.id), "gap-safe trend segments should preserve rendered point order and endpoints")
+let continuousRendered = [segmentSource[0], segmentSource[3]]
+let continuousSource = [segmentSource[0], segmentSource[1], MetricSample(timestamp: segmentStart.addingTimeInterval(120), hostID: "example", state: .online, pingMilliseconds: 21), segmentSource[3]]
+test.require(
+    TrendLineSegmenter.segments(source: continuousSource, rendered: continuousRendered, maximumGap: 180, isRenderable: { $0.pingMilliseconds != nil }).map(\.count) == [2],
+    "downsampled points should remain connected when full-resolution samples prove continuity"
+)
+test.require(TrendLineSegmenter.segments(source: segmentSource, rendered: segmentRendered, maximumGap: 180, isRenderable: { _ in false }).isEmpty, "all-missing trend series should produce no line segments")
 var sustainedLossHistory: [MetricSample] = []
 sustainedLossHistory.reserveCapacity(10_000)
 for index in 0..<10_000 {

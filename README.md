@@ -129,6 +129,8 @@ Supported machine fields:
 - Configurable performance-warning thresholds
 - Runtime host detection for portable fleet configurations, with direct local monitoring and no SSH loopback on whichever configured Mac is running Fleetlight
 - Seven-day local metric history with 1-hour, 6-hour, 24-hour, and 7-day charts
+- Gap-safe linear trend segments that leave outages, missing values, and long collection gaps visibly blank instead of bridging them with invented curves
+- Non-blocking Keychain initialization so the menu and health endpoint become ready even when macOS is awaiting credential approval
 - Launch-time history hydration runs alongside live probes, with an off-main-thread per-host index and no redundant global sample copy
 - Indexed windows, one-pass cached statistics, binary cursor lookup, lazy chart construction, and event-aware 360-point rendering keep seven-day Trends smooth without hiding outages, packet loss, or timing spikes
 - Live fleet timing comparison and plain-language network diagnosis

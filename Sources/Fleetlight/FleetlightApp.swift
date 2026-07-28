@@ -2316,11 +2316,11 @@ private struct CompareView: View {
         ranks.filter { $0.snapshot.state == .online && $0.valueMilliseconds != nil }
     }
 
-    private var best: FleetTimingRank? { measuredRanks.first }
-
-    private var worst: FleetTimingRank? {
-        measuredRanks.max { ($0.valueMilliseconds ?? 0) < ($1.valueMilliseconds ?? 0) }
+    private var summary: FleetTimingSummary {
+        FleetTimingSummary(ranks: ranks)
     }
+
+    private var best: FleetTimingRank? { measuredRanks.first }
 
     private var maximumValue: Int {
         max(1, measuredRanks.compactMap(\.valueMilliseconds).max() ?? 1)
@@ -2383,29 +2383,35 @@ private struct CompareView: View {
     }
 
     private var comparisonSummary: some View {
-        HStack(spacing: 8) {
-            TrendStatCard(
-                title: "Fastest",
-                value: best?.host.displayName ?? "—",
-                systemImage: "hare"
-            )
-            TrendStatCard(
-                title: "Best value",
-                value: best?.valueMilliseconds.map(durationLabel) ?? "—",
-                systemImage: "timer"
-            )
-            TrendStatCard(
-                title: "Spread",
-                value: spreadLabel,
-                systemImage: "arrow.left.and.right"
-            )
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                TrendStatCard(
+                    title: "Fastest",
+                    value: best?.host.displayName ?? "—",
+                    systemImage: "hare"
+                )
+                TrendStatCard(
+                    title: "Typical",
+                    value: summary.medianMilliseconds.map(durationLabel) ?? "—",
+                    systemImage: "timer"
+                )
+                TrendStatCard(
+                    title: "Spread",
+                    value: summary.spreadMilliseconds.map(durationLabel) ?? "—",
+                    systemImage: "arrow.left.and.right"
+                )
+            }
+
+            Label(comparisonContext, systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
-    private var spreadLabel: String {
-        guard let bestValue = best?.valueMilliseconds,
-              let worstValue = worst?.valueMilliseconds else { return "—" }
-        return durationLabel(max(0, worstValue - bestValue))
+    private var comparisonContext: String {
+        let machineLabel = summary.comparableCount == 1 ? "remote machine" : "remote machines"
+        let localContext = ranks.contains(where: { $0.host.isLocal }) ? " · local observer excluded" : ""
+        return "\(summary.measuredCount) of \(summary.comparableCount) \(machineLabel) measured\(localContext)"
     }
 
     private func durationLabel(_ milliseconds: Int) -> String {

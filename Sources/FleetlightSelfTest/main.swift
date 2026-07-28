@@ -1385,6 +1385,12 @@ let pingRanks = FleetTimingRanker.rank(
 )
 test.require(pingRanks.map(\.host.id) == ["fast", "slow", "offline"], "online machines should rank before unreachable machines")
 test.require(pingRanks.map(\.valueMilliseconds) == [20, 80, 10], "timing rank should retain measured values")
+let pingSummary = FleetTimingSummary(ranks: pingRanks)
+test.require(pingSummary.measuredCount == 2, "timing summary should count only online measurements")
+test.require(pingSummary.comparableCount == 3, "timing summary should count all remote comparison candidates")
+test.require(pingSummary.bestMilliseconds == 20, "timing summary should retain the best measured value")
+test.require(pingSummary.medianMilliseconds == 50, "timing summary should average the two middle values")
+test.require(pingSummary.spreadMilliseconds == 60, "timing summary should measure the best-to-worst spread")
 let readyRanks = FleetTimingRanker.rank(
     hosts: [slowHost, fastHost],
     snapshots: comparisonSnapshots,
@@ -1402,6 +1408,14 @@ let localComparison = FleetTimingRanker.rank(
 )
 test.require(localComparison.first?.host.id == "fast", "local process startup must not outrank remote SSH timing")
 test.require(localComparison.last?.valueMilliseconds == nil, "local timing should be marked not comparable")
+let localComparisonSummary = FleetTimingSummary(ranks: localComparison)
+test.require(localComparisonSummary.measuredCount == 1, "local observer timing should not be counted as a measurement")
+test.require(localComparisonSummary.comparableCount == 1, "local observer should not be counted as a comparable machine")
+let roundedMedianSummary = FleetTimingSummary(ranks: [
+    FleetTimingRank(host: fastHost, snapshot: comparisonSnapshots["fast"]!, valueMilliseconds: 20),
+    FleetTimingRank(host: slowHost, snapshot: comparisonSnapshots["slow"]!, valueMilliseconds: 81),
+])
+test.require(roundedMedianSummary.medianMilliseconds == 51, "an even median should round a half millisecond to the nearest whole millisecond")
 let checkRanks = FleetTimingRanker.rank(
     hosts: [slowHost, fastHost],
     snapshots: comparisonSnapshots,

@@ -133,7 +133,7 @@ Supported machine fields:
 - Non-blocking Keychain initialization so the menu and health endpoint become ready even when macOS is awaiting credential approval
 - Launch-time history hydration runs alongside live probes, with an off-main-thread per-host index and no redundant global sample copy
 - Indexed windows, one-pass cached statistics, binary cursor lookup, lazy chart construction, and event-aware 360-point rendering keep seven-day Trends smooth without hiding outages, packet loss, or timing spikes
-- Live fleet timing comparison and plain-language network diagnosis
+- Live fleet timing comparison with a typical median baseline, measured-machine coverage, and plain-language network diagnosis
 - Actionable SSH diagnosis for authentication, host-key, DNS, refused, timeout, route, and early-close errors, plus interactive Terminal troubleshooting from Access-state cards
 - Thirty-day incident history with restart-safe active issue reconstruction
 - Optional notifications for confirmed outages, recoveries, and service transitions

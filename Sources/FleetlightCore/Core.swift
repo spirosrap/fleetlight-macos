@@ -1207,6 +1207,45 @@ public struct FleetTimingRank: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct FleetTimingSummary: Equatable, Sendable {
+    public let measuredCount: Int
+    public let comparableCount: Int
+    public let bestMilliseconds: Int?
+    public let medianMilliseconds: Int?
+    public let spreadMilliseconds: Int?
+
+    public init(ranks: [FleetTimingRank]) {
+        comparableCount = ranks.filter { !$0.host.isLocal }.count
+
+        let values = ranks.compactMap { rank -> Int? in
+            guard !rank.host.isLocal,
+                  rank.snapshot.state == .online else { return nil }
+            return rank.valueMilliseconds
+        }
+        .sorted()
+
+        measuredCount = values.count
+        bestMilliseconds = values.first
+        spreadMilliseconds = values.first.flatMap { best in
+            values.last.map { max(0, $0 - best) }
+        }
+
+        guard !values.isEmpty else {
+            medianMilliseconds = nil
+            return
+        }
+
+        let midpoint = values.count / 2
+        if values.count.isMultiple(of: 2) {
+            medianMilliseconds = Int(
+                ((Double(values[midpoint - 1]) + Double(values[midpoint])) / 2).rounded()
+            )
+        } else {
+            medianMilliseconds = values[midpoint]
+        }
+    }
+}
+
 public enum FleetTimingRanker {
     public static func rank(
         hosts: [FleetHost],

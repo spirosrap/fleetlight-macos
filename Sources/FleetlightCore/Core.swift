@@ -1191,19 +1191,97 @@ public enum FleetTimingMetric: String, CaseIterable, Identifiable, Sendable {
         case .fullProbe: snapshot.probeDurationMilliseconds
         }
     }
+
+    public func value(in sample: MetricSample) -> Int? {
+        switch self {
+        case .ping: sample.pingMilliseconds
+        case .connectionReady: sample.connectionReadyMilliseconds
+        case .checks: sample.probeWorkMilliseconds
+        case .fullProbe: sample.effectiveProbeDurationMilliseconds
+        }
+    }
+}
+
+public enum FleetTimingEvidence: Equatable, Sendable {
+    case live
+    case history(sampleCount: Int)
+
+    public var sampleCount: Int? {
+        if case let .history(sampleCount) = self { return sampleCount }
+        return nil
+    }
+}
+
+public struct FleetTimingHistoryMeasurement: Equatable, Sendable {
+    public let averageMilliseconds: Int?
+    public let sampleCount: Int
+
+    public init(averageMilliseconds: Int?, sampleCount: Int) {
+        self.averageMilliseconds = averageMilliseconds
+        self.sampleCount = sampleCount
+    }
+}
+
+public enum FleetTimingHistoryAnalyzer {
+    private struct SampleKey: Hashable {
+        let hostID: String
+        let timestamp: Date
+    }
+
+    public static func summarize(
+        samples: [MetricSample],
+        metric: FleetTimingMetric,
+        endAt: Date = Date()
+    ) -> FleetTimingHistoryMeasurement {
+        let groupedValues = Dictionary(grouping: samples.compactMap { sample -> (SampleKey, Int)? in
+            guard sample.timestamp <= endAt,
+                  sample.state == .online,
+                  let value = metric.value(in: sample),
+                  value >= 0 else { return nil }
+            return (SampleKey(hostID: sample.hostID, timestamp: sample.timestamp), value)
+        }, by: \.0)
+        let values = groupedValues.values.map { duplicateSamples in
+            let duplicateValues = duplicateSamples.map(\.1)
+            let average = Double(duplicateValues.reduce(0, +)) / Double(duplicateValues.count)
+            return Int(average.rounded())
+        }
+        guard !values.isEmpty else {
+            return FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+        }
+        let average = Double(values.reduce(0, +)) / Double(values.count)
+        return FleetTimingHistoryMeasurement(
+            averageMilliseconds: Int(average.rounded()),
+            sampleCount: values.count
+        )
+    }
 }
 
 public struct FleetTimingRank: Identifiable, Equatable, Sendable {
     public let host: FleetHost
     public let snapshot: HostSnapshot
     public let valueMilliseconds: Int?
+    public let evidence: FleetTimingEvidence
 
     public var id: String { host.id }
 
-    public init(host: FleetHost, snapshot: HostSnapshot, valueMilliseconds: Int?) {
+    public var isMeasured: Bool {
+        guard valueMilliseconds != nil else { return false }
+        switch evidence {
+        case .live: return snapshot.state == .online
+        case let .history(sampleCount): return sampleCount > 0
+        }
+    }
+
+    public init(
+        host: FleetHost,
+        snapshot: HostSnapshot,
+        valueMilliseconds: Int?,
+        evidence: FleetTimingEvidence = .live
+    ) {
         self.host = host
         self.snapshot = snapshot
         self.valueMilliseconds = valueMilliseconds
+        self.evidence = evidence
     }
 }
 
@@ -1218,8 +1296,7 @@ public struct FleetTimingSummary: Equatable, Sendable {
         comparableCount = ranks.filter { !$0.host.isLocal }.count
 
         let values = ranks.compactMap { rank -> Int? in
-            guard !rank.host.isLocal,
-                  rank.snapshot.state == .online else { return nil }
+            guard !rank.host.isLocal, rank.isMeasured else { return nil }
             return rank.valueMilliseconds
         }
         .sorted()
@@ -1252,15 +1329,45 @@ public enum FleetTimingRanker {
         snapshots: [String: HostSnapshot],
         metric: FleetTimingMetric
     ) -> [FleetTimingRank] {
-        hosts.map { host in
+        sorted(hosts.map { host in
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             return FleetTimingRank(
                 host: host,
                 snapshot: snapshot,
                 valueMilliseconds: host.isLocal ? nil : metric.value(in: snapshot)
             )
-        }
-        .sorted { left, right in
+        })
+    }
+
+    public static func rank(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        history: [String: FleetTimingHistoryMeasurement]
+    ) -> [FleetTimingRank] {
+        sorted(hosts.map { host in
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            let measurement = history[host.id]
+                ?? FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+            return FleetTimingRank(
+                host: host,
+                snapshot: snapshot,
+                valueMilliseconds: host.isLocal ? nil : measurement.averageMilliseconds,
+                evidence: .history(sampleCount: host.isLocal ? 0 : measurement.sampleCount)
+            )
+        })
+    }
+
+    private static func sorted(_ ranks: [FleetTimingRank]) -> [FleetTimingRank] {
+        ranks.sorted { left, right in
+            if left.isMeasured != right.isMeasured { return left.isMeasured }
+            if left.isMeasured,
+               let leftValue = left.valueMilliseconds,
+               let rightValue = right.valueMilliseconds {
+                if leftValue != rightValue { return leftValue < rightValue }
+                let nameOrder = left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                return left.host.id < right.host.id
+            }
             let leftOnline = left.snapshot.state == .online
             let rightOnline = right.snapshot.state == .online
             if leftOnline != rightOnline { return leftOnline }
@@ -1272,7 +1379,9 @@ public enum FleetTimingRanker {
             case (nil, _?): return false
             case (nil, nil): break
             }
-            return left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName) == .orderedAscending
+            let nameOrder = left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return left.host.id < right.host.id
         }
     }
 }
@@ -1281,21 +1390,34 @@ public enum FleetComparisonReportBuilder {
     public static func build(
         metric: FleetTimingMetric,
         ranks: [FleetTimingRank],
+        scopeLabel: String = "Live",
         generatedAt: Date = Date()
     ) -> String {
         var lines = [
-            "Fleetlight comparison — \(metric.displayName) — \(generatedAt.formatted(date: .abbreviated, time: .standard))"
+            "Fleetlight comparison — \(metric.displayName) — \(scopeLabel) — \(generatedAt.formatted(date: .abbreviated, time: .standard))"
         ]
-        let best = ranks.first(where: { $0.snapshot.state == .online && $0.valueMilliseconds != nil })?.valueMilliseconds
+        let best = ranks.first(where: \.isMeasured)?.valueMilliseconds
 
         for (index, rank) in ranks.enumerated() {
-            let value = rank.valueMilliseconds.map { "\($0) ms" } ?? "unavailable"
+            let value = rank.isMeasured ? rank.valueMilliseconds.map { "\($0) ms" } ?? "unavailable" : "unavailable"
             let delta = rank.valueMilliseconds.flatMap { value -> String? in
-                guard rank.snapshot.state == .online, let best else { return nil }
+                guard rank.isMeasured, let best else { return nil }
                 return value == best ? "fastest" : "+\(value - best) ms"
             }
-            let route = rank.snapshot.routeName.map { "route \($0)" }
-            let facts = [value, delta, route, rank.snapshot.state.rawValue].compactMap { $0 }.joined(separator: " · ")
+            let evidence: String?
+            let route: String?
+            let state: String
+            switch rank.evidence {
+            case .live:
+                evidence = nil
+                route = rank.snapshot.routeName.map { "route \($0)" }
+                state = rank.snapshot.state.rawValue
+            case let .history(sampleCount):
+                evidence = rank.host.isLocal ? nil : "\(sampleCount) verified samples"
+                route = nil
+                state = rank.host.isLocal ? "local observer excluded" : "currently \(rank.snapshot.state.rawValue)"
+            }
+            let facts = [value, delta, evidence, route, state].compactMap { $0 }.joined(separator: " · ")
             lines.append("\(index + 1). \(rank.host.displayName): \(facts)")
         }
         return lines.joined(separator: "\n")

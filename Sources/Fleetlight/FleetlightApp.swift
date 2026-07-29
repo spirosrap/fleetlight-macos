@@ -2304,52 +2304,107 @@ private struct CodexMachineRow: View {
     }
 }
 
+private enum ComparisonScope: String, CaseIterable, Identifiable {
+    case live
+    case oneHour
+    case sixHours
+    case twentyFourHours
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .live: "Now"
+        case .oneHour: "1h"
+        case .sixHours: "6h"
+        case .twentyFourHours: "24h"
+        }
+    }
+
+    var hours: Double? {
+        switch self {
+        case .live: nil
+        case .oneHour: 1
+        case .sixHours: 6
+        case .twentyFourHours: 24
+        }
+    }
+
+    var reportLabel: String { hours == nil ? "Current snapshot" : "\(label) verified average" }
+
+    var subtitle: String {
+        hours == nil
+            ? "Current values ranked fastest to slowest"
+            : "Verified \(label) averages ranked fastest to slowest"
+    }
+}
+
 private struct CompareView: View {
     @ObservedObject var model: FleetModel
     @State private var metric: FleetTimingMetric = .ping
+    @State private var scope: ComparisonScope = .live
 
-    private var ranks: [FleetTimingRank] {
-        FleetTimingRanker.rank(hosts: model.visibleHosts, snapshots: model.snapshots, metric: metric)
-    }
-
-    private var measuredRanks: [FleetTimingRank] {
-        ranks.filter { $0.snapshot.state == .online && $0.valueMilliseconds != nil }
-    }
-
-    private var summary: FleetTimingSummary {
-        FleetTimingSummary(ranks: ranks)
-    }
-
-    private var best: FleetTimingRank? { measuredRanks.first }
-
-    private var maximumValue: Int {
-        max(1, measuredRanks.compactMap(\.valueMilliseconds).max() ?? 1)
+    private func comparisonRanks() -> [FleetTimingRank] {
+        if scope == .live {
+            return FleetTimingRanker.rank(hosts: model.visibleHosts, snapshots: model.snapshots, metric: metric)
+        }
+        guard let hours = scope.hours else { return [] }
+        let history = Dictionary(uniqueKeysWithValues: model.visibleHosts.map { host in
+            (
+                host.id,
+                FleetTimingHistoryAnalyzer.summarize(
+                    samples: model.samples(for: host.id, hours: hours),
+                    metric: metric
+                )
+            )
+        })
+        return FleetTimingRanker.rank(
+            hosts: model.visibleHosts,
+            snapshots: model.snapshots,
+            history: history
+        )
     }
 
     var body: some View {
+        let ranks = comparisonRanks()
+        let measuredRanks = ranks.filter(\.isMeasured)
+        let summary = FleetTimingSummary(ranks: ranks)
+        let best = measuredRanks.first
+        let maximumValue = max(1, measuredRanks.compactMap(\.valueMilliseconds).max() ?? 1)
+
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Fleet comparison")
-                        .font(.headline)
-                    Text("Live values ranked fastest to slowest")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Fleet comparison")
+                            .font(.headline)
+                        Text(scope.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("Metric", selection: $metric) {
+                        ForEach(FleetTimingMetric.allCases) { metric in
+                            Text(metric.displayName).tag(metric)
+                        }
+                    }
+                    .frame(width: 165)
+                    Button {
+                        model.copyComparison(metric: metric, ranks: ranks, scopeLabel: scope.reportLabel)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy this comparison")
                 }
-                Spacer()
-                Picker("Metric", selection: $metric) {
-                    ForEach(FleetTimingMetric.allCases) { metric in
-                        Text(metric.displayName).tag(metric)
+
+                Picker("Window", selection: $scope) {
+                    ForEach(ComparisonScope.allCases) { scope in
+                        Text(scope.label).tag(scope)
                     }
                 }
-                .frame(width: 165)
-                Button {
-                    model.copyComparison(metric: metric)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                }
-                .buttonStyle(.borderless)
-                .help("Copy this comparison")
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
             .padding(12)
 
@@ -2359,12 +2414,16 @@ private struct CompareView: View {
                 ContentUnavailableView(
                     "No \(metric.displayName.lowercased()) measurements",
                     systemImage: "chart.bar.xaxis",
-                    description: Text("Refresh the fleet to collect comparable live values.")
+                    description: Text(
+                        scope == .live
+                            ? "Refresh the fleet to collect comparable current values."
+                            : "No verified \(metric.displayName.lowercased()) history exists in \(scope.label) yet."
+                    )
                 )
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
-                        comparisonSummary
+                        comparisonSummary(best: best, summary: summary, ranks: ranks)
 
                         ForEach(ranks) { rank in
                             ComparisonRow(
@@ -2372,7 +2431,8 @@ private struct CompareView: View {
                                 metric: metric,
                                 position: measuredRanks.firstIndex(where: { $0.id == rank.id }).map { $0 + 1 },
                                 bestValue: best?.valueMilliseconds,
-                                maximumValue: maximumValue
+                                maximumValue: maximumValue,
+                                scopeLabel: scope.hours == nil ? nil : scope.label
                             )
                         }
                     }
@@ -2382,7 +2442,11 @@ private struct CompareView: View {
         }
     }
 
-    private var comparisonSummary: some View {
+    private func comparisonSummary(
+        best: FleetTimingRank?,
+        summary: FleetTimingSummary,
+        ranks: [FleetTimingRank]
+    ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 8) {
                 TrendStatCard(
@@ -2402,16 +2466,23 @@ private struct CompareView: View {
                 )
             }
 
-            Label(comparisonContext, systemImage: "info.circle")
+            Label(comparisonContext(summary: summary, ranks: ranks), systemImage: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var comparisonContext: String {
+    private func comparisonContext(summary: FleetTimingSummary, ranks: [FleetTimingRank]) -> String {
         let machineLabel = summary.comparableCount == 1 ? "remote machine" : "remote machines"
         let localContext = ranks.contains(where: { $0.host.isLocal }) ? " · local observer excluded" : ""
-        return "\(summary.measuredCount) of \(summary.comparableCount) \(machineLabel) measured\(localContext)"
+        let historyContext: String
+        if scope == .live {
+            historyContext = ""
+        } else {
+            let sampleCount = ranks.compactMap { $0.evidence.sampleCount }.reduce(0, +)
+            historyContext = " · \(sampleCount) verified samples"
+        }
+        return "\(summary.measuredCount) of \(summary.comparableCount) \(machineLabel) measured\(historyContext)\(localContext)"
     }
 
     private func durationLabel(_ milliseconds: Int) -> String {
@@ -2428,6 +2499,7 @@ private struct ComparisonRow: View {
     let position: Int?
     let bestValue: Int?
     let maximumValue: Int
+    let scopeLabel: String?
 
     var body: some View {
         HStack(spacing: 9) {
@@ -2459,7 +2531,7 @@ private struct ComparisonRow: View {
                     Spacer()
                     Text(valueLabel)
                         .font(.system(.caption, design: .rounded, weight: .semibold))
-                        .foregroundStyle(rank.snapshot.state == .online ? Color.primary : Color.red)
+                        .foregroundStyle(rank.isMeasured ? Color.primary : statusColor)
                     if let deltaLabel {
                         Text(deltaLabel)
                             .font(.caption2)
@@ -2470,7 +2542,7 @@ private struct ComparisonRow: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.primary.opacity(0.06))
-                        if rank.snapshot.state == .online, let value = rank.valueMilliseconds {
+                        if rank.isMeasured, let value = rank.valueMilliseconds {
                             Capsule()
                                 .fill(color.opacity(0.75))
                                 .frame(width: max(5, geometry.size.width * CGFloat(value) / CGFloat(maximumValue)))
@@ -2491,14 +2563,15 @@ private struct ComparisonRow: View {
 
     private var valueLabel: String {
         if rank.host.isLocal { return "Local" }
-        guard let value = rank.valueMilliseconds else {
+        guard rank.isMeasured, let value = rank.valueMilliseconds else {
+            if rank.evidence.sampleCount != nil { return "No history" }
             return rank.snapshot.state == .unreachable ? "Unreachable" : "No data"
         }
         return durationLabel(value)
     }
 
     private var deltaLabel: String? {
-        guard rank.snapshot.state == .online,
+        guard rank.isMeasured,
               let value = rank.valueMilliseconds,
               let bestValue,
               value > bestValue else { return nil }
@@ -2508,6 +2581,17 @@ private struct ComparisonRow: View {
     private var detail: String {
         if rank.host.isLocal {
             return "Local process timing is not comparable with remote SSH hosts"
+        }
+        if let sampleCount = rank.evidence.sampleCount {
+            guard sampleCount > 0 else {
+                return "No verified \(metric.displayName.lowercased()) samples in \(scopeLabel ?? "this window")"
+            }
+            let currentState = rank.snapshot.state == .online ? nil : "currently \(rank.snapshot.state.rawValue)"
+            return [
+                "\(sampleCount) verified sample\(sampleCount == 1 ? "" : "s")",
+                "\(scopeLabel ?? "Window") average",
+                currentState,
+            ].compactMap { $0 }.joined(separator: " · ")
         }
         guard rank.snapshot.state == .online else { return rank.snapshot.detail }
         switch metric {

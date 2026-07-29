@@ -1427,6 +1427,60 @@ test.require(comparisonReport.contains("Fleetlight comparison — Ping"), "compa
 test.require(comparisonReport.contains("Fast: 20 ms · fastest"), "comparison report should mark the fastest machine")
 test.require(comparisonReport.contains("Slow: 80 ms · +60 ms"), "comparison report should show the gap from fastest")
 
+let historicalPing = FleetTimingHistoryAnalyzer.summarize(
+    samples: [
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "offline", state: .online, pingMilliseconds: 20),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "offline", state: .online, pingMilliseconds: 20),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_200), hostID: "offline", state: .online, pingMilliseconds: 21),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-600), hostID: "offline", state: .unreachable, pingMilliseconds: 1),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-300), hostID: "offline", state: .online, pingMilliseconds: -5),
+        MetricSample(timestamp: windowNow.addingTimeInterval(60), hostID: "offline", state: .online, pingMilliseconds: 1),
+    ],
+    metric: .ping,
+    endAt: windowNow
+)
+test.require(historicalPing.averageMilliseconds == 21, "historical comparison should average only verified online samples")
+test.require(historicalPing.sampleCount == 2, "historical comparison should report its verified sample count")
+let historicalChecks = FleetTimingHistoryAnalyzer.summarize(
+    samples: [
+        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 250),
+        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 300, probeDurationMilliseconds: 250),
+        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: nil),
+    ],
+    metric: .checks
+)
+test.require(historicalChecks.averageMilliseconds == 150, "historical checks should ignore incomplete and invalid timing pairs")
+test.require(historicalChecks.sampleCount == 1, "historical checks should count only usable timing pairs")
+let historicalRanks = FleetTimingRanker.rank(
+    hosts: [offlineHost, localComparisonHost, fastHost],
+    snapshots: [
+        "offline": HostSnapshot(state: .unreachable, pingMilliseconds: 10, routeName: "current-route"),
+        "local": HostSnapshot(state: .online),
+        "fast": comparisonSnapshots["fast"]!,
+    ],
+    history: [
+        "offline": FleetTimingHistoryMeasurement(averageMilliseconds: 10, sampleCount: 2),
+        "local": FleetTimingHistoryMeasurement(averageMilliseconds: 1, sampleCount: 5),
+        "fast": FleetTimingHistoryMeasurement(averageMilliseconds: 20, sampleCount: 1),
+    ]
+)
+test.require(historicalRanks.map(\.host.id) == ["offline", "fast", "local"], "historical comparison should rank verified averages even when the fastest machine is currently offline")
+test.require(historicalRanks[0].isMeasured, "current availability must not erase verified history")
+test.require(historicalRanks.last?.valueMilliseconds == nil, "the local observer must remain excluded from historical SSH comparison")
+let historicalSummary = FleetTimingSummary(ranks: historicalRanks)
+test.require(historicalSummary.measuredCount == 2, "historical summary should count verified remote averages")
+test.require(historicalSummary.medianMilliseconds == 15, "historical summary should calculate the rounded typical average")
+let historicalReport = FleetComparisonReportBuilder.build(
+    metric: .ping,
+    ranks: historicalRanks,
+    scopeLabel: "6h verified average",
+    generatedAt: windowNow
+)
+test.require(historicalReport.contains("6h verified average"), "historical report should name its selected window")
+test.require(historicalReport.contains("Offline: 10 ms · fastest · 2 verified samples · currently unreachable"), "historical report should include value, delta, evidence, and qualified current state")
+test.require(!historicalReport.contains("current-route"), "historical reports must not attribute a current route to a window average")
+test.require(historicalReport.contains("Local: unavailable · local observer excluded"), "historical reports should label the local observer without fake sample evidence")
+
 let sortingSnapshots = [
     "fast": HostSnapshot(state: .online, pingMilliseconds: 20),
     "slow": HostSnapshot(state: .online, pingMilliseconds: 250),

@@ -1430,6 +1430,7 @@ let checkRanks = FleetTimingRanker.rank(
 test.require(checkRanks.map(\.valueMilliseconds) == [300, 900], "check ranking should subtract SSH readiness from full probe")
 let comparisonReport = FleetComparisonReportBuilder.build(metric: .ping, ranks: pingRanks, generatedAt: windowNow)
 test.require(comparisonReport.contains("Fleetlight comparison — Ping"), "comparison report should identify the metric")
+test.require(comparisonReport.contains("Ordering: Speed (fastest current timing first)"), "comparison report should state its speed ordering mode")
 test.require(comparisonReport.contains("Fast: 20 ms · fastest"), "comparison report should mark the fastest machine")
 test.require(comparisonReport.contains("Slow: 80 ms · +60 ms"), "comparison report should show the gap from fastest")
 
@@ -1621,6 +1622,58 @@ test.require(periodChangeSummary.stableCount == 1, "period summary should count 
 test.require(periodChangeSummary.slowerCount == 1, "period summary should count slower machines")
 test.require(periodChangeSummary.comparedCount == 4, "period summary should count machines with two comparable windows")
 test.require(periodChangeSummary.missingBaselineCount == 1, "period summary should count measured machines without a previous baseline")
+test.require(periodChangeSummary.biggestMaterialImprovement?.host.id == "fast", "the biggest improvement should use percent first and signed timing delta as its deterministic tie-break")
+test.require(periodChangeSummary.biggestMaterialSlowdown?.host.id == "slow", "the biggest slowdown should identify the largest material finite-percent regression")
+
+let zeroStableHost = FleetHost(id: "zero-stable", displayName: "Zero stable", systemImage: "desktopcomputer")
+let zeroSlowerHost = FleetHost(id: "zero-slower", displayName: "Zero slower", systemImage: "desktopcomputer")
+var changeComparisons = Dictionary(uniqueKeysWithValues: periodRanks.compactMap { rank in
+    rank.periodComparison.map { (rank.host.id, $0) }
+})
+changeComparisons[zeroStableHost.id] = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 2, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 0, sampleCount: 1)
+)
+changeComparisons[zeroSlowerHost.id] = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 3, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 0, sampleCount: 1)
+)
+var changeSnapshots = Dictionary(uniqueKeysWithValues: periodRanks.map { ($0.host.id, $0.snapshot) })
+changeSnapshots[zeroStableHost.id] = HostSnapshot(state: .online)
+changeSnapshots[zeroSlowerHost.id] = HostSnapshot(state: .online)
+let changeRanks = FleetTimingRanker.rank(
+    hosts: periodRanks.map(\.host) + [zeroSlowerHost, zeroStableHost],
+    snapshots: changeSnapshots,
+    periodComparisons: changeComparisons,
+    ordering: .change
+)
+test.require(
+    changeRanks.map(\.host.id) == ["fast", "offline", "stable", "zero-stable", "slow", "zero-slower", "missing-baseline", "baseline-only", "no-history", "local"],
+    "change ranking should group faster, stable, and slower pairs before current-only, previous-only, no-data, and the local observer"
+)
+test.require(changeRanks[0].periodComparison?.percentChange == -50, "change ranking should retain signed percent evidence")
+test.require(changeRanks[2].periodComparison?.direction == .stable && changeRanks[3].periodComparison?.direction == .stable, "change ranking should keep finite and zero-baseline stable pairs together")
+test.require(changeRanks[5].periodComparison?.percentChange == nil && changeRanks[5].periodComparison?.direction == .slower, "a material zero-baseline delay should be comparable without inventing a percentage")
+let changeSummary = FleetTimingChangeSummary(ranks: changeRanks)
+test.require(changeSummary.biggestMaterialImprovement?.host.id == "fast", "change summary should retain the largest material improvement after reordering")
+test.require(changeSummary.biggestMaterialSlowdown?.host.id == "slow", "a zero-baseline delay should not eclipse a finite-percent slowdown callout")
+let zeroOnlySummary = FleetTimingChangeSummary(ranks: [changeRanks[5]])
+test.require(zeroOnlySummary.biggestMaterialSlowdown?.host.id == "zero-slower", "a zero-baseline material delay should be the slowdown fallback when no finite-percent regression exists")
+let stableOnlySummary = FleetTimingChangeSummary(ranks: [changeRanks[2], changeRanks[3]])
+test.require(stableOnlySummary.biggestMaterialImprovement == nil && stableOnlySummary.biggestMaterialSlowdown == nil, "stable evidence must not invent material mover callouts")
+let malformedPairRank = FleetTimingRank(
+    host: FleetHost(id: "malformed", displayName: "Malformed", systemImage: "desktopcomputer"),
+    snapshot: HostSnapshot(state: .online),
+    valueMilliseconds: 20,
+    evidence: .history(sampleCount: 1),
+    periodComparison: FleetTimingPeriodComparison(
+        current: FleetTimingHistoryMeasurement(averageMilliseconds: 20, sampleCount: 1),
+        previous: FleetTimingHistoryMeasurement(averageMilliseconds: 10, sampleCount: 0)
+    )
+)
+let malformedPairSummary = FleetTimingChangeSummary(ranks: [malformedPairRank])
+test.require(malformedPairSummary.comparedCount == 0 && malformedPairSummary.missingBaselineCount == 1, "an average without positive paired sample evidence must not count as a comparison")
+test.require(malformedPairSummary.biggestMaterialSlowdown == nil, "malformed evidence must not produce a mover callout")
 
 let periodReport = FleetComparisonReportBuilder.build(
     metric: .ping,
@@ -1635,6 +1688,19 @@ test.require(periodReport.contains("Missing baseline: 40 ms · +25 ms · previou
 test.require(periodReport.contains("Baseline only: unavailable · previous 5 ms · 2 previous verified samples"), "period report should retain previous evidence when the current window is unavailable")
 test.require(periodReport.contains("Local: unavailable · local observer excluded"), "period report should keep the local observer excluded")
 test.require(!periodReport.contains("0 verified samples") && !periodReport.contains("0 previous verified"), "period report should not describe absent evidence as fake zero-sample evidence")
+
+let changeReport = FleetComparisonReportBuilder.build(
+    metric: .ping,
+    ranks: changeRanks,
+    scopeLabel: "1h vs previous 1h",
+    ordering: .change,
+    generatedAt: windowNow
+)
+test.require(changeReport.contains("Ordering: Change (faster, stable, then slower; signed percent within each group)"), "change report should state its ordering mode")
+test.require(changeReport.contains("1. Fast:") && changeReport.contains("2. Offline:") && changeReport.contains("3. Stable:"), "change report ordinals should reflect the visible change order")
+test.require(changeReport.contains("— Missing baseline:") && changeReport.contains("— Baseline only:") && changeReport.contains("— Local:"), "change reports should not assign comparison ordinals to unpaired or local rows")
+test.require(changeReport.contains("Zero stable: 2 ms · fastest current timing"), "change reports should compute fastest current timing independently from display order")
+test.require(changeReport.contains("Fast: 30 ms · current speed +28 ms from fastest"), "change reports should qualify speed gaps instead of treating the first change row as fastest")
 
 let sortingSnapshots = [
     "fast": HostSnapshot(state: .online, pingMilliseconds: 20),

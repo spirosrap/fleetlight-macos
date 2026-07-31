@@ -135,6 +135,7 @@ Supported machine fields:
 - Launch-time history hydration runs alongside live probes, with an off-main-thread per-host index and no redundant global sample copy
 - Indexed windows, one-pass cached statistics, binary cursor lookup, lazy chart construction, and event-aware 360-point rendering keep seven-day Trends smooth without hiding outages, packet loss, or timing spikes
 - Live and verified 1-hour, 6-hour, and 24-hour fleet timing comparisons with period-over-period faster, about-same, and slower badges, sample evidence, and honest offline-current context
+- Historical comparisons can rank by current Speed or period-over-period Change, with material improvement and slowdown callouts backed by paired samples
 - Actionable SSH diagnosis for authentication, host-key, DNS, refused, timeout, route, and early-close errors, plus interactive Terminal troubleshooting from Access-state cards
 - Thirty-day incident history with restart-safe active issue reconstruction
 - Optional notifications for confirmed outages, recoveries, and service transitions

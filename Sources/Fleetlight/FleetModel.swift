@@ -4336,11 +4336,17 @@ final class FleetModel: ObservableObject {
         notice = "Codex Mac app report copied"
     }
 
-    func copyComparison(metric: FleetTimingMetric, ranks: [FleetTimingRank], scopeLabel: String) {
+    func copyComparison(
+        metric: FleetTimingMetric,
+        ranks: [FleetTimingRank],
+        scopeLabel: String,
+        ordering: FleetTimingRankingMode = .speed
+    ) {
         let report = FleetComparisonReportBuilder.build(
             metric: metric,
             ranks: ranks,
-            scopeLabel: scopeLabel
+            scopeLabel: scopeLabel,
+            ordering: ordering
         )
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(report, forType: .string)
@@ -4348,7 +4354,7 @@ final class FleetModel: ObservableObject {
         Task {
             await ActivityLogger.shared.append(
                 event: "comparison-copied",
-                detail: "metric=\(metric.rawValue); scope=\(scopeLabel); hosts=\(ranks.count)"
+                detail: "metric=\(metric.rawValue); scope=\(scopeLabel); ordering=\(ordering.rawValue); hosts=\(ranks.count)"
             )
         }
     }

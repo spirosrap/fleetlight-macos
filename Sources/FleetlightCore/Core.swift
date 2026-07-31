@@ -1218,6 +1218,27 @@ public enum FleetTimingChangeDirection: String, Equatable, Sendable {
     case slower
 }
 
+public enum FleetTimingRankingMode: String, CaseIterable, Identifiable, Equatable, Sendable {
+    case speed
+    case change
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .speed: "Speed"
+        case .change: "Change"
+        }
+    }
+
+    public var reportDescription: String {
+        switch self {
+        case .speed: "Speed (fastest current timing first)"
+        case .change: "Change (faster, stable, then slower; signed percent within each group)"
+        }
+    }
+}
+
 public struct FleetTimingHistoryMeasurement: Equatable, Sendable {
     public let averageMilliseconds: Int?
     public let sampleCount: Int
@@ -1259,6 +1280,19 @@ public struct FleetTimingPeriodComparison: Equatable, Sendable {
         let tolerance = max(2.0, Double(previous) * 0.05)
         if abs(Double(deltaMilliseconds)) <= tolerance { return .stable }
         return deltaMilliseconds < 0 ? .faster : .slower
+    }
+
+    public var hasPairedEvidence: Bool {
+        guard let currentAverage = current.averageMilliseconds,
+              let previousAverage = previous.averageMilliseconds else { return false }
+        return current.sampleCount > 0
+            && previous.sampleCount > 0
+            && currentAverage >= 0
+            && previousAverage >= 0
+    }
+
+    public var isChangeComparable: Bool {
+        hasPairedEvidence && direction != nil && deltaMilliseconds != nil
     }
 }
 
@@ -1389,20 +1423,71 @@ public struct FleetTimingChangeSummary: Equatable, Sendable {
     public let slowerCount: Int
     public let comparedCount: Int
     public let missingBaselineCount: Int
+    public let biggestMaterialImprovement: FleetTimingRank?
+    public let biggestMaterialSlowdown: FleetTimingRank?
 
     public init(ranks: [FleetTimingRank]) {
         let measuredRemoteRanks = ranks.filter { !$0.host.isLocal && $0.isMeasured }
-        fasterCount = measuredRemoteRanks.count {
+        let pairedRanks = measuredRemoteRanks.filter {
+            $0.periodComparison?.isChangeComparable == true
+        }
+        fasterCount = pairedRanks.count {
             $0.periodComparison?.direction == .faster
         }
-        stableCount = measuredRemoteRanks.count {
+        stableCount = pairedRanks.count {
             $0.periodComparison?.direction == .stable
         }
-        slowerCount = measuredRemoteRanks.count {
+        slowerCount = pairedRanks.count {
             $0.periodComparison?.direction == .slower
         }
         comparedCount = fasterCount + stableCount + slowerCount
         missingBaselineCount = measuredRemoteRanks.count - comparedCount
+        biggestMaterialImprovement = Self.materialMover(
+            in: measuredRemoteRanks,
+            direction: .faster,
+            largestPercentFirst: false
+        )
+        biggestMaterialSlowdown = Self.materialMover(
+            in: measuredRemoteRanks,
+            direction: .slower,
+            largestPercentFirst: true
+        )
+    }
+
+    private static func materialMover(
+        in ranks: [FleetTimingRank],
+        direction: FleetTimingChangeDirection,
+        largestPercentFirst: Bool
+    ) -> FleetTimingRank? {
+        let candidates = ranks.filter { rank in
+            guard let comparison = rank.periodComparison,
+                  comparison.isChangeComparable,
+                  comparison.direction == direction,
+                  comparison.deltaMilliseconds != nil else { return false }
+            return true
+        }
+        let finitePercentCandidates = candidates.filter {
+            $0.periodComparison?.percentChange?.isFinite == true
+        }
+        let rankedCandidates = finitePercentCandidates.isEmpty ? candidates : finitePercentCandidates
+        return rankedCandidates
+        .sorted { left, right in
+            let leftComparison = left.periodComparison!
+            let rightComparison = right.periodComparison!
+            if let leftPercent = leftComparison.percentChange,
+               let rightPercent = rightComparison.percentChange,
+               leftPercent != rightPercent {
+                return largestPercentFirst ? leftPercent > rightPercent : leftPercent < rightPercent
+            }
+            let leftDelta = abs(leftComparison.deltaMilliseconds!)
+            let rightDelta = abs(rightComparison.deltaMilliseconds!)
+            if leftDelta != rightDelta { return leftDelta > rightDelta }
+            if left.valueMilliseconds != right.valueMilliseconds {
+                return (left.valueMilliseconds ?? Int.max) < (right.valueMilliseconds ?? Int.max)
+            }
+            return FleetTimingRanker.nameComesFirst(left, right)
+        }
+        .first
     }
 }
 
@@ -1450,7 +1535,7 @@ public enum FleetTimingRanker {
         snapshots: [String: HostSnapshot],
         metric: FleetTimingMetric
     ) -> [FleetTimingRank] {
-        sorted(hosts.map { host in
+        sortedBySpeed(hosts.map { host in
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             return FleetTimingRank(
                 host: host,
@@ -1465,7 +1550,7 @@ public enum FleetTimingRanker {
         snapshots: [String: HostSnapshot],
         history: [String: FleetTimingHistoryMeasurement]
     ) -> [FleetTimingRank] {
-        sorted(hosts.map { host in
+        sortedBySpeed(hosts.map { host in
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             let measurement = history[host.id]
                 ?? FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
@@ -1481,10 +1566,11 @@ public enum FleetTimingRanker {
     public static func rank(
         hosts: [FleetHost],
         snapshots: [String: HostSnapshot],
-        periodComparisons: [String: FleetTimingPeriodComparison]
+        periodComparisons: [String: FleetTimingPeriodComparison],
+        ordering: FleetTimingRankingMode = .speed
     ) -> [FleetTimingRank] {
         let empty = FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
-        return sorted(hosts.map { host in
+        let ranks = hosts.map { host in
             let snapshot = snapshots[host.id] ?? HostSnapshot()
             let comparison = periodComparisons[host.id]
                 ?? FleetTimingPeriodComparison(current: empty, previous: empty)
@@ -1495,19 +1581,21 @@ public enum FleetTimingRanker {
                 evidence: .history(sampleCount: host.isLocal ? 0 : comparison.current.sampleCount),
                 periodComparison: host.isLocal ? nil : comparison
             )
-        })
+        }
+        switch ordering {
+        case .speed: return sortedBySpeed(ranks)
+        case .change: return sortedByChange(ranks)
+        }
     }
 
-    private static func sorted(_ ranks: [FleetTimingRank]) -> [FleetTimingRank] {
+    private static func sortedBySpeed(_ ranks: [FleetTimingRank]) -> [FleetTimingRank] {
         ranks.sorted { left, right in
             if left.isMeasured != right.isMeasured { return left.isMeasured }
             if left.isMeasured,
                let leftValue = left.valueMilliseconds,
                let rightValue = right.valueMilliseconds {
                 if leftValue != rightValue { return leftValue < rightValue }
-                let nameOrder = left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName)
-                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
-                return left.host.id < right.host.id
+                return nameComesFirst(left, right)
             }
             if left.host.isLocal != right.host.isLocal { return !left.host.isLocal }
             let leftHasBaseline = left.periodComparison?.previous.averageMilliseconds != nil
@@ -1526,10 +1614,91 @@ public enum FleetTimingRanker {
             case (nil, _?): return false
             case (nil, nil): break
             }
-            let nameOrder = left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName)
-            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
-            return left.host.id < right.host.id
+            return nameComesFirst(left, right)
         }
+    }
+
+    private enum ChangeSortBucket: Int {
+        case comparable
+        case measuredWithoutBaseline
+        case previousOnly
+        case noData
+        case localObserver
+    }
+
+    private static func sortedByChange(_ ranks: [FleetTimingRank]) -> [FleetTimingRank] {
+        ranks.sorted { left, right in
+            let leftBucket = changeSortBucket(for: left)
+            let rightBucket = changeSortBucket(for: right)
+            if leftBucket != rightBucket { return leftBucket.rawValue < rightBucket.rawValue }
+
+            switch leftBucket {
+            case .comparable:
+                let leftComparison = left.periodComparison!
+                let rightComparison = right.periodComparison!
+                let leftDirection = changeDirectionOrder(leftComparison.direction!)
+                let rightDirection = changeDirectionOrder(rightComparison.direction!)
+                if leftDirection != rightDirection { return leftDirection < rightDirection }
+                switch (leftComparison.percentChange, rightComparison.percentChange) {
+                case let (leftPercent?, rightPercent?):
+                    if leftPercent != rightPercent { return leftPercent < rightPercent }
+                case (_?, nil): return true
+                case (nil, _?): return false
+                case (nil, nil): break
+                }
+                let leftDelta = leftComparison.deltaMilliseconds!
+                let rightDelta = rightComparison.deltaMilliseconds!
+                if leftDelta != rightDelta { return leftDelta < rightDelta }
+                if left.valueMilliseconds != right.valueMilliseconds {
+                    return (left.valueMilliseconds ?? Int.max) < (right.valueMilliseconds ?? Int.max)
+                }
+            case .measuredWithoutBaseline:
+                if left.valueMilliseconds != right.valueMilliseconds {
+                    return (left.valueMilliseconds ?? Int.max) < (right.valueMilliseconds ?? Int.max)
+                }
+            case .previousOnly:
+                let leftPrevious = left.periodComparison?.previous.averageMilliseconds ?? Int.max
+                let rightPrevious = right.periodComparison?.previous.averageMilliseconds ?? Int.max
+                if leftPrevious != rightPrevious { return leftPrevious < rightPrevious }
+            case .noData:
+                let leftOnline = left.snapshot.state == .online
+                let rightOnline = right.snapshot.state == .online
+                if leftOnline != rightOnline { return leftOnline }
+            case .localObserver:
+                break
+            }
+            return nameComesFirst(left, right)
+        }
+    }
+
+    private static func changeSortBucket(for rank: FleetTimingRank) -> ChangeSortBucket {
+        if rank.host.isLocal { return .localObserver }
+        if rank.isMeasured,
+           let comparison = rank.periodComparison,
+           comparison.isChangeComparable {
+            return .comparable
+        }
+        if rank.isMeasured { return .measuredWithoutBaseline }
+        if let comparison = rank.periodComparison,
+           comparison.previous.sampleCount > 0,
+           comparison.previous.averageMilliseconds != nil {
+            return .previousOnly
+        }
+        return .noData
+    }
+
+    private static func changeDirectionOrder(_ direction: FleetTimingChangeDirection) -> Int {
+        switch direction {
+        case .faster: 0
+        case .stable: 1
+        case .slower: 2
+        }
+    }
+
+    fileprivate static func nameComesFirst(_ left: FleetTimingRank, _ right: FleetTimingRank) -> Bool {
+        let nameOrder = left.host.displayName.localizedCaseInsensitiveCompare(right.host.displayName)
+        if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+        return left.host.id < right.host.id
     }
 }
 
@@ -1538,17 +1707,27 @@ public enum FleetComparisonReportBuilder {
         metric: FleetTimingMetric,
         ranks: [FleetTimingRank],
         scopeLabel: String = "Live",
+        ordering: FleetTimingRankingMode = .speed,
         generatedAt: Date = Date()
     ) -> String {
         var lines = [
-            "Fleetlight comparison — \(metric.displayName) — \(scopeLabel) — \(generatedAt.formatted(date: .abbreviated, time: .standard))"
+            "Fleetlight comparison — \(metric.displayName) — \(scopeLabel) — \(generatedAt.formatted(date: .abbreviated, time: .standard))",
+            "Ordering: \(ordering.reportDescription)",
         ]
-        let best = ranks.first(where: \.isMeasured)?.valueMilliseconds
+        let best = ranks.compactMap { rank in
+            rank.isMeasured ? rank.valueMilliseconds : nil
+        }.min()
 
+        var changeOrdinal = 0
         for (index, rank) in ranks.enumerated() {
             let value = rank.isMeasured ? rank.valueMilliseconds.map { "\($0) ms" } ?? "unavailable" : "unavailable"
             let delta = rank.valueMilliseconds.flatMap { value -> String? in
                 guard rank.isMeasured, let best else { return nil }
+                if ordering == .change {
+                    return value == best
+                        ? "fastest current timing"
+                        : "current speed +\(value - best) ms from fastest"
+                }
                 return value == best ? "fastest" : "+\(value - best) ms"
             }
             let evidence: String?
@@ -1573,7 +1752,18 @@ public enum FleetComparisonReportBuilder {
                 state = rank.host.isLocal ? "local observer excluded" : "currently \(rank.snapshot.state.rawValue)"
             }
             let facts = [value, delta, evidence, route, state].compactMap { $0 }.joined(separator: " · ")
-            lines.append("\(index + 1). \(rank.host.displayName): \(facts)")
+            let ordinal: String
+            if ordering == .change {
+                if !rank.host.isLocal, rank.periodComparison?.isChangeComparable == true {
+                    changeOrdinal += 1
+                    ordinal = "\(changeOrdinal)."
+                } else {
+                    ordinal = "—"
+                }
+            } else {
+                ordinal = "\(index + 1)."
+            }
+            lines.append("\(ordinal) \(rank.host.displayName): \(facts)")
         }
         return lines.joined(separator: "\n")
     }

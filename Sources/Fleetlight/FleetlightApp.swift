@@ -2332,10 +2332,14 @@ private enum ComparisonScope: String, CaseIterable, Identifiable {
 
     var reportLabel: String { hours == nil ? "Current snapshot" : "\(label) vs previous \(label)" }
 
-    var subtitle: String {
-        hours == nil
-            ? "Current values ranked fastest to slowest"
-            : "Verified \(label) averages compared with the previous \(label)"
+    func subtitle(ordering: FleetTimingRankingMode) -> String {
+        if hours == nil { return "Current values ranked fastest to slowest" }
+        switch ordering {
+        case .speed:
+            return "Verified \(label) averages ranked fastest to slowest"
+        case .change:
+            return "Most improved to most regressed vs previous \(label)"
+        }
     }
 }
 
@@ -2343,6 +2347,11 @@ private struct CompareView: View {
     @ObservedObject var model: FleetModel
     @State private var metric: FleetTimingMetric = .ping
     @State private var scope: ComparisonScope = .live
+    @State private var rankingMode: FleetTimingRankingMode = .speed
+
+    private var effectiveRankingMode: FleetTimingRankingMode {
+        scope == .live ? .speed : rankingMode
+    }
 
     private func comparisonRanks() -> [FleetTimingRank] {
         if scope == .live {
@@ -2364,7 +2373,8 @@ private struct CompareView: View {
         return FleetTimingRanker.rank(
             hosts: model.visibleHosts,
             snapshots: model.snapshots,
-            periodComparisons: periodComparisons
+            periodComparisons: periodComparisons,
+            ordering: effectiveRankingMode
         )
     }
 
@@ -2376,7 +2386,14 @@ private struct CompareView: View {
         }
         let summary = FleetTimingSummary(ranks: ranks)
         let changeSummary = FleetTimingChangeSummary(ranks: ranks)
-        let best = measuredRanks.first
+        let best = measuredRanks.min { left, right in
+            let leftValue = left.valueMilliseconds ?? Int.max
+            let rightValue = right.valueMilliseconds ?? Int.max
+            return leftValue == rightValue ? left.host.id < right.host.id : leftValue < rightValue
+        }
+        let positionedRanks = effectiveRankingMode == .change
+            ? ranks.filter { !$0.host.isLocal && ($0.periodComparison?.isChangeComparable == true) }
+            : measuredRanks
         let maximumValue = max(1, measuredRanks.compactMap(\.valueMilliseconds).max() ?? 1)
 
         VStack(spacing: 0) {
@@ -2385,7 +2402,7 @@ private struct CompareView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Fleet comparison")
                             .font(.headline)
-                        Text(scope.subtitle)
+                        Text(scope.subtitle(ordering: effectiveRankingMode))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -2397,7 +2414,12 @@ private struct CompareView: View {
                     }
                     .frame(width: 165)
                     Button {
-                        model.copyComparison(metric: metric, ranks: ranks, scopeLabel: scope.reportLabel)
+                        model.copyComparison(
+                            metric: metric,
+                            ranks: ranks,
+                            scopeLabel: scope.reportLabel,
+                            ordering: effectiveRankingMode
+                        )
                     } label: {
                         Image(systemName: "doc.on.doc")
                     }
@@ -2405,13 +2427,26 @@ private struct CompareView: View {
                     .help("Copy this comparison")
                 }
 
-                Picker("Window", selection: $scope) {
-                    ForEach(ComparisonScope.allCases) { scope in
-                        Text(scope.label).tag(scope)
+                HStack(spacing: 8) {
+                    Picker("Window", selection: $scope) {
+                        ForEach(ComparisonScope.allCases) { scope in
+                            Text(scope.label).tag(scope)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+
+                    if scope != .live {
+                        Picker("Order", selection: $rankingMode) {
+                            ForEach(FleetTimingRankingMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 145)
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
             }
             .padding(12)
 
@@ -2441,16 +2476,20 @@ private struct CompareView: View {
                             ComparisonRow(
                                 rank: rank,
                                 metric: metric,
-                                position: measuredRanks.firstIndex(where: { $0.id == rank.id }).map { $0 + 1 },
+                                position: positionedRanks.firstIndex(where: { $0.id == rank.id }).map { $0 + 1 },
                                 bestValue: best?.valueMilliseconds,
                                 maximumValue: maximumValue,
-                                scopeLabel: scope.hours == nil ? nil : scope.label
+                                scopeLabel: scope.hours == nil ? nil : scope.label,
+                                rankingMode: effectiveRankingMode
                             )
                         }
                     }
                     .padding(12)
                 }
             }
+        }
+        .onChange(of: scope) { _, newScope in
+            if newScope == .live { rankingMode = .speed }
         }
     }
 
@@ -2487,8 +2526,47 @@ private struct CompareView: View {
                 Label(periodChangeContext(changeSummary), systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if let callout = materialChangeCallout(
+                    changeSummary.biggestMaterialImprovement,
+                    title: "Biggest improvement",
+                    directionLabel: "faster"
+                ) {
+                    Label(callout, systemImage: "arrow.down.right")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+
+                if let callout = materialChangeCallout(
+                    changeSummary.biggestMaterialSlowdown,
+                    title: "Biggest slowdown",
+                    directionLabel: "slower"
+                ) {
+                    Label(callout, systemImage: "arrow.up.right")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.red)
+                }
             }
         }
+    }
+
+    private func materialChangeCallout(
+        _ rank: FleetTimingRank?,
+        title: String,
+        directionLabel: String
+    ) -> String? {
+        guard let rank,
+              let comparison = rank.periodComparison,
+              let delta = comparison.deltaMilliseconds,
+              let current = comparison.current.averageMilliseconds,
+              let previous = comparison.previous.averageMilliseconds else { return nil }
+        let changeLabel = comparison.percentChange.map {
+            "\(Int(abs($0).rounded()))% \(directionLabel) · \(durationLabel(abs(delta)))"
+        } ?? "new delay +\(durationLabel(abs(delta)))"
+        let evidenceLabel = comparison.current.sampleCount == 1 || comparison.previous.sampleCount == 1
+            ? " · limited evidence"
+            : ""
+        return "\(title): \(rank.host.displayName) · \(changeLabel) (\(durationLabel(previous)) → \(durationLabel(current)))\(evidenceLabel)"
     }
 
     private func periodChangeContext(_ summary: FleetTimingChangeSummary) -> String {
@@ -2540,6 +2618,7 @@ private struct ComparisonRow: View {
     let bestValue: Int?
     let maximumValue: Int
     let scopeLabel: String?
+    let rankingMode: FleetTimingRankingMode
 
     var body: some View {
         HStack(spacing: 9) {
@@ -2560,7 +2639,7 @@ private struct ComparisonRow: View {
                 HStack(spacing: 5) {
                     Text(rank.host.displayName)
                         .font(.caption.weight(.semibold))
-                    if position == 1 {
+                    if position == 1 && rankingMode == .speed {
                         Text("FASTEST")
                             .font(.system(size: 8, weight: .bold))
                             .foregroundStyle(color)
@@ -2588,17 +2667,19 @@ private struct ComparisonRow: View {
                     }
                 }
 
-                GeometryReader { geometry in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.primary.opacity(0.06))
-                        if rank.isMeasured, let value = rank.valueMilliseconds {
-                            Capsule()
-                                .fill(color.opacity(0.75))
-                                .frame(width: max(5, geometry.size.width * CGFloat(value) / CGFloat(maximumValue)))
+                if rankingMode == .speed {
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.primary.opacity(0.06))
+                            if rank.isMeasured, let value = rank.valueMilliseconds {
+                                Capsule()
+                                    .fill(color.opacity(0.75))
+                                    .frame(width: max(5, geometry.size.width * CGFloat(value) / CGFloat(maximumValue)))
+                            }
                         }
                     }
+                    .frame(height: 5)
                 }
-                .frame(height: 5)
 
                 Text(detail)
                     .font(.caption2)
@@ -2620,7 +2701,8 @@ private struct ComparisonRow: View {
     }
 
     private var deltaLabel: String? {
-        guard rank.isMeasured,
+        guard rankingMode == .speed,
+              rank.isMeasured,
               let value = rank.valueMilliseconds,
               let bestValue,
               value > bestValue else { return nil }

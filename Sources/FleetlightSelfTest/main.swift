@@ -1283,15 +1283,21 @@ let windowHistory = [
     MetricSample(timestamp: windowNow.addingTimeInterval(-7_200), hostID: "example", state: .online),
     MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "example", state: .online),
     MetricSample(timestamp: windowNow.addingTimeInterval(-3_600), hostID: "example", state: .online),
+    MetricSample(timestamp: windowNow.addingTimeInterval(60), hostID: "example", state: .online),
 ]
 let oneHourHistory = HistoryAnalyzer.recentSamples(windowHistory, hours: 1, now: windowNow)
 test.require(oneHourHistory.count == 2, "one-hour trends should include the cutoff sample")
 test.require(oneHourHistory.first?.timestamp == windowNow.addingTimeInterval(-3_600), "trend samples should remain chronological")
+test.require(oneHourHistory.allSatisfy { $0.timestamp <= windowNow }, "trend windows should reject future-dated samples")
 test.require(HistoryAnalyzer.recentSamples(windowHistory, hours: 6, now: windowNow).count == 3, "wider trend ranges should include older samples")
 let sortedWindowHistory = windowHistory.sorted { $0.timestamp < $1.timestamp }
 test.require(
     HistoryAnalyzer.recentSortedSamples(sortedWindowHistory, hours: 1, now: windowNow) == oneHourHistory,
     "indexed history windows should match the existing inclusive cutoff behavior"
+)
+test.require(
+    HistoryAnalyzer.recentSortedSamples(sortedWindowHistory, hours: 1, now: windowNow).allSatisfy { $0.timestamp <= windowNow },
+    "indexed trend windows should reject future-dated samples"
 )
 let indexedWindowHistory = HistoryIndexBuilder.build(samples: windowHistory + [
     MetricSample(timestamp: windowNow, hostID: "second", state: .online)
@@ -1480,6 +1486,155 @@ test.require(historicalReport.contains("6h verified average"), "historical repor
 test.require(historicalReport.contains("Offline: 10 ms · fastest · 2 verified samples · currently unreachable"), "historical report should include value, delta, evidence, and qualified current state")
 test.require(!historicalReport.contains("current-route"), "historical reports must not attribute a current route to a window average")
 test.require(historicalReport.contains("Local: unavailable · local observer excluded"), "historical reports should label the local observer without fake sample evidence")
+
+let boundedPeriodComparison = FleetTimingHistoryAnalyzer.compare(
+    samples: [
+        MetricSample(timestamp: windowNow.addingTimeInterval(-7_201), hostID: "period", state: .online, pingMilliseconds: 1),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-7_200), hostID: "period", state: .online, pingMilliseconds: 100),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-5_400), hostID: "period", state: .online, pingMilliseconds: 120),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-5_400), hostID: "period", state: .online, pingMilliseconds: 140),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-4_500), hostID: "period", state: .online, pingMilliseconds: 90),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-4_500), hostID: "period", state: .unreachable, pingMilliseconds: 90),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-3_600), hostID: "period", state: .online, pingMilliseconds: 80),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "period", state: .online, pingMilliseconds: 60),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-900), hostID: "period", state: .online, pingMilliseconds: -5),
+        MetricSample(timestamp: windowNow, hostID: "period", state: .online, pingMilliseconds: 70),
+        MetricSample(timestamp: windowNow.addingTimeInterval(1), hostID: "period", state: .online, pingMilliseconds: 1),
+    ],
+    metric: .ping,
+    endAt: windowNow,
+    windowHours: 1
+)
+test.require(boundedPeriodComparison.previous.averageMilliseconds == 120, "the previous comparison window should include its lower bound and keep the last raw correction per timestamp")
+test.require(boundedPeriodComparison.previous.sampleCount == 2, "invalid last corrections should replace, rather than fall back to, earlier duplicate samples")
+test.require(boundedPeriodComparison.current.averageMilliseconds == 70, "the current comparison window should include its lower and upper bounds")
+test.require(boundedPeriodComparison.current.sampleCount == 3, "period comparison should reject invalid, outside-window, and future samples")
+test.require(boundedPeriodComparison.deltaMilliseconds == -50, "period delta should be signed current minus previous")
+test.require(abs((boundedPeriodComparison.percentChange ?? 0) - (-41.666_666_7)) < 0.001, "period percent change should use the previous average as its denominator")
+test.require(boundedPeriodComparison.direction == .faster, "a material negative timing delta should be faster")
+
+let boundedChecksComparison = FleetTimingHistoryAnalyzer.compare(
+    samples: [
+        MetricSample(timestamp: windowNow.addingTimeInterval(-5_400), hostID: "checks", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 250),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-4_500), hostID: "checks", state: .online, latencyMilliseconds: 300, probeDurationMilliseconds: 250),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "checks", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 260),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-900), hostID: "checks", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: nil),
+    ],
+    metric: .checks,
+    endAt: windowNow,
+    windowHours: 1
+)
+test.require(boundedChecksComparison.previous.averageMilliseconds == 150 && boundedChecksComparison.previous.sampleCount == 1, "previous checks comparison should ignore invalid timing pairs")
+test.require(boundedChecksComparison.current.averageMilliseconds == 160 && boundedChecksComparison.current.sampleCount == 1, "current checks comparison should ignore incomplete timing pairs")
+
+let stableFivePercent = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 105, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 1)
+)
+let slowerBeyondTolerance = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 106, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 1)
+)
+let fasterBeyondTolerance = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 94, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 1)
+)
+let stableTwoMilliseconds = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 12, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 10, sampleCount: 1)
+)
+let zeroBaseline = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 3, sampleCount: 1),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 0, sampleCount: 1)
+)
+test.require(stableFivePercent.direction == .stable, "a change exactly at the five-percent tolerance should be stable")
+test.require(slowerBeyondTolerance.direction == .slower, "a material positive timing delta should be slower")
+test.require(fasterBeyondTolerance.direction == .faster, "a material negative timing delta should be faster")
+test.require(stableTwoMilliseconds.direction == .stable, "the absolute two-millisecond tolerance should suppress low-latency noise")
+test.require(zeroBaseline.percentChange == nil, "period percent change should be unavailable for a zero baseline")
+
+let baselineOnlyHost = FleetHost(id: "baseline-only", displayName: "Baseline only", systemImage: "desktopcomputer")
+let noHistoryHost = FleetHost(id: "no-history", displayName: "No history", systemImage: "desktopcomputer")
+let missingBaselineHost = FleetHost(id: "missing-baseline", displayName: "Missing baseline", systemImage: "desktopcomputer")
+let stableHost = FleetHost(id: "stable", displayName: "Stable", systemImage: "desktopcomputer")
+let emptyPeriodMeasurement = FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+let periodRanks = FleetTimingRanker.rank(
+    hosts: [
+        localComparisonHost,
+        noHistoryHost,
+        stableHost,
+        fastHost,
+        baselineOnlyHost,
+        offlineHost,
+        missingBaselineHost,
+        slowHost,
+    ],
+    snapshots: [
+        "local": HostSnapshot(state: .online),
+        "no-history": HostSnapshot(state: .online),
+        "stable": HostSnapshot(state: .online),
+        "fast": HostSnapshot(state: .online),
+        "baseline-only": HostSnapshot(state: .unreachable),
+        "offline": HostSnapshot(state: .unreachable),
+        "missing-baseline": HostSnapshot(state: .online),
+        "slow": HostSnapshot(state: .online),
+    ],
+    periodComparisons: [
+        "local": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 1, sampleCount: 2),
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 1, sampleCount: 2)
+        ),
+        "stable": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 102, sampleCount: 2),
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 2)
+        ),
+        "fast": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 30, sampleCount: 2),
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 60, sampleCount: 2)
+        ),
+        "baseline-only": FleetTimingPeriodComparison(
+            current: emptyPeriodMeasurement,
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 5, sampleCount: 2)
+        ),
+        "offline": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 15, sampleCount: 2),
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 30, sampleCount: 2)
+        ),
+        "missing-baseline": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 40, sampleCount: 1),
+            previous: emptyPeriodMeasurement
+        ),
+        "slow": FleetTimingPeriodComparison(
+            current: FleetTimingHistoryMeasurement(averageMilliseconds: 20, sampleCount: 2),
+            previous: FleetTimingHistoryMeasurement(averageMilliseconds: 10, sampleCount: 2)
+        ),
+    ]
+)
+test.require(
+    periodRanks.map(\.host.id) == ["offline", "slow", "fast", "missing-baseline", "stable", "baseline-only", "no-history", "local"],
+    "period ranks should use current averages, retain baseline-only evidence, and keep the local observer last"
+)
+test.require(periodRanks.first?.isMeasured == true && periodRanks.first?.snapshot.state == .unreachable, "verified period timing should remain ranked when a machine is currently offline")
+let periodChangeSummary = FleetTimingChangeSummary(ranks: periodRanks)
+test.require(periodChangeSummary.fasterCount == 2, "period summary should count faster machines")
+test.require(periodChangeSummary.stableCount == 1, "period summary should count stable machines")
+test.require(periodChangeSummary.slowerCount == 1, "period summary should count slower machines")
+test.require(periodChangeSummary.comparedCount == 4, "period summary should count machines with two comparable windows")
+test.require(periodChangeSummary.missingBaselineCount == 1, "period summary should count measured machines without a previous baseline")
+
+let periodReport = FleetComparisonReportBuilder.build(
+    metric: .ping,
+    ranks: periodRanks,
+    scopeLabel: "1h vs previous 1h",
+    generatedAt: windowNow
+)
+test.require(periodReport.contains("1h vs previous 1h"), "period report should identify both compared windows")
+test.require(periodReport.contains("Offline: 15 ms · fastest · previous 30 ms · faster by 15 ms · 2 current / 2 previous verified samples · currently unreachable"), "period report should include the previous average, direction, both sample counts, and current state")
+test.require(periodReport.contains("Slow: 20 ms · +5 ms · previous 10 ms · slower by 10 ms"), "period report should distinguish ranking delta from period change")
+test.require(periodReport.contains("Missing baseline: 40 ms · +25 ms · previous unavailable · 1 current verified sample"), "period report should label a missing baseline without inventing samples")
+test.require(periodReport.contains("Baseline only: unavailable · previous 5 ms · 2 previous verified samples"), "period report should retain previous evidence when the current window is unavailable")
+test.require(periodReport.contains("Local: unavailable · local observer excluded"), "period report should keep the local observer excluded")
+test.require(!periodReport.contains("0 verified samples") && !periodReport.contains("0 previous verified"), "period report should not describe absent evidence as fake zero-sample evidence")
 
 let sortingSnapshots = [
     "fast": HostSnapshot(state: .online, pingMilliseconds: 20),
@@ -1905,15 +2060,33 @@ let mobileFeed = MobileFeedDocument(
             restartRequired: true,
             checkedAt: mobileFeedCheckedAt
         )
+    ],
+    timingComparisons: [
+        MobileFeedTimingComparison(
+            hostId: "example-host",
+            metric: "ping",
+            windowHours: 6,
+            currentAverageMs: 40,
+            currentSampleCount: 4,
+            previousAverageMs: 50,
+            previousSampleCount: 3
+        )
     ]
 )
 let mobileFeedData = try MobileFeedCodec.encode(mobileFeed)
 let decodedMobileFeed = try MobileFeedCodec.decode(mobileFeedData)
 let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
 test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1 && decodedMobileFeed.metricsWindowHours == 24 && decodedMobileFeed.metricsSampleIntervalSeconds == 1_800, "mobile feed schema should round-trip explicit metric coverage and effective published cadence")
+test.require(decodedMobileFeed.timingComparisons?.first?.currentAverageMs == 40 && decodedMobileFeed.timingComparisons?.first?.previousAverageMs == 50, "mobile feeds should round-trip controller-computed current and previous timing aggregates")
 test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
 test.require(decodedMobileFeed.hosts.first?.fleetlightVersion == "v1.0 (1)" && decodedMobileFeed.hosts.first?.isPinned == true, "mobile feeds should expose observer versions and pinned-machine priority")
 test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")
+var legacyMobileFeedObject = try JSONSerialization.jsonObject(with: mobileFeedData) as! [String: Any]
+legacyMobileFeedObject.removeValue(forKey: "timingComparisons")
+let legacyMobileFeedDocument = try MobileFeedCodec.decode(
+    JSONSerialization.data(withJSONObject: legacyMobileFeedObject)
+)
+test.require(legacyMobileFeedDocument.timingComparisons == nil, "older mobile feed documents should decode without timing comparison aggregates")
 let legacyMobileHostData = Data(#"{"id":"legacy","name":"Legacy Host","platform":"Linux","state":"online","status":"online","detail":"Online","issueTypes":[],"services":[],"warnings":[]}"#.utf8)
 let legacyMobileHost = try decoder.decode(MobileFeedHost.self, from: legacyMobileHostData)
 test.require(legacyMobileHost.fleetlightVersion == nil && legacyMobileHost.isPinned == nil, "older mobile feeds should decode without observer-version or pinned-priority fields")

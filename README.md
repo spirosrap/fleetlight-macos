@@ -111,6 +111,7 @@ Supported machine fields:
 - An atomic, versioned mobile feed for the Fleetlight Android companion, designed for tailnet-only delivery without placing fleet SSH keys or sudo credentials on the phone
 - Per-Mac Fleetlight versions and pinned-machine priority in the mobile feed, so Android mirrors the observer identity and ordering chosen on macOS
 - Explicit 24-hour metric coverage and effective published sampling cadence for mobile Trends, enabling truthful freshness measurement and gap-safe charts after downsampling
+- Controller-computed timing aggregates for Android comparisons, so 1-hour, 6-hour, and 24-hour changes use full verified history instead of chart-selected points
 - Optional Android maintenance control through one designated Mac observer, with short-lived pairing, per-device credentials, explicit target confirmation, idempotent jobs, sequential Codex CLI/Codex Mac app/Linux OS execution, confirmed individual Linux restarts, and live per-machine results
 - Authenticated read-only Android rechecks for one machine or the visible fleet, with fresh Online or Offline results and one atomic feed publication without package or release audits
 - Shared local and authenticated Android read-only update checks that asynchronously force fresh installed-version probes, npm and official Mac app release lookups, Linux package checks with one retry for transient connection failures, and mobile-feed publication without installing, updating, or restarting anything
@@ -133,7 +134,7 @@ Supported machine fields:
 - Non-blocking Keychain initialization so the menu and health endpoint become ready even when macOS is awaiting credential approval
 - Launch-time history hydration runs alongside live probes, with an off-main-thread per-host index and no redundant global sample copy
 - Indexed windows, one-pass cached statistics, binary cursor lookup, lazy chart construction, and event-aware 360-point rendering keep seven-day Trends smooth without hiding outages, packet loss, or timing spikes
-- Live and verified 1-hour, 6-hour, and 24-hour fleet timing comparisons with sample counts, a typical median baseline, measured-machine coverage, and honest offline-current context
+- Live and verified 1-hour, 6-hour, and 24-hour fleet timing comparisons with period-over-period faster, about-same, and slower badges, sample evidence, and honest offline-current context
 - Actionable SSH diagnosis for authentication, host-key, DNS, refused, timeout, route, and early-close errors, plus interactive Terminal troubleshooting from Access-state cards
 - Thirty-day incident history with restart-safe active issue reconstruction
 - Optional notifications for confirmed outages, recoveries, and service transitions

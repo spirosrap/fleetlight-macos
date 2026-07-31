@@ -16,6 +16,13 @@ private struct TrendSampleCacheKey: Hashable {
     let maxPoints: Int
 }
 
+private struct HistoryPeriodComparisonCacheKey: Hashable {
+    let hostID: String
+    let hours: Double
+    let metric: String
+    let endAt: Date
+}
+
 private struct ReadOnlyUpdateProgressChange {
     let id: String
     let state: MobileControlJobState
@@ -110,7 +117,13 @@ final class FleetModel: ObservableObject {
     private var historyWindowCache: [HistoryWindowCacheKey: [MetricSample]] = [:]
     private var historySummaryCache: [HistoryWindowCacheKey: HistorySummary] = [:]
     private var trendSampleCache: [TrendSampleCacheKey: [MetricSample]] = [:]
+    private var historyPeriodComparisonCache: [HistoryPeriodComparisonCacheKey: FleetTimingPeriodComparison] = [:]
     private var nextHistoryPruneAt = Date.distantPast
+
+    var historyReferenceTime: Date {
+        let newestSampleAt = historySamplesByHost.values.compactMap { $0.last?.timestamp }.max()
+        return [lastRefresh, newestSampleAt].compactMap { $0 }.max() ?? Date()
+    }
     private var lastFreshSSHValidationAt: Date?
     private var activeIncidentState = ActiveIncidentState()
     private var codexUpdateBatch: PersistedCodexUpdateBatch?
@@ -1462,6 +1475,38 @@ final class FleetModel: ObservableObject {
             }
         }
 
+        let comparisonEndAt = historyReferenceTime
+        let comparisonWindows = [1, 6, 24]
+        let mobileMetricName: (FleetTimingMetric) -> String = { metric in
+            switch metric {
+            case .ping: "ping"
+            case .connectionReady: "sshReady"
+            case .checks: "checks"
+            case .fullProbe: "fullProbe"
+            }
+        }
+        let timingComparisons = feedHosts.filter { !$0.isLocal }.flatMap { host in
+            comparisonWindows.flatMap { hours in
+                FleetTimingMetric.allCases.map { metric in
+                    let comparison = timingPeriodComparison(
+                        for: host.id,
+                        hours: Double(hours),
+                        metric: metric,
+                        endAt: comparisonEndAt
+                    )
+                    return MobileFeedTimingComparison(
+                        hostId: host.id,
+                        metric: mobileMetricName(metric),
+                        windowHours: hours,
+                        currentAverageMs: comparison.current.averageMilliseconds,
+                        currentSampleCount: comparison.current.sampleCount,
+                        previousAverageMs: comparison.previous.averageMilliseconds,
+                        previousSampleCount: comparison.previous.sampleCount
+                    )
+                }
+            }
+        }
+
         let document = MobileFeedDocument(
             generatedAt: Date(),
             metricsWindowHours: 24,
@@ -1485,7 +1530,8 @@ final class FleetModel: ObservableObject {
             hosts: mobileHosts,
             linuxUpdates: linuxUpdates,
             incidents: recentIncidents,
-            metrics: metrics
+            metrics: metrics,
+            timingComparisons: timingComparisons
         )
         return MobileFeedStore.save(document)
     }
@@ -3909,7 +3955,7 @@ final class FleetModel: ObservableObject {
         let result = HistoryAnalyzer.recentSortedSamples(
             historySamplesByHost[hostID] ?? [],
             hours: hours,
-            now: lastRefresh ?? Date()
+            now: historyReferenceTime
         )
         historyWindowCache[key] = result
         return result
@@ -3931,6 +3977,30 @@ final class FleetModel: ObservableObject {
         if let cached = historySummaryCache[key] { return cached }
         let result = HistoryAnalyzer.summary(samples: samples(for: hostID, hours: hours))
         historySummaryCache[key] = result
+        return result
+    }
+
+    func timingPeriodComparison(
+        for hostID: String,
+        hours: Double,
+        metric: FleetTimingMetric,
+        endAt: Date? = nil
+    ) -> FleetTimingPeriodComparison {
+        let referenceTime = endAt ?? historyReferenceTime
+        let key = HistoryPeriodComparisonCacheKey(
+            hostID: hostID,
+            hours: hours,
+            metric: metric.rawValue,
+            endAt: referenceTime
+        )
+        if let cached = historyPeriodComparisonCache[key] { return cached }
+        let result = FleetTimingHistoryAnalyzer.compare(
+            samples: samples(for: hostID, hours: hours * 2),
+            metric: metric,
+            endAt: referenceTime,
+            windowHours: hours
+        )
+        historyPeriodComparisonCache[key] = result
         return result
     }
 
@@ -3984,6 +4054,7 @@ final class FleetModel: ObservableObject {
         historyWindowCache.removeAll(keepingCapacity: true)
         historySummaryCache.removeAll(keepingCapacity: true)
         trendSampleCache.removeAll(keepingCapacity: true)
+        historyPeriodComparisonCache.removeAll(keepingCapacity: true)
     }
 
     func availability(for hostID: String) -> Double? {

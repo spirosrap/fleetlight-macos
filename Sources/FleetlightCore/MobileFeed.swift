@@ -277,6 +277,34 @@ public struct MobileFeedMetric: Codable, Equatable, Sendable {
     }
 }
 
+public struct MobileFeedTimingComparison: Codable, Equatable, Sendable {
+    public let hostId: String
+    public let metric: String
+    public let windowHours: Int
+    public let currentAverageMs: Int?
+    public let currentSampleCount: Int
+    public let previousAverageMs: Int?
+    public let previousSampleCount: Int
+
+    public init(
+        hostId: String,
+        metric: String,
+        windowHours: Int,
+        currentAverageMs: Int?,
+        currentSampleCount: Int,
+        previousAverageMs: Int?,
+        previousSampleCount: Int
+    ) {
+        self.hostId = hostId
+        self.metric = metric
+        self.windowHours = windowHours
+        self.currentAverageMs = currentAverageMs
+        self.currentSampleCount = currentSampleCount
+        self.previousAverageMs = previousAverageMs
+        self.previousSampleCount = previousSampleCount
+    }
+}
+
 public struct MobileFeedDocument: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let generatedAt: Date
@@ -288,6 +316,7 @@ public struct MobileFeedDocument: Codable, Equatable, Sendable {
     public let linuxUpdates: [MobileFeedLinuxUpdate]
     public let incidents: [MobileFeedIncident]
     public let metrics: [MobileFeedMetric]
+    public let timingComparisons: [MobileFeedTimingComparison]?
 
     public init(
         generatedAt: Date = Date(),
@@ -298,7 +327,8 @@ public struct MobileFeedDocument: Codable, Equatable, Sendable {
         hosts: [MobileFeedHost],
         linuxUpdates: [MobileFeedLinuxUpdate] = [],
         incidents: [MobileFeedIncident] = [],
-        metrics: [MobileFeedMetric] = []
+        metrics: [MobileFeedMetric] = [],
+        timingComparisons: [MobileFeedTimingComparison]? = nil
     ) {
         schemaVersion = 1
         self.generatedAt = generatedAt
@@ -310,6 +340,7 @@ public struct MobileFeedDocument: Codable, Equatable, Sendable {
         self.linuxUpdates = linuxUpdates
         self.incidents = incidents
         self.metrics = metrics
+        self.timingComparisons = timingComparisons
     }
 }
 

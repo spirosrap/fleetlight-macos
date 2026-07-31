@@ -2330,12 +2330,12 @@ private enum ComparisonScope: String, CaseIterable, Identifiable {
         }
     }
 
-    var reportLabel: String { hours == nil ? "Current snapshot" : "\(label) verified average" }
+    var reportLabel: String { hours == nil ? "Current snapshot" : "\(label) vs previous \(label)" }
 
     var subtitle: String {
         hours == nil
             ? "Current values ranked fastest to slowest"
-            : "Verified \(label) averages ranked fastest to slowest"
+            : "Verified \(label) averages compared with the previous \(label)"
     }
 }
 
@@ -2349,26 +2349,33 @@ private struct CompareView: View {
             return FleetTimingRanker.rank(hosts: model.visibleHosts, snapshots: model.snapshots, metric: metric)
         }
         guard let hours = scope.hours else { return [] }
-        let history = Dictionary(uniqueKeysWithValues: model.visibleHosts.map { host in
+        let endAt = model.historyReferenceTime
+        let periodComparisons = Dictionary(uniqueKeysWithValues: model.visibleHosts.map { host in
             (
                 host.id,
-                FleetTimingHistoryAnalyzer.summarize(
-                    samples: model.samples(for: host.id, hours: hours),
-                    metric: metric
+                model.timingPeriodComparison(
+                    for: host.id,
+                    hours: hours,
+                    metric: metric,
+                    endAt: endAt
                 )
             )
         })
         return FleetTimingRanker.rank(
             hosts: model.visibleHosts,
             snapshots: model.snapshots,
-            history: history
+            periodComparisons: periodComparisons
         )
     }
 
     var body: some View {
         let ranks = comparisonRanks()
         let measuredRanks = ranks.filter(\.isMeasured)
+        let hasHistoricalEvidence = scope != .live && ranks.contains {
+            ($0.periodComparison?.previous.sampleCount ?? 0) > 0
+        }
         let summary = FleetTimingSummary(ranks: ranks)
+        let changeSummary = FleetTimingChangeSummary(ranks: ranks)
         let best = measuredRanks.first
         let maximumValue = max(1, measuredRanks.compactMap(\.valueMilliseconds).max() ?? 1)
 
@@ -2410,7 +2417,7 @@ private struct CompareView: View {
 
             Divider()
 
-            if measuredRanks.isEmpty {
+            if measuredRanks.isEmpty && !hasHistoricalEvidence {
                 ContentUnavailableView(
                     "No \(metric.displayName.lowercased()) measurements",
                     systemImage: "chart.bar.xaxis",
@@ -2423,7 +2430,12 @@ private struct CompareView: View {
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
-                        comparisonSummary(best: best, summary: summary, ranks: ranks)
+                        comparisonSummary(
+                            best: best,
+                            summary: summary,
+                            changeSummary: changeSummary,
+                            ranks: ranks
+                        )
 
                         ForEach(ranks) { rank in
                             ComparisonRow(
@@ -2445,6 +2457,7 @@ private struct CompareView: View {
     private func comparisonSummary(
         best: FleetTimingRank?,
         summary: FleetTimingSummary,
+        changeSummary: FleetTimingChangeSummary,
         ranks: [FleetTimingRank]
     ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -2469,7 +2482,31 @@ private struct CompareView: View {
             Label(comparisonContext(summary: summary, ranks: ranks), systemImage: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if scope != .live {
+                Label(periodChangeContext(changeSummary), systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
+    }
+
+    private func periodChangeContext(_ summary: FleetTimingChangeSummary) -> String {
+        guard summary.comparedCount > 0 else {
+            return summary.missingBaselineCount > 0
+                ? "No machines have a verified previous-\(scope.label) baseline yet"
+                : "No comparable period change yet"
+        }
+        var parts = [
+            "\(summary.fasterCount) faster",
+            "\(summary.stableCount) about same",
+            "\(summary.slowerCount) slower",
+            "\(summary.comparedCount) with baseline",
+        ]
+        if summary.missingBaselineCount > 0 {
+            parts.append("\(summary.missingBaselineCount) no baseline")
+        }
+        return "Vs previous \(scope.label): " + parts.joined(separator: " · ")
     }
 
     private func comparisonContext(summary: FleetTimingSummary, ranks: [FleetTimingRank]) -> String {
@@ -2479,8 +2516,11 @@ private struct CompareView: View {
         if scope == .live {
             historyContext = ""
         } else {
-            let sampleCount = ranks.compactMap { $0.evidence.sampleCount }.reduce(0, +)
-            historyContext = " · \(sampleCount) verified samples"
+            let currentSampleCount = ranks.compactMap { $0.evidence.sampleCount }.reduce(0, +)
+            let previousSampleCount = ranks.reduce(0) {
+                $0 + ($1.periodComparison?.previous.sampleCount ?? 0)
+            }
+            historyContext = " · \(currentSampleCount) current / \(previousSampleCount) previous verified samples"
         }
         return "\(summary.measuredCount) of \(summary.comparableCount) \(machineLabel) measured\(historyContext)\(localContext)"
     }
@@ -2537,6 +2577,15 @@ private struct ComparisonRow: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
+                    if let periodBadgeLabel {
+                        Text(periodBadgeLabel)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(periodBadgeColor)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(periodBadgeColor.opacity(0.12), in: Capsule())
+                            .help(periodBadgeHelp)
+                    }
                 }
 
                 GeometryReader { geometry in
@@ -2554,7 +2603,7 @@ private struct ComparisonRow: View {
                 Text(detail)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(scopeLabel == nil ? 1 : 2)
             }
         }
         .padding(9)
@@ -2582,6 +2631,26 @@ private struct ComparisonRow: View {
         if rank.host.isLocal {
             return "Local process timing is not comparable with remote SSH hosts"
         }
+        if let comparison = rank.periodComparison {
+            let currentCount = comparison.current.sampleCount
+            let previousCount = comparison.previous.sampleCount
+            guard currentCount > 0 else {
+                if let previous = comparison.previous.averageMilliseconds, previousCount > 0 {
+                    return "No current \(scopeLabel ?? "window") history · previous \(durationLabel(previous)) from \(previousCount) samples"
+                }
+                return "No verified \(metric.displayName.lowercased()) samples in either \(scopeLabel ?? "window") period"
+            }
+            var facts = ["\(currentCount) current / \(previousCount) previous samples"]
+            if let change = periodChangeDescription(comparison) {
+                facts.append(change)
+            } else {
+                facts.append("No previous \(scopeLabel ?? "window") baseline")
+            }
+            if rank.snapshot.state != .online {
+                facts.append("currently \(rank.snapshot.state.rawValue)")
+            }
+            return facts.joined(separator: " · ")
+        }
         if let sampleCount = rank.evidence.sampleCount {
             guard sampleCount > 0 else {
                 return "No verified \(metric.displayName.lowercased()) samples in \(scopeLabel ?? "this window")"
@@ -2608,6 +2677,53 @@ private struct ComparisonRow: View {
             let ready = rank.snapshot.connectionReadyMilliseconds.map { "SSH \(durationLabel($0))" }
             let checks = rank.snapshot.probeWorkMilliseconds.map { "checks \(durationLabel($0))" }
             return [ready, checks].compactMap { $0 }.joined(separator: " + ")
+        }
+    }
+
+    private var periodBadgeLabel: String? {
+        guard let comparison = rank.periodComparison,
+              let direction = comparison.direction else { return nil }
+        switch direction {
+        case .faster:
+            return comparison.deltaMilliseconds.map { "↓ \(durationLabel(abs($0)))" }
+        case .stable:
+            return "≈ same"
+        case .slower:
+            return comparison.deltaMilliseconds.map { "↑ \(durationLabel(abs($0)))" }
+        }
+    }
+
+    private var periodBadgeColor: Color {
+        switch rank.periodComparison?.direction {
+        case .faster: .green
+        case .slower: .red
+        case .stable, nil: .secondary
+        }
+    }
+
+    private var periodBadgeHelp: String {
+        guard let comparison = rank.periodComparison,
+              let description = periodChangeDescription(comparison) else {
+            return "No verified previous-period baseline"
+        }
+        return description
+    }
+
+    private func periodChangeDescription(_ comparison: FleetTimingPeriodComparison) -> String? {
+        guard let direction = comparison.direction,
+              let delta = comparison.deltaMilliseconds else { return nil }
+        let percent = comparison.percentChange.map { "\(Int(abs($0).rounded()))%" }
+        switch direction {
+        case .faster:
+            return [percent.map { "\($0) faster" }, "down \(durationLabel(abs(delta))) vs previous \(scopeLabel ?? "window")"]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+        case .stable:
+            return "About the same as previous \(scopeLabel ?? "window")"
+        case .slower:
+            return [percent.map { "\($0) slower" }, "up \(durationLabel(abs(delta))) vs previous \(scopeLabel ?? "window")"]
+                .compactMap { $0 }
+                .joined(separator: " · ")
         }
     }
 

@@ -1212,6 +1212,12 @@ public enum FleetTimingEvidence: Equatable, Sendable {
     }
 }
 
+public enum FleetTimingChangeDirection: String, Equatable, Sendable {
+    case faster
+    case stable
+    case slower
+}
+
 public struct FleetTimingHistoryMeasurement: Equatable, Sendable {
     public let averageMilliseconds: Int?
     public let sampleCount: Int
@@ -1219,6 +1225,40 @@ public struct FleetTimingHistoryMeasurement: Equatable, Sendable {
     public init(averageMilliseconds: Int?, sampleCount: Int) {
         self.averageMilliseconds = averageMilliseconds
         self.sampleCount = sampleCount
+    }
+}
+
+public struct FleetTimingPeriodComparison: Equatable, Sendable {
+    public let current: FleetTimingHistoryMeasurement
+    public let previous: FleetTimingHistoryMeasurement
+
+    public init(
+        current: FleetTimingHistoryMeasurement,
+        previous: FleetTimingHistoryMeasurement
+    ) {
+        self.current = current
+        self.previous = previous
+    }
+
+    public var deltaMilliseconds: Int? {
+        guard let current = current.averageMilliseconds,
+              let previous = previous.averageMilliseconds else { return nil }
+        return current - previous
+    }
+
+    public var percentChange: Double? {
+        guard let deltaMilliseconds,
+              let previous = previous.averageMilliseconds,
+              previous > 0 else { return nil }
+        return Double(deltaMilliseconds) / Double(previous) * 100
+    }
+
+    public var direction: FleetTimingChangeDirection? {
+        guard let deltaMilliseconds,
+              let previous = previous.averageMilliseconds else { return nil }
+        let tolerance = max(2.0, Double(previous) * 0.05)
+        if abs(Double(deltaMilliseconds)) <= tolerance { return .stable }
+        return deltaMilliseconds < 0 ? .faster : .slower
     }
 }
 
@@ -1254,6 +1294,61 @@ public enum FleetTimingHistoryAnalyzer {
             sampleCount: values.count
         )
     }
+
+    public static func compare(
+        samples: [MetricSample],
+        metric: FleetTimingMetric,
+        endAt: Date = Date(),
+        windowHours: Double
+    ) -> FleetTimingPeriodComparison {
+        let empty = FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+        guard windowHours > 0 else {
+            return FleetTimingPeriodComparison(current: empty, previous: empty)
+        }
+
+        let duration = windowHours * 3_600
+        let currentStart = endAt.addingTimeInterval(-duration)
+        let previousStart = currentStart.addingTimeInterval(-duration)
+        var correctedSamples: [SampleKey: MetricSample] = [:]
+        correctedSamples.reserveCapacity(samples.count)
+
+        for sample in samples
+        where sample.timestamp >= previousStart && sample.timestamp <= endAt {
+            correctedSamples[SampleKey(hostID: sample.hostID, timestamp: sample.timestamp)] = sample
+        }
+
+        var currentValues: [Int] = []
+        var previousValues: [Int] = []
+        currentValues.reserveCapacity(correctedSamples.count)
+        previousValues.reserveCapacity(correctedSamples.count)
+
+        for sample in correctedSamples.values {
+            guard sample.state == .online,
+                  let value = metric.value(in: sample),
+                  value >= 0 else { continue }
+            if sample.timestamp >= currentStart {
+                currentValues.append(value)
+            } else {
+                previousValues.append(value)
+            }
+        }
+
+        return FleetTimingPeriodComparison(
+            current: measurement(values: currentValues),
+            previous: measurement(values: previousValues)
+        )
+    }
+
+    private static func measurement(values: [Int]) -> FleetTimingHistoryMeasurement {
+        guard !values.isEmpty else {
+            return FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+        }
+        let average = Double(values.reduce(0, +)) / Double(values.count)
+        return FleetTimingHistoryMeasurement(
+            averageMilliseconds: Int(average.rounded()),
+            sampleCount: values.count
+        )
+    }
 }
 
 public struct FleetTimingRank: Identifiable, Equatable, Sendable {
@@ -1261,6 +1356,7 @@ public struct FleetTimingRank: Identifiable, Equatable, Sendable {
     public let snapshot: HostSnapshot
     public let valueMilliseconds: Int?
     public let evidence: FleetTimingEvidence
+    public let periodComparison: FleetTimingPeriodComparison?
 
     public var id: String { host.id }
 
@@ -1276,12 +1372,37 @@ public struct FleetTimingRank: Identifiable, Equatable, Sendable {
         host: FleetHost,
         snapshot: HostSnapshot,
         valueMilliseconds: Int?,
-        evidence: FleetTimingEvidence = .live
+        evidence: FleetTimingEvidence = .live,
+        periodComparison: FleetTimingPeriodComparison? = nil
     ) {
         self.host = host
         self.snapshot = snapshot
         self.valueMilliseconds = valueMilliseconds
         self.evidence = evidence
+        self.periodComparison = periodComparison
+    }
+}
+
+public struct FleetTimingChangeSummary: Equatable, Sendable {
+    public let fasterCount: Int
+    public let stableCount: Int
+    public let slowerCount: Int
+    public let comparedCount: Int
+    public let missingBaselineCount: Int
+
+    public init(ranks: [FleetTimingRank]) {
+        let measuredRemoteRanks = ranks.filter { !$0.host.isLocal && $0.isMeasured }
+        fasterCount = measuredRemoteRanks.count {
+            $0.periodComparison?.direction == .faster
+        }
+        stableCount = measuredRemoteRanks.count {
+            $0.periodComparison?.direction == .stable
+        }
+        slowerCount = measuredRemoteRanks.count {
+            $0.periodComparison?.direction == .slower
+        }
+        comparedCount = fasterCount + stableCount + slowerCount
+        missingBaselineCount = measuredRemoteRanks.count - comparedCount
     }
 }
 
@@ -1357,6 +1478,26 @@ public enum FleetTimingRanker {
         })
     }
 
+    public static func rank(
+        hosts: [FleetHost],
+        snapshots: [String: HostSnapshot],
+        periodComparisons: [String: FleetTimingPeriodComparison]
+    ) -> [FleetTimingRank] {
+        let empty = FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
+        return sorted(hosts.map { host in
+            let snapshot = snapshots[host.id] ?? HostSnapshot()
+            let comparison = periodComparisons[host.id]
+                ?? FleetTimingPeriodComparison(current: empty, previous: empty)
+            return FleetTimingRank(
+                host: host,
+                snapshot: snapshot,
+                valueMilliseconds: host.isLocal ? nil : comparison.current.averageMilliseconds,
+                evidence: .history(sampleCount: host.isLocal ? 0 : comparison.current.sampleCount),
+                periodComparison: host.isLocal ? nil : comparison
+            )
+        })
+    }
+
     private static func sorted(_ ranks: [FleetTimingRank]) -> [FleetTimingRank] {
         ranks.sorted { left, right in
             if left.isMeasured != right.isMeasured { return left.isMeasured }
@@ -1368,6 +1509,12 @@ public enum FleetTimingRanker {
                 if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
                 return left.host.id < right.host.id
             }
+            if left.host.isLocal != right.host.isLocal { return !left.host.isLocal }
+            let leftHasBaseline = left.periodComparison?.previous.averageMilliseconds != nil
+                && (left.periodComparison?.previous.sampleCount ?? 0) > 0
+            let rightHasBaseline = right.periodComparison?.previous.averageMilliseconds != nil
+                && (right.periodComparison?.previous.sampleCount ?? 0) > 0
+            if leftHasBaseline != rightHasBaseline { return leftHasBaseline }
             let leftOnline = left.snapshot.state == .online
             let rightOnline = right.snapshot.state == .online
             if leftOnline != rightOnline { return leftOnline }
@@ -1413,7 +1560,15 @@ public enum FleetComparisonReportBuilder {
                 route = rank.snapshot.routeName.map { "route \($0)" }
                 state = rank.snapshot.state.rawValue
             case let .history(sampleCount):
-                evidence = rank.host.isLocal ? nil : "\(sampleCount) verified samples"
+                if rank.host.isLocal {
+                    evidence = nil
+                } else if let comparison = rank.periodComparison {
+                    evidence = periodEvidence(comparison)
+                } else if sampleCount > 0 {
+                    evidence = "\(sampleCount) verified samples"
+                } else {
+                    evidence = nil
+                }
                 route = nil
                 state = rank.host.isLocal ? "local observer excluded" : "currently \(rank.snapshot.state.rawValue)"
             }
@@ -1421,6 +1576,41 @@ public enum FleetComparisonReportBuilder {
             lines.append("\(index + 1). \(rank.host.displayName): \(facts)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static func periodEvidence(_ comparison: FleetTimingPeriodComparison) -> String? {
+        var facts: [String] = []
+        if let previous = comparison.previous.averageMilliseconds,
+           comparison.previous.sampleCount > 0 {
+            facts.append("previous \(previous) ms")
+        } else {
+            facts.append("previous unavailable")
+        }
+        if let direction = comparison.direction,
+           let delta = comparison.deltaMilliseconds {
+            switch direction {
+            case .faster:
+                facts.append("faster by \(abs(delta)) ms")
+            case .stable:
+                facts.append("stable")
+            case .slower:
+                facts.append("slower by \(abs(delta)) ms")
+            }
+        }
+        if comparison.current.sampleCount > 0, comparison.previous.sampleCount > 0 {
+            facts.append(
+                "\(comparison.current.sampleCount) current / \(comparison.previous.sampleCount) previous verified samples"
+            )
+        } else if comparison.current.sampleCount > 0 {
+            facts.append(
+                "\(comparison.current.sampleCount) current verified sample\(comparison.current.sampleCount == 1 ? "" : "s")"
+            )
+        } else if comparison.previous.sampleCount > 0 {
+            facts.append(
+                "\(comparison.previous.sampleCount) previous verified sample\(comparison.previous.sampleCount == 1 ? "" : "s")"
+            )
+        }
+        return facts.isEmpty ? nil : facts.joined(separator: " · ")
     }
 }
 
@@ -1772,7 +1962,9 @@ public enum HistoryAnalyzer {
         now: Date = Date()
     ) -> [MetricSample] {
         let cutoff = now.addingTimeInterval(-hours * 3_600)
-        return samples.filter { $0.timestamp >= cutoff }.sorted { $0.timestamp < $1.timestamp }
+        return samples
+            .filter { $0.timestamp >= cutoff && $0.timestamp <= now }
+            .sorted { $0.timestamp < $1.timestamp }
     }
 
     public static func recentSortedSamples(
@@ -1793,7 +1985,19 @@ public enum HistoryAnalyzer {
             }
         }
         guard lower < samples.count else { return [] }
-        return Array(samples[lower...])
+
+        var endLower = lower
+        var endUpper = samples.count
+        while endLower < endUpper {
+            let middle = (endLower + endUpper) / 2
+            if samples[middle].timestamp <= now {
+                endLower = middle + 1
+            } else {
+                endUpper = middle
+            }
+        }
+        guard lower < endLower else { return [] }
+        return Array(samples[lower..<endLower])
     }
 
     public static func availabilityPercent(samples: [MetricSample]) -> Double? {

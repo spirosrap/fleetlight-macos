@@ -1433,12 +1433,23 @@ test.require(comparisonReport.contains("Fleetlight comparison — Ping"), "compa
 test.require(comparisonReport.contains("Ordering: Speed (fastest current timing first)"), "comparison report should state its speed ordering mode")
 test.require(comparisonReport.contains("Fast: 20 ms · fastest"), "comparison report should mark the fastest machine")
 test.require(comparisonReport.contains("Slow: 80 ms · +60 ms"), "comparison report should show the gap from fastest")
+let guardedHistoryReference = FleetHistoryReferenceTimeResolver.resolve(
+    lastRefresh: windowNow.addingTimeInterval(-60),
+    newestSampleAt: windowNow.addingTimeInterval(86_400),
+    now: windowNow
+)
+test.require(guardedHistoryReference == windowNow, "a future-dated history sample must not move comparison windows beyond now")
+test.require(
+    FleetHistoryReferenceTimeResolver.resolve(lastRefresh: nil, newestSampleAt: nil, now: windowNow) == windowNow,
+    "history without refresh or samples should anchor comparisons to now"
+)
 
 let historicalPing = FleetTimingHistoryAnalyzer.summarize(
     samples: [
         MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "offline", state: .online, pingMilliseconds: 20),
-        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "offline", state: .online, pingMilliseconds: 20),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1_800), hostID: "offline", state: .online, pingMilliseconds: 22),
         MetricSample(timestamp: windowNow.addingTimeInterval(-1_200), hostID: "offline", state: .online, pingMilliseconds: 21),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-600), hostID: "offline", state: .online, pingMilliseconds: 99),
         MetricSample(timestamp: windowNow.addingTimeInterval(-600), hostID: "offline", state: .unreachable, pingMilliseconds: 1),
         MetricSample(timestamp: windowNow.addingTimeInterval(-300), hostID: "offline", state: .online, pingMilliseconds: -5),
         MetricSample(timestamp: windowNow.addingTimeInterval(60), hostID: "offline", state: .online, pingMilliseconds: 1),
@@ -1446,8 +1457,8 @@ let historicalPing = FleetTimingHistoryAnalyzer.summarize(
     metric: .ping,
     endAt: windowNow
 )
-test.require(historicalPing.averageMilliseconds == 21, "historical comparison should average only verified online samples")
-test.require(historicalPing.sampleCount == 2, "historical comparison should report its verified sample count")
+test.require(historicalPing.averageMilliseconds == 22, "historical comparison should keep the last valid correction per timestamp")
+test.require(historicalPing.sampleCount == 2, "historical comparison should let an invalid last correction suppress an older duplicate sample")
 let historicalChecks = FleetTimingHistoryAnalyzer.summarize(
     samples: [
         MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 250),
@@ -1513,6 +1524,10 @@ test.require(boundedPeriodComparison.current.sampleCount == 3, "period compariso
 test.require(boundedPeriodComparison.deltaMilliseconds == -50, "period delta should be signed current minus previous")
 test.require(abs((boundedPeriodComparison.percentChange ?? 0) - (-41.666_666_7)) < 0.001, "period percent change should use the previous average as its denominator")
 test.require(boundedPeriodComparison.direction == .faster, "a material negative timing delta should be faster")
+test.require(boundedPeriodComparison.previous.coverageDurationSeconds == 1_800, "previous-period coverage should span the earliest and latest canonical valid samples")
+test.require(boundedPeriodComparison.current.coverageDurationSeconds == 3_600, "current-period coverage should include its exact lower and upper boundaries")
+test.require(boundedPeriodComparison.previousCoverageRatio == 0.5 && boundedPeriodComparison.currentCoverageRatio == 1, "period coverage ratios should use the selected window duration")
+test.require(boundedPeriodComparison.evidenceStrength == .fair, "two paired samples with adequate coverage should provide fair evidence")
 
 let boundedChecksComparison = FleetTimingHistoryAnalyzer.compare(
     samples: [
@@ -1527,6 +1542,45 @@ let boundedChecksComparison = FleetTimingHistoryAnalyzer.compare(
 )
 test.require(boundedChecksComparison.previous.averageMilliseconds == 150 && boundedChecksComparison.previous.sampleCount == 1, "previous checks comparison should ignore invalid timing pairs")
 test.require(boundedChecksComparison.current.averageMilliseconds == 160 && boundedChecksComparison.current.sampleCount == 1, "current checks comparison should ignore incomplete timing pairs")
+test.require(boundedChecksComparison.previous.coverageDurationSeconds == 0 && boundedChecksComparison.current.coverageDurationSeconds == 0, "a single canonical sample should have zero coverage duration")
+test.require(boundedChecksComparison.evidenceStrength == .limited, "paired one-sample periods should be explicitly limited evidence")
+
+let belowQuarterCoverage = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 24.99),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 4, coverageDurationSeconds: 80),
+    windowDurationSeconds: 100
+)
+let exactQuarterCoverage = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 25),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 4, coverageDurationSeconds: 80),
+    windowDurationSeconds: 100
+)
+let belowStrongCoverage = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 64.99),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 4, coverageDurationSeconds: 80),
+    windowDurationSeconds: 100
+)
+let exactStrongCoverage = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 65),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 4, coverageDurationSeconds: 80),
+    windowDurationSeconds: 100
+)
+let clampedCoverage = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 150),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: 100, sampleCount: 4, coverageDurationSeconds: 250),
+    windowDurationSeconds: 100
+)
+let missingPairEvidence = FleetTimingPeriodComparison(
+    current: FleetTimingHistoryMeasurement(averageMilliseconds: 90, sampleCount: 4, coverageDurationSeconds: 80),
+    previous: FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0),
+    windowDurationSeconds: 100
+)
+test.require(belowQuarterCoverage.evidenceStrength == .limited && belowQuarterCoverage.currentCoveragePercent == 24, "coverage below 25 percent should remain limited and display without rounding across the threshold")
+test.require(exactQuarterCoverage.evidenceStrength == .fair && exactQuarterCoverage.currentCoveragePercent == 25, "coverage exactly at 25 percent should advance to fair evidence when sample counts are sufficient")
+test.require(belowStrongCoverage.evidenceStrength == .fair && belowStrongCoverage.currentCoveragePercent == 64, "coverage below 65 percent should remain fair and display without rounding across the threshold")
+test.require(exactStrongCoverage.evidenceStrength == .strong && exactStrongCoverage.currentCoveragePercent == 65, "coverage exactly at 65 percent should provide strong evidence with four paired samples")
+test.require(clampedCoverage.currentCoverageRatio == 1 && clampedCoverage.previousCoveragePercent == 100, "coverage ratios and percentages should clamp malformed spans to the selected window")
+test.require(missingPairEvidence.evidenceStrength == .none, "a missing current or previous average should be unpaired regardless of the remaining coverage")
 
 let stableFivePercent = FleetTimingPeriodComparison(
     current: FleetTimingHistoryMeasurement(averageMilliseconds: 105, sampleCount: 1),
@@ -1622,6 +1676,7 @@ test.require(periodChangeSummary.stableCount == 1, "period summary should count 
 test.require(periodChangeSummary.slowerCount == 1, "period summary should count slower machines")
 test.require(periodChangeSummary.comparedCount == 4, "period summary should count machines with two comparable windows")
 test.require(periodChangeSummary.missingBaselineCount == 1, "period summary should count measured machines without a previous baseline")
+test.require(periodChangeSummary.strongEvidenceCount == 0 && periodChangeSummary.fairEvidenceCount == 0 && periodChangeSummary.limitedEvidenceCount == 4 && periodChangeSummary.unpairedEvidenceCount == 3, "period summary should count each evidence-strength tier and every unpaired remote machine")
 test.require(periodChangeSummary.biggestMaterialImprovement?.host.id == "fast", "the biggest improvement should use percent first and signed timing delta as its deterministic tie-break")
 test.require(periodChangeSummary.biggestMaterialSlowdown?.host.id == "slow", "the biggest slowdown should identify the largest material finite-percent regression")
 
@@ -1682,10 +1737,10 @@ let periodReport = FleetComparisonReportBuilder.build(
     generatedAt: windowNow
 )
 test.require(periodReport.contains("1h vs previous 1h"), "period report should identify both compared windows")
-test.require(periodReport.contains("Offline: 15 ms · fastest · previous 30 ms · faster by 15 ms · 2 current / 2 previous verified samples · currently unreachable"), "period report should include the previous average, direction, both sample counts, and current state")
-test.require(periodReport.contains("Slow: 20 ms · +5 ms · previous 10 ms · slower by 10 ms"), "period report should distinguish ranking delta from period change")
-test.require(periodReport.contains("Missing baseline: 40 ms · +25 ms · previous unavailable · 1 current verified sample"), "period report should label a missing baseline without inventing samples")
-test.require(periodReport.contains("Baseline only: unavailable · previous 5 ms · 2 previous verified samples"), "period report should retain previous evidence when the current window is unavailable")
+test.require(periodReport.contains("Offline: 15 ms · fastest · limited evidence · previous 30 ms · faster by 15 ms · coverage 0% current (2 samples) / 0% previous (2 samples) · currently unreachable"), "period report should include evidence strength, per-period coverage, sample counts, direction, and current state")
+test.require(periodReport.contains("Slow: 20 ms · +5 ms · limited evidence · previous 10 ms · slower by 10 ms"), "period report should distinguish ranking delta from period change while retaining evidence quality")
+test.require(periodReport.contains("Missing baseline: 40 ms · +25 ms · unpaired evidence · previous unavailable · coverage 0% current (1 sample) / 0% previous (0 samples)"), "period report should label a missing pair and retain truthful coverage evidence")
+test.require(periodReport.contains("Baseline only: unavailable · unpaired evidence · previous 5 ms · coverage 0% current (0 samples) / 0% previous (2 samples)"), "period report should retain previous evidence and coverage when the current window is unavailable")
 test.require(periodReport.contains("Local: unavailable · local observer excluded"), "period report should keep the local observer excluded")
 test.require(!periodReport.contains("0 verified samples") && !periodReport.contains("0 previous verified"), "period report should not describe absent evidence as fake zero-sample evidence")
 
@@ -2135,7 +2190,9 @@ let mobileFeed = MobileFeedDocument(
             currentAverageMs: 40,
             currentSampleCount: 4,
             previousAverageMs: 50,
-            previousSampleCount: 3
+            previousSampleCount: 3,
+            currentCoverageSeconds: 12_000,
+            previousCoverageSeconds: 9_000
         )
     ]
 )
@@ -2144,6 +2201,7 @@ let decodedMobileFeed = try MobileFeedCodec.decode(mobileFeedData)
 let mobileFeedJSON = String(decoding: mobileFeedData, as: UTF8.self)
 test.require(decodedMobileFeed == mobileFeed && decodedMobileFeed.schemaVersion == 1 && decodedMobileFeed.metricsWindowHours == 24 && decodedMobileFeed.metricsSampleIntervalSeconds == 1_800, "mobile feed schema should round-trip explicit metric coverage and effective published cadence")
 test.require(decodedMobileFeed.timingComparisons?.first?.currentAverageMs == 40 && decodedMobileFeed.timingComparisons?.first?.previousAverageMs == 50, "mobile feeds should round-trip controller-computed current and previous timing aggregates")
+test.require(decodedMobileFeed.timingComparisons?.first?.currentCoverageSeconds == 12_000 && decodedMobileFeed.timingComparisons?.first?.previousCoverageSeconds == 9_000, "mobile feeds should round-trip additive per-period coverage durations")
 test.require(decodedMobileFeed.summary.offline == 1 && decodedMobileFeed.summary.slowConnections == 1 && decodedMobileFeed.summary.alerts == 1, "mobile summaries should preserve simultaneous issue categories")
 test.require(decodedMobileFeed.hosts.first?.fleetlightVersion == "v1.0 (1)" && decodedMobileFeed.hosts.first?.isPinned == true, "mobile feeds should expose observer versions and pinned-machine priority")
 test.require(!mobileFeedJSON.contains("routeAlias") && !mobileFeedJSON.contains("ipAddress") && !mobileFeedJSON.contains("username") && !mobileFeedJSON.contains("command"), "mobile feeds should omit transport routes and fleet credentials")
@@ -2153,6 +2211,9 @@ let legacyMobileFeedDocument = try MobileFeedCodec.decode(
     JSONSerialization.data(withJSONObject: legacyMobileFeedObject)
 )
 test.require(legacyMobileFeedDocument.timingComparisons == nil, "older mobile feed documents should decode without timing comparison aggregates")
+let legacyTimingComparisonData = Data(#"{"hostId":"legacy","metric":"ping","windowHours":6,"currentAverageMs":40,"currentSampleCount":4,"previousAverageMs":50,"previousSampleCount":3}"#.utf8)
+let legacyTimingComparison = try JSONDecoder().decode(MobileFeedTimingComparison.self, from: legacyTimingComparisonData)
+test.require(legacyTimingComparison.currentCoverageSeconds == nil && legacyTimingComparison.previousCoverageSeconds == nil, "older timing-comparison feeds should decode without coverage-duration fields")
 let legacyMobileHostData = Data(#"{"id":"legacy","name":"Legacy Host","platform":"Linux","state":"online","status":"online","detail":"Online","issueTypes":[],"services":[],"warnings":[]}"#.utf8)
 let legacyMobileHost = try decoder.decode(MobileFeedHost.self, from: legacyMobileHostData)
 test.require(legacyMobileHost.fleetlightVersion == nil && legacyMobileHost.isPinned == nil, "older mobile feeds should decode without observer-version or pinned-priority fields")

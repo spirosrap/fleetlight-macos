@@ -285,6 +285,8 @@ public struct MobileFeedTimingComparison: Codable, Equatable, Sendable {
     public let currentSampleCount: Int
     public let previousAverageMs: Int?
     public let previousSampleCount: Int
+    public let currentCoverageSeconds: TimeInterval?
+    public let previousCoverageSeconds: TimeInterval?
 
     public init(
         hostId: String,
@@ -293,7 +295,9 @@ public struct MobileFeedTimingComparison: Codable, Equatable, Sendable {
         currentAverageMs: Int?,
         currentSampleCount: Int,
         previousAverageMs: Int?,
-        previousSampleCount: Int
+        previousSampleCount: Int,
+        currentCoverageSeconds: TimeInterval? = nil,
+        previousCoverageSeconds: TimeInterval? = nil
     ) {
         self.hostId = hostId
         self.metric = metric
@@ -302,6 +306,8 @@ public struct MobileFeedTimingComparison: Codable, Equatable, Sendable {
         self.currentSampleCount = currentSampleCount
         self.previousAverageMs = previousAverageMs
         self.previousSampleCount = previousSampleCount
+        self.currentCoverageSeconds = currentCoverageSeconds
+        self.previousCoverageSeconds = previousCoverageSeconds
     }
 }
 

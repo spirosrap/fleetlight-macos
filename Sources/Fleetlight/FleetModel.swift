@@ -121,8 +121,13 @@ final class FleetModel: ObservableObject {
     private var nextHistoryPruneAt = Date.distantPast
 
     var historyReferenceTime: Date {
+        let now = Date()
         let newestSampleAt = historySamplesByHost.values.compactMap { $0.last?.timestamp }.max()
-        return [lastRefresh, newestSampleAt].compactMap { $0 }.max() ?? Date()
+        return FleetHistoryReferenceTimeResolver.resolve(
+            lastRefresh: lastRefresh,
+            newestSampleAt: newestSampleAt,
+            now: now
+        )
     }
     private var lastFreshSSHValidationAt: Date?
     private var activeIncidentState = ActiveIncidentState()
@@ -1501,7 +1506,9 @@ final class FleetModel: ObservableObject {
                         currentAverageMs: comparison.current.averageMilliseconds,
                         currentSampleCount: comparison.current.sampleCount,
                         previousAverageMs: comparison.previous.averageMilliseconds,
-                        previousSampleCount: comparison.previous.sampleCount
+                        previousSampleCount: comparison.previous.sampleCount,
+                        currentCoverageSeconds: comparison.current.coverageDurationSeconds,
+                        previousCoverageSeconds: comparison.previous.coverageDurationSeconds
                     )
                 }
             }

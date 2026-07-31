@@ -2527,6 +2527,14 @@ private struct CompareView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                Label(periodEvidenceContext(changeSummary), systemImage: "checkmark.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Label("Coverage is the time span from the first to last valid sample, not sample density.", systemImage: "clock.arrow.circlepath")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
                 if let callout = materialChangeCallout(
                     changeSummary.biggestMaterialImprovement,
                     title: "Biggest improvement",
@@ -2563,10 +2571,14 @@ private struct CompareView: View {
         let changeLabel = comparison.percentChange.map {
             "\(Int(abs($0).rounded()))% \(directionLabel) · \(durationLabel(abs(delta)))"
         } ?? "new delay +\(durationLabel(abs(delta)))"
-        let evidenceLabel = comparison.current.sampleCount == 1 || comparison.previous.sampleCount == 1
+        let evidenceLabel = comparison.evidenceStrength == .limited
             ? " · limited evidence"
             : ""
         return "\(title): \(rank.host.displayName) · \(changeLabel) (\(durationLabel(previous)) → \(durationLabel(current)))\(evidenceLabel)"
+    }
+
+    private func periodEvidenceContext(_ summary: FleetTimingChangeSummary) -> String {
+        "Evidence: \(summary.strongEvidenceCount) strong · \(summary.fairEvidenceCount) fair · \(summary.limitedEvidenceCount) limited · \(summary.unpairedEvidenceCount) unpaired"
     }
 
     private func periodChangeContext(_ summary: FleetTimingChangeSummary) -> String {
@@ -2681,10 +2693,39 @@ private struct ComparisonRow: View {
                     .frame(height: 5)
                 }
 
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(scopeLabel == nil ? 1 : 2)
+                if let comparison = rank.periodComparison, let evidenceBadgeLabel {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(evidenceBadgeLabel)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(evidenceBadgeColor)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(evidenceBadgeColor.opacity(0.12), in: Capsule())
+                                .fixedSize()
+                                .help(evidenceBadgeHelp)
+                            Text(periodContextDescription(comparison))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(periodEvidenceLine("Current", measurement: comparison.current, coveragePercent: comparison.currentCoveragePercent))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help("Time span from the first to last valid current-period sample")
+                        Text(periodEvidenceLine("Previous", measurement: comparison.previous, coveragePercent: comparison.previousCoveragePercent))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help("Time span from the first to last valid previous-period sample")
+                    }
+                } else {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(9)
@@ -2716,13 +2757,14 @@ private struct ComparisonRow: View {
         if let comparison = rank.periodComparison {
             let currentCount = comparison.current.sampleCount
             let previousCount = comparison.previous.sampleCount
+            let coverageEvidence = periodCoverageDescription(comparison)
             guard currentCount > 0 else {
                 if let previous = comparison.previous.averageMilliseconds, previousCount > 0 {
-                    return "No current \(scopeLabel ?? "window") history · previous \(durationLabel(previous)) from \(previousCount) samples"
+                    return "\(coverageEvidence) · no current \(scopeLabel ?? "window") history · previous \(durationLabel(previous))"
                 }
-                return "No verified \(metric.displayName.lowercased()) samples in either \(scopeLabel ?? "window") period"
+                return "\(coverageEvidence) · no verified \(metric.displayName.lowercased()) samples in either \(scopeLabel ?? "window") period"
             }
-            var facts = ["\(currentCount) current / \(previousCount) previous samples"]
+            var facts = [coverageEvidence]
             if let change = periodChangeDescription(comparison) {
                 facts.append(change)
             } else {
@@ -2760,6 +2802,46 @@ private struct ComparisonRow: View {
             let checks = rank.snapshot.probeWorkMilliseconds.map { "checks \(durationLabel($0))" }
             return [ready, checks].compactMap { $0 }.joined(separator: " + ")
         }
+    }
+
+    private var evidenceBadgeLabel: String? {
+        rank.periodComparison?.evidenceStrength.displayName.uppercased()
+    }
+
+    private var evidenceBadgeColor: Color {
+        switch rank.periodComparison?.evidenceStrength {
+        case .strong: .green
+        case .fair: .blue
+        case .limited: .orange
+        case .some(.none), nil: .secondary
+        }
+    }
+
+    private var evidenceBadgeHelp: String {
+        guard let comparison = rank.periodComparison else { return "No period evidence" }
+        return "\(comparison.evidenceStrength.displayName) evidence · \(periodCoverageDescription(comparison)). Coverage is the time span from the first to last valid sample, not sample density."
+    }
+
+    private func periodCoverageDescription(_ comparison: FleetTimingPeriodComparison) -> String {
+        "Span \(comparison.currentCoveragePercent)% (\(comparison.current.sampleCount)) current / \(comparison.previousCoveragePercent)% (\(comparison.previous.sampleCount)) previous samples"
+    }
+
+    private func periodEvidenceLine(
+        _ label: String,
+        measurement: FleetTimingHistoryMeasurement,
+        coveragePercent: Int
+    ) -> String {
+        let value = measurement.averageMilliseconds.map(durationLabel) ?? "no data"
+        let samples = "\(measurement.sampleCount) sample\(measurement.sampleCount == 1 ? "" : "s")"
+        return "\(label) \(value) · \(samples) · \(coveragePercent)% span"
+    }
+
+    private func periodContextDescription(_ comparison: FleetTimingPeriodComparison) -> String {
+        var facts = [periodChangeDescription(comparison) ?? "No previous \(scopeLabel ?? "window") baseline"]
+        if rank.snapshot.state != .online {
+            facts.append("currently \(rank.snapshot.state.rawValue)")
+        }
+        return facts.joined(separator: " · ")
     }
 
     private var periodBadgeLabel: String? {

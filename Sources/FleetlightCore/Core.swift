@@ -1218,6 +1218,22 @@ public enum FleetTimingChangeDirection: String, Equatable, Sendable {
     case slower
 }
 
+public enum FleetTimingEvidenceStrength: String, Equatable, Sendable {
+    case none
+    case limited
+    case fair
+    case strong
+
+    public var displayName: String {
+        switch self {
+        case .none: "Unpaired"
+        case .limited: "Limited"
+        case .fair: "Fair"
+        case .strong: "Strong"
+        }
+    }
+}
+
 public enum FleetTimingRankingMode: String, CaseIterable, Identifiable, Equatable, Sendable {
     case speed
     case change
@@ -1242,24 +1258,38 @@ public enum FleetTimingRankingMode: String, CaseIterable, Identifiable, Equatabl
 public struct FleetTimingHistoryMeasurement: Equatable, Sendable {
     public let averageMilliseconds: Int?
     public let sampleCount: Int
+    public let coverageDurationSeconds: TimeInterval
 
-    public init(averageMilliseconds: Int?, sampleCount: Int) {
+    public init(
+        averageMilliseconds: Int?,
+        sampleCount: Int,
+        coverageDurationSeconds: TimeInterval = 0
+    ) {
         self.averageMilliseconds = averageMilliseconds
         self.sampleCount = sampleCount
+        self.coverageDurationSeconds = coverageDurationSeconds
     }
 }
 
 public struct FleetTimingPeriodComparison: Equatable, Sendable {
     public let current: FleetTimingHistoryMeasurement
     public let previous: FleetTimingHistoryMeasurement
+    public let windowDurationSeconds: TimeInterval
 
     public init(
         current: FleetTimingHistoryMeasurement,
-        previous: FleetTimingHistoryMeasurement
+        previous: FleetTimingHistoryMeasurement,
+        windowDurationSeconds: TimeInterval = 0
     ) {
         self.current = current
         self.previous = previous
+        self.windowDurationSeconds = windowDurationSeconds
     }
+
+    public var currentCoverageRatio: Double { coverageRatio(for: current) }
+    public var previousCoverageRatio: Double { coverageRatio(for: previous) }
+    public var currentCoveragePercent: Int { Int((currentCoverageRatio * 100).rounded(.down)) }
+    public var previousCoveragePercent: Int { Int((previousCoverageRatio * 100).rounded(.down)) }
 
     public var deltaMilliseconds: Int? {
         guard let current = current.averageMilliseconds,
@@ -1294,6 +1324,35 @@ public struct FleetTimingPeriodComparison: Equatable, Sendable {
     public var isChangeComparable: Bool {
         hasPairedEvidence && direction != nil && deltaMilliseconds != nil
     }
+
+    public var evidenceStrength: FleetTimingEvidenceStrength {
+        guard hasPairedEvidence else { return .none }
+        let minimumCount = min(current.sampleCount, previous.sampleCount)
+        let minimumCoverageRatio = min(currentCoverageRatio, previousCoverageRatio)
+        if minimumCount < 2 || minimumCoverageRatio < 0.25 { return .limited }
+        if minimumCount < 4 || minimumCoverageRatio < 0.65 { return .fair }
+        return .strong
+    }
+
+    private func coverageRatio(for measurement: FleetTimingHistoryMeasurement) -> Double {
+        guard windowDurationSeconds.isFinite,
+              windowDurationSeconds > 0,
+              measurement.coverageDurationSeconds.isFinite else { return 0 }
+        return min(1, max(0, measurement.coverageDurationSeconds / windowDurationSeconds))
+    }
+}
+
+public enum FleetHistoryReferenceTimeResolver {
+    public static func resolve(
+        lastRefresh: Date?,
+        newestSampleAt: Date?,
+        now: Date = Date()
+    ) -> Date {
+        [lastRefresh, newestSampleAt]
+            .compactMap { $0 }
+            .map { min($0, now) }
+            .max() ?? now
+    }
 }
 
 public enum FleetTimingHistoryAnalyzer {
@@ -1307,25 +1366,25 @@ public enum FleetTimingHistoryAnalyzer {
         metric: FleetTimingMetric,
         endAt: Date = Date()
     ) -> FleetTimingHistoryMeasurement {
-        let groupedValues = Dictionary(grouping: samples.compactMap { sample -> (SampleKey, Int)? in
-            guard sample.timestamp <= endAt,
-                  sample.state == .online,
+        var correctedSamples: [SampleKey: MetricSample] = [:]
+        for sample in samples where sample.timestamp <= endAt {
+            correctedSamples[SampleKey(hostID: sample.hostID, timestamp: sample.timestamp)] = sample
+        }
+        let canonicalValues = correctedSamples.values.compactMap { sample -> (value: Int, timestamp: Date)? in
+            guard sample.state == .online,
                   let value = metric.value(in: sample),
                   value >= 0 else { return nil }
-            return (SampleKey(hostID: sample.hostID, timestamp: sample.timestamp), value)
-        }, by: \.0)
-        let values = groupedValues.values.map { duplicateSamples in
-            let duplicateValues = duplicateSamples.map(\.1)
-            let average = Double(duplicateValues.reduce(0, +)) / Double(duplicateValues.count)
-            return Int(average.rounded())
+            return (value, sample.timestamp)
         }
-        guard !values.isEmpty else {
+        guard !canonicalValues.isEmpty else {
             return FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
         }
+        let values = canonicalValues.map(\.value)
         let average = Double(values.reduce(0, +)) / Double(values.count)
         return FleetTimingHistoryMeasurement(
             averageMilliseconds: Int(average.rounded()),
-            sampleCount: values.count
+            sampleCount: values.count,
+            coverageDurationSeconds: coverageDuration(for: canonicalValues.map(\.timestamp))
         )
     }
 
@@ -1351,37 +1410,53 @@ public enum FleetTimingHistoryAnalyzer {
             correctedSamples[SampleKey(hostID: sample.hostID, timestamp: sample.timestamp)] = sample
         }
 
-        var currentValues: [Int] = []
-        var previousValues: [Int] = []
-        currentValues.reserveCapacity(correctedSamples.count)
-        previousValues.reserveCapacity(correctedSamples.count)
+        var currentSamples: [(value: Int, timestamp: Date)] = []
+        var previousSamples: [(value: Int, timestamp: Date)] = []
+        currentSamples.reserveCapacity(correctedSamples.count)
+        previousSamples.reserveCapacity(correctedSamples.count)
 
         for sample in correctedSamples.values {
             guard sample.state == .online,
                   let value = metric.value(in: sample),
                   value >= 0 else { continue }
             if sample.timestamp >= currentStart {
-                currentValues.append(value)
+                currentSamples.append((value, sample.timestamp))
             } else {
-                previousValues.append(value)
+                previousSamples.append((value, sample.timestamp))
             }
         }
 
         return FleetTimingPeriodComparison(
-            current: measurement(values: currentValues),
-            previous: measurement(values: previousValues)
+            current: measurement(samples: currentSamples, windowDurationSeconds: duration),
+            previous: measurement(samples: previousSamples, windowDurationSeconds: duration),
+            windowDurationSeconds: duration
         )
     }
 
-    private static func measurement(values: [Int]) -> FleetTimingHistoryMeasurement {
-        guard !values.isEmpty else {
+    private static func measurement(
+        samples: [(value: Int, timestamp: Date)],
+        windowDurationSeconds: TimeInterval
+    ) -> FleetTimingHistoryMeasurement {
+        guard !samples.isEmpty else {
             return FleetTimingHistoryMeasurement(averageMilliseconds: nil, sampleCount: 0)
         }
+        let values = samples.map(\.value)
         let average = Double(values.reduce(0, +)) / Double(values.count)
         return FleetTimingHistoryMeasurement(
             averageMilliseconds: Int(average.rounded()),
-            sampleCount: values.count
+            sampleCount: values.count,
+            coverageDurationSeconds: min(
+                windowDurationSeconds,
+                coverageDuration(for: samples.map(\.timestamp))
+            )
         )
+    }
+
+    private static func coverageDuration(for timestamps: [Date]) -> TimeInterval {
+        guard timestamps.count >= 2,
+              let earliest = timestamps.min(),
+              let latest = timestamps.max() else { return 0 }
+        return max(0, latest.timeIntervalSince(earliest))
     }
 }
 
@@ -1423,10 +1498,15 @@ public struct FleetTimingChangeSummary: Equatable, Sendable {
     public let slowerCount: Int
     public let comparedCount: Int
     public let missingBaselineCount: Int
+    public let strongEvidenceCount: Int
+    public let fairEvidenceCount: Int
+    public let limitedEvidenceCount: Int
+    public let unpairedEvidenceCount: Int
     public let biggestMaterialImprovement: FleetTimingRank?
     public let biggestMaterialSlowdown: FleetTimingRank?
 
     public init(ranks: [FleetTimingRank]) {
+        let remoteRanks = ranks.filter { !$0.host.isLocal }
         let measuredRemoteRanks = ranks.filter { !$0.host.isLocal && $0.isMeasured }
         let pairedRanks = measuredRemoteRanks.filter {
             $0.periodComparison?.isChangeComparable == true
@@ -1442,6 +1522,10 @@ public struct FleetTimingChangeSummary: Equatable, Sendable {
         }
         comparedCount = fasterCount + stableCount + slowerCount
         missingBaselineCount = measuredRemoteRanks.count - comparedCount
+        strongEvidenceCount = remoteRanks.count { $0.periodComparison?.evidenceStrength == .strong }
+        fairEvidenceCount = remoteRanks.count { $0.periodComparison?.evidenceStrength == .fair }
+        limitedEvidenceCount = remoteRanks.count { $0.periodComparison?.evidenceStrength == .limited }
+        unpairedEvidenceCount = remoteRanks.count - strongEvidenceCount - fairEvidenceCount - limitedEvidenceCount
         biggestMaterialImprovement = Self.materialMover(
             in: measuredRemoteRanks,
             direction: .faster,
@@ -1769,7 +1853,7 @@ public enum FleetComparisonReportBuilder {
     }
 
     private static func periodEvidence(_ comparison: FleetTimingPeriodComparison) -> String? {
-        var facts: [String] = []
+        var facts = ["\(comparison.evidenceStrength.displayName.lowercased()) evidence"]
         if let previous = comparison.previous.averageMilliseconds,
            comparison.previous.sampleCount > 0 {
             facts.append("previous \(previous) ms")
@@ -1787,20 +1871,14 @@ public enum FleetComparisonReportBuilder {
                 facts.append("slower by \(abs(delta)) ms")
             }
         }
-        if comparison.current.sampleCount > 0, comparison.previous.sampleCount > 0 {
-            facts.append(
-                "\(comparison.current.sampleCount) current / \(comparison.previous.sampleCount) previous verified samples"
-            )
-        } else if comparison.current.sampleCount > 0 {
-            facts.append(
-                "\(comparison.current.sampleCount) current verified sample\(comparison.current.sampleCount == 1 ? "" : "s")"
-            )
-        } else if comparison.previous.sampleCount > 0 {
-            facts.append(
-                "\(comparison.previous.sampleCount) previous verified sample\(comparison.previous.sampleCount == 1 ? "" : "s")"
-            )
-        }
+        facts.append(
+            "coverage \(comparison.currentCoveragePercent)% current (\(sampleLabel(comparison.current.sampleCount))) / \(comparison.previousCoveragePercent)% previous (\(sampleLabel(comparison.previous.sampleCount)))"
+        )
         return facts.isEmpty ? nil : facts.joined(separator: " · ")
+    }
+
+    private static func sampleLabel(_ count: Int) -> String {
+        "\(count) sample\(count == 1 ? "" : "s")"
     }
 }
 

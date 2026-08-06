@@ -82,6 +82,7 @@ Supported machine fields:
 ## Features
 
 - Always-visible Fleetlight version and build badge sourced directly from the running app bundle
+- Self-repairing launch-at-login registration with a verifiable per-user startup-agent fallback; it defaults existing installs on, preserves explicit opt-outs, and links directly to Login Items when macOS approval is required
 - Observer provenance in the header, Settings, and copied diagnostics, including the monitoring Mac and last completed refresh time
 - Concurrent local and SSH health checks with verification markers and hard timeouts
 - Manual refreshes requested during Linux checks, updates, verification, or restarts are visibly queued, coalesced, and run automatically after the complete maintenance workflow finishes

@@ -25,6 +25,60 @@ test.require(FleetlightVersion.displayLabel(version: "1.32", build: "36") == "v1
 test.require(FleetlightVersion.displayLabel(version: "1.32", build: nil) == "v1.32", "app version labels should support a missing build")
 test.require(FleetlightVersion.displayLabel(version: nil, build: "36") == "Build 36", "app version labels should support a build-only bundle")
 test.require(FleetlightVersion.displayLabel(version: "  ", build: nil) == "Development", "app version labels should identify unbundled development runs")
+test.require(LaunchAtLoginPolicy.desiredEnabled(storedPreference: nil), "existing installs without a stored login preference should default to enabled")
+test.require(!LaunchAtLoginPolicy.desiredEnabled(storedPreference: false), "an explicit launch-at-login opt-out should persist")
+test.require(
+    LaunchAtLoginPolicy.reconciliationAction(desiredEnabled: true, status: .notRegistered) == .register,
+    "an enabled login preference should repair a missing registration"
+)
+test.require(
+    LaunchAtLoginPolicy.reconciliationAction(desiredEnabled: true, status: .enabled) == .none,
+    "an enabled login item should not be registered repeatedly"
+)
+test.require(
+    LaunchAtLoginPolicy.reconciliationAction(desiredEnabled: true, status: .requiresApproval) == .none,
+    "a login item awaiting approval should not trigger repeated registration prompts"
+)
+test.require(
+    LaunchAtLoginPolicy.reconciliationAction(desiredEnabled: false, status: .enabled) == .unregister,
+    "an explicit login opt-out should remove an enabled registration"
+)
+test.require(
+    LaunchAtLoginPolicy.reconciliationAction(desiredEnabled: false, status: .requiresApproval) == .unregister,
+    "an explicit login opt-out should remove an approval-pending registration"
+)
+test.require(
+    LaunchAtLoginPolicy.statusLabel(desiredEnabled: true, status: .requiresApproval).contains("Approval required"),
+    "login item status should expose required approval"
+)
+test.require(
+    LaunchAtLoginPolicy.statusLabel(desiredEnabled: false, status: .notRegistered) == "Disabled",
+    "login item status should distinguish an explicit disabled state"
+)
+test.require(
+    LaunchAtLoginPolicy.statusLabel(desiredEnabled: false, status: .requiresApproval).contains("could not remove"),
+    "login item status should not claim a pending registration was disabled"
+)
+let launchAgentSpecification = LaunchAtLoginAgentPolicy.specification(
+    bundleIdentifier: "app.fleetlight.test",
+    applicationPath: "/Applications/Fleetlight.app"
+)
+test.require(
+    launchAgentSpecification?.label == "app.fleetlight.test.startup",
+    "the startup agent should use a stable bundle-scoped label"
+)
+test.require(
+    launchAgentSpecification?.programArguments == ["/usr/bin/open", "-g", "/Applications/Fleetlight.app"],
+    "the startup agent should reopen the exact installed app without stealing focus"
+)
+test.require(
+    LaunchAtLoginAgentPolicy.specification(bundleIdentifier: nil, applicationPath: "/Applications/Fleetlight.app") == nil,
+    "the startup agent should reject an app without a bundle identifier"
+)
+test.require(
+    LaunchAtLoginAgentPolicy.specification(bundleIdentifier: "app.fleetlight.test", applicationPath: "/tmp/Fleetlight") == nil,
+    "the startup agent should reject an unbundled executable"
+)
 test.require(FleetObserver.displayName(localizedName: " studio ", hostname: "provider.example.net") == "studio", "observer identity should prefer the localized Mac name")
 test.require(FleetObserver.displayName(localizedName: nil, hostname: "workstation.example.net") == "workstation", "observer identity should shorten DNS hostnames")
 test.require(FleetObserver.displayName(localizedName: " ", hostname: nil) == "This Mac", "observer identity should provide a safe fallback")
@@ -1461,11 +1515,12 @@ test.require(historicalPing.averageMilliseconds == 22, "historical comparison sh
 test.require(historicalPing.sampleCount == 2, "historical comparison should let an invalid last correction suppress an older duplicate sample")
 let historicalChecks = FleetTimingHistoryAnalyzer.summarize(
     samples: [
-        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 250),
-        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 300, probeDurationMilliseconds: 250),
-        MetricSample(hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: nil),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-3), hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: 250),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-2), hostID: "fast", state: .online, latencyMilliseconds: 300, probeDurationMilliseconds: 250),
+        MetricSample(timestamp: windowNow.addingTimeInterval(-1), hostID: "fast", state: .online, latencyMilliseconds: 100, probeDurationMilliseconds: nil),
     ],
-    metric: .checks
+    metric: .checks,
+    endAt: windowNow
 )
 test.require(historicalChecks.averageMilliseconds == 150, "historical checks should ignore incomplete and invalid timing pairs")
 test.require(historicalChecks.sampleCount == 1, "historical checks should count only usable timing pairs")

@@ -1,9 +1,147 @@
 import AppKit
+import Darwin
 import Dispatch
 import Foundation
 import FleetlightCore
 import ServiceManagement
 import UniformTypeIdentifiers
+
+private enum LaunchAtLoginAgentError: LocalizedError {
+    case unavailable
+    case bootstrapFailed
+    case disableFailed
+    case enableFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "Fleetlight is not running from an application bundle"
+        case .bootstrapFailed:
+            "The startup agent could not be loaded"
+        case .disableFailed:
+            "The previous startup agent could not be unloaded"
+        case .enableFailed:
+            "The startup agent could not be enabled"
+        }
+    }
+}
+
+private enum LaunchAtLoginAgentController {
+    private static let launchAgentsDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+
+    static var isInstalled: Bool {
+        guard let specification = specification else { return false }
+        return FileManager.default.fileExists(atPath: agentURL(for: specification).path)
+    }
+
+    static var isActive: Bool {
+        guard let specification else { return false }
+        return isInstalled && isLoaded(serviceTarget: serviceTarget(for: specification))
+    }
+
+    @discardableResult
+    static func reconcile(enabled: Bool) throws -> Bool {
+        guard let specification else { throw LaunchAtLoginAgentError.unavailable }
+        let url = agentURL(for: specification)
+        let domain = "gui/\(getuid())"
+        let serviceTarget = serviceTarget(for: specification)
+
+        if !enabled {
+            if isLoaded(serviceTarget: serviceTarget) {
+                let status = runLaunchctl(["bootout", serviceTarget])
+                guard status == 0 || !isLoaded(serviceTarget: serviceTarget) else {
+                    throw LaunchAtLoginAgentError.disableFailed
+                }
+            }
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            return false
+        }
+
+        try FileManager.default.createDirectory(
+            at: launchAgentsDirectory,
+            withIntermediateDirectories: true
+        )
+        let propertyList: [String: Any] = [
+            "Label": specification.label,
+            "ProgramArguments": specification.programArguments,
+            "RunAtLoad": true,
+            "LimitLoadToSessionType": "Aqua",
+            "ProcessType": "Interactive",
+        ]
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: propertyList,
+            format: .xml,
+            options: 0
+        )
+        let definitionChanged = (try? Data(contentsOf: url)) != data
+        if definitionChanged, isLoaded(serviceTarget: serviceTarget) {
+            let status = runLaunchctl(["bootout", serviceTarget])
+            guard status == 0 || !isLoaded(serviceTarget: serviceTarget) else {
+                throw LaunchAtLoginAgentError.disableFailed
+            }
+        }
+        if definitionChanged {
+            try data.write(to: url, options: .atomic)
+        }
+
+        guard runLaunchctl(["enable", serviceTarget]) == 0 else {
+            throw LaunchAtLoginAgentError.enableFailed
+        }
+
+        if !isLoaded(serviceTarget: serviceTarget) {
+            let status = runLaunchctl(["bootstrap", domain, url.path])
+            guard status == 0 || isLoaded(serviceTarget: serviceTarget) else {
+                throw LaunchAtLoginAgentError.bootstrapFailed
+            }
+        }
+        guard isActive else {
+            throw LaunchAtLoginAgentError.bootstrapFailed
+        }
+        return true
+    }
+
+    private static var specification: LaunchAtLoginAgentSpecification? {
+        LaunchAtLoginAgentPolicy.specification(
+            bundleIdentifier: Bundle.main.bundleIdentifier,
+            applicationPath: Bundle.main.bundleURL.path
+        )
+    }
+
+    private static func agentURL(
+        for specification: LaunchAtLoginAgentSpecification
+    ) -> URL {
+        launchAgentsDirectory.appendingPathComponent("\(specification.label).plist")
+    }
+
+    private static func serviceTarget(
+        for specification: LaunchAtLoginAgentSpecification
+    ) -> String {
+        "gui/\(getuid())/\(specification.label)"
+    }
+
+    private static func isLoaded(serviceTarget: String) -> Bool {
+        runLaunchctl(["print", serviceTarget]) == 0
+    }
+
+    @discardableResult
+    private static func runLaunchctl(_ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
+    }
+}
 
 private struct HistoryWindowCacheKey: Hashable {
     let hostID: String
@@ -90,7 +228,12 @@ final class FleetModel: ObservableObject {
     @Published var fleetStatusFilter: FleetStatusFilter
     @Published private(set) var pinnedHostIDs: Set<String>
     @Published private(set) var fleetSortMode: FleetSortMode
-    @Published var launchAtLogin = false
+    @Published var launchAtLogin = LaunchAtLoginPolicy.desiredEnabled(
+        storedPreference: UserDefaults.standard.object(forKey: "launchAtLoginDesired") as? Bool
+    )
+    @Published private(set) var launchAtLoginStatusText = "Checking…"
+    @Published private(set) var launchAtLoginRequiresApproval = false
+    @Published private(set) var launchAtLoginFallbackActive = false
     @Published var notificationsEnabled: Bool
     @Published var codexUpdateAlertsEnabled: Bool
     @Published private(set) var performanceThresholds: PerformanceThresholds
@@ -688,7 +831,7 @@ final class FleetModel: ObservableObject {
         }
         scheduleObserverHeartbeat()
         let startupStartedAt = DispatchTime.now().uptimeNanoseconds
-        launchAtLogin = SMAppService.mainApp.status == .enabled
+        reconcileLaunchAtLoginOnStartup()
         let historyIndexTask = Task.detached(priority: .utility) {
             let samples = await MetricHistoryStore.shared.recent(hours: 7 * 24)
             return HistoryIndexBuilder.build(samples: samples)
@@ -4385,18 +4528,132 @@ final class FleetModel: ObservableObject {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-            launchAtLogin = SMAppService.mainApp.status == .enabled
-            notice = launchAtLogin ? "Fleetlight will open at login" : "Launch at login disabled"
-        } catch {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+        UserDefaults.standard.set(enabled, forKey: "launchAtLoginDesired")
+        launchAtLogin = enabled
+        let error = reconcileLaunchAtLoginRegistration()
+        if let error {
             notice = "Could not change login setting: \(error.localizedDescription)"
+        } else if launchAtLoginRequiresApproval {
+            notice = "Allow Fleetlight in System Settings › General › Login Items"
+        } else if enabled && launchAtLoginFallbackActive {
+            notice = "Fleetlight will open at login"
+        } else if !enabled, launchAtLoginStatusText == "Disabled" {
+            notice = "Launch at login disabled"
+        } else {
+            notice = launchAtLoginStatusText
         }
+    }
+
+    func refreshLaunchAtLoginStatus() {
+        launchAtLoginFallbackActive = LaunchAtLoginAgentController.isActive
+        updateLaunchAtLoginStatus(currentLaunchAtLoginRegistrationStatus)
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    private func reconcileLaunchAtLoginOnStartup() {
+        let storedPreference = UserDefaults.standard.object(forKey: "launchAtLoginDesired") as? Bool
+        let desiredEnabled = LaunchAtLoginPolicy.desiredEnabled(storedPreference: storedPreference)
+        if storedPreference == nil {
+            UserDefaults.standard.set(desiredEnabled, forKey: "launchAtLoginDesired")
+        }
+        launchAtLogin = desiredEnabled
+        let error = reconcileLaunchAtLoginRegistration()
+        Task {
+            if let error {
+                await ActivityLogger.shared.append(
+                    event: "launch-at-login-repair-failed",
+                    detail: MobileFeedSanitizer.redact(error.localizedDescription)
+                )
+            } else {
+                await ActivityLogger.shared.append(
+                    event: "launch-at-login-reconciled",
+                    detail: "desired=\(desiredEnabled); startup-agent=\(launchAtLoginFallbackActive)"
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    private func reconcileLaunchAtLoginRegistration() -> Error? {
+        let service = SMAppService.mainApp
+        let initialStatus = currentLaunchAtLoginRegistrationStatus
+        var nativeError: Error?
+        do {
+            switch LaunchAtLoginPolicy.reconciliationAction(
+                desiredEnabled: launchAtLogin,
+                status: initialStatus
+            ) {
+            case .register:
+                try service.register()
+            case .unregister:
+                try service.unregister()
+            case .none:
+                break
+            }
+        } catch {
+            nativeError = error
+        }
+
+        var fallbackError: Error?
+        do {
+            launchAtLoginFallbackActive = try LaunchAtLoginAgentController.reconcile(
+                enabled: launchAtLogin
+            )
+        } catch {
+            launchAtLoginFallbackActive = LaunchAtLoginAgentController.isActive
+            fallbackError = error
+        }
+
+        let finalStatus = currentLaunchAtLoginRegistrationStatus
+        updateLaunchAtLoginStatus(finalStatus)
+        if launchAtLogin {
+            return launchAtLoginFallbackActive ? nil : (fallbackError ?? nativeError)
+        }
+        let nativeStillActive = finalStatus == .enabled || finalStatus == .requiresApproval
+        let fallbackStillConfigured = launchAtLoginFallbackActive || LaunchAtLoginAgentController.isInstalled
+        return !fallbackStillConfigured && !nativeStillActive
+            ? nil
+            : (fallbackError ?? nativeError ?? LaunchAtLoginAgentError.bootstrapFailed)
+    }
+
+    private var currentLaunchAtLoginRegistrationStatus: LaunchAtLoginRegistrationStatus {
+        guard Bundle.main.bundleURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame else {
+            return .unavailable
+        }
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return .enabled
+        case .notRegistered:
+            return .notRegistered
+        case .requiresApproval:
+            return .requiresApproval
+        case .notFound:
+            return .unavailable
+        @unknown default:
+            return .unavailable
+        }
+    }
+
+    private func updateLaunchAtLoginStatus(_ status: LaunchAtLoginRegistrationStatus) {
+        if launchAtLogin && launchAtLoginFallbackActive {
+            launchAtLoginStatusText = "Enabled · startup agent"
+            launchAtLoginRequiresApproval = false
+            return
+        }
+        if !launchAtLogin,
+           launchAtLoginFallbackActive || LaunchAtLoginAgentController.isInstalled {
+            launchAtLoginStatusText = "Enabled · could not disable startup agent"
+            launchAtLoginRequiresApproval = false
+            return
+        }
+        launchAtLoginStatusText = LaunchAtLoginPolicy.statusLabel(
+            desiredEnabled: launchAtLogin,
+            status: status
+        )
+        launchAtLoginRequiresApproval = launchAtLogin && status == .requiresApproval
     }
 
     func setNotificationsEnabled(_ enabled: Bool) {

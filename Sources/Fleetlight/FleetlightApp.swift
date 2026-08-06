@@ -3714,6 +3714,15 @@ private struct FleetSettingsView: View {
                     get: { model.launchAtLogin },
                     set: { model.setLaunchAtLogin($0) }
                 ))
+                LabeledContent("Login item", value: model.launchAtLoginStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .onAppear { model.refreshLaunchAtLoginStatus() }
+                if model.launchAtLoginRequiresApproval {
+                    Button("Open Login Items Settings") {
+                        model.openLoginItemsSettings()
+                    }
+                }
             }
 
             Section("Android control") {

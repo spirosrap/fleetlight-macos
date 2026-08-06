@@ -33,6 +33,101 @@ public enum FleetlightVersion {
     }
 }
 
+public enum LaunchAtLoginRegistrationStatus: Equatable, Sendable {
+    case enabled
+    case notRegistered
+    case requiresApproval
+    case unavailable
+}
+
+public enum LaunchAtLoginReconciliationAction: Equatable, Sendable {
+    case none
+    case register
+    case unregister
+}
+
+public enum LaunchAtLoginPolicy {
+    /// Older Fleetlight builds did not persist intent. Treat those existing
+    /// installations as enabled, while retaining every explicit opt-out made
+    /// after the preference was introduced.
+    public static func desiredEnabled(storedPreference: Bool?) -> Bool {
+        storedPreference ?? true
+    }
+
+    public static func reconciliationAction(
+        desiredEnabled: Bool,
+        status: LaunchAtLoginRegistrationStatus
+    ) -> LaunchAtLoginReconciliationAction {
+        if desiredEnabled {
+            switch status {
+            case .notRegistered:
+                return .register
+            case .enabled, .requiresApproval, .unavailable:
+                return .none
+            }
+        }
+
+        switch status {
+        case .enabled, .requiresApproval:
+            return .unregister
+        case .notRegistered, .unavailable:
+            return .none
+        }
+    }
+
+    public static func statusLabel(
+        desiredEnabled: Bool,
+        status: LaunchAtLoginRegistrationStatus
+    ) -> String {
+        if !desiredEnabled {
+            switch status {
+            case .enabled:
+                return "Enabled · could not disable"
+            case .requiresApproval:
+                return "Pending approval · could not remove"
+            case .notRegistered, .unavailable:
+                return "Disabled"
+            }
+        }
+
+        switch status {
+        case .enabled:
+            return "Enabled"
+        case .notRegistered:
+            return "Not registered"
+        case .requiresApproval:
+            return "Approval required in System Settings"
+        case .unavailable:
+            return "Unavailable for this app"
+        }
+    }
+}
+
+public struct LaunchAtLoginAgentSpecification: Equatable, Sendable {
+    public let label: String
+    public let programArguments: [String]
+
+    public init(label: String, programArguments: [String]) {
+        self.label = label
+        self.programArguments = programArguments
+    }
+}
+
+public enum LaunchAtLoginAgentPolicy {
+    public static func specification(
+        bundleIdentifier: String?,
+        applicationPath: String
+    ) -> LaunchAtLoginAgentSpecification? {
+        guard let bundleIdentifier = bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundleIdentifier.isEmpty,
+              applicationPath.hasSuffix(".app") else { return nil }
+        return LaunchAtLoginAgentSpecification(
+            label: "\(bundleIdentifier).startup",
+            programArguments: ["/usr/bin/open", "-g", applicationPath]
+        )
+    }
+}
+
 public enum FleetObserver {
     public static func displayName(localizedName: String?, hostname: String?) -> String {
         for candidate in [localizedName, hostname] {
